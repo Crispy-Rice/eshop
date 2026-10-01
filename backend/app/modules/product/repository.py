@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import Select, delete, func, select, tuple_, update
+from sqlalchemy import Numeric, Select, delete, func, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.product.models import Category, Sku, SkuSpec, SpecGroup, SpecValue, Spu
@@ -185,6 +185,18 @@ async def list_skus_by_spus(session: AsyncSession, spu_ids: Sequence[int]) -> li
     return list(result)
 
 
+async def list_skus_by_shop(session: AsyncSession, shop_id: int, *, limit: int = 500) -> list[Sku]:
+    """按店铺列 SKU。
+
+    给 inventory 用：商家发布商品后要在库存页看到它，而库存页是按 SKU 驱动的，
+    所以需要"这个店铺有哪些 SKU"这个查询。加上限避免店铺很大时一次拉爆。
+    """
+    result = await session.scalars(
+        select(Sku).where(Sku.shop_id == shop_id).order_by(Sku.id).limit(limit)
+    )
+    return list(result)
+
+
 async def update_sku_fields(session: AsyncSession, sku_id: int, values: dict[str, Any]) -> None:
     if not values:
         return
@@ -207,6 +219,42 @@ async def price_range_of_spu(session: AsyncSession, spu_id: int) -> tuple[int, i
         )
     ).one()
     return int(row[0] or 0), int(row[1] or 0)
+
+
+async def incr_spu_review_stats(
+    session: AsyncSession,
+    spu_id: int,
+    *,
+    count_delta: int,
+    score_delta: int,
+    good_delta: int,
+) -> None:
+    """增减 SPU 的评价统计。由评价模块在**同一个事务内**调用。
+
+    ``avg_score`` 由三个计数推导，**计数归零就用 ``nullif`` 置成 NULL** ——
+    "零评价 ⇒ avg_score IS NULL"是展示层"无评价不显示评分"的依据
+    （docs/12 §9）。
+
+    ``good_delta`` 由调用方算好（``+1 if score >= 4 else 0``），不把阈值判断塞进 SQL，
+    这样阈值是纯函数、能单测。
+
+    全量重算不走这里 —— 那是一条 ``UPDATE ... FROM`` 的运维 SQL，见
+    ``review/tasks.py``（docs/12 §3.2 明确把那种跨 schema 的批量修正列为运维例外）。
+    """
+    new_count = Spu.review_count + count_delta
+    new_sum = Spu.review_score_sum + score_delta
+    await session.execute(
+        update(Spu)
+        .where(Spu.id == spu_id)
+        .values(
+            review_count=new_count,
+            review_score_sum=new_sum,
+            good_review_count=Spu.good_review_count + good_delta,
+            avg_score=func.round(func.cast(new_sum, Numeric(10, 4)) / func.nullif(new_count, 0), 2),
+            updated_at=func.now(),
+            version=Spu.version + 1,
+        )
+    )
 
 
 # ============================================================

@@ -51,6 +51,13 @@ const priceRange = computed(() => {
   return `¥${priceTo} 以下`
 })
 
+const resultText = computed(() => {
+  if (!searched.value) return '正在加载…'
+  if (items.value.length === 0) return '没有找到符合条件的商品'
+  // hasMore 为真时总数还不确定，所以说"已显示"而不是"共"
+  return hasMore.value ? `已显示 ${items.value.length} 件商品` : `共 ${items.value.length} 件商品`
+})
+
 async function load(reset: boolean): Promise<void> {
   if (reset) {
     loading.value = true
@@ -111,58 +118,71 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div>
-    <el-card class="filters" shadow="never">
-      <div class="filter-row">
-        <el-input
-          v-model="filters.keyword"
-          placeholder="搜索商品，多个关键词用空格分隔"
-          clearable
-          class="keyword"
-          @keyup.enter="onSearch"
+  <div class="page">
+    <div class="toolbar">
+      <el-input
+        v-model="filters.keyword"
+        placeholder="搜索商品，多个关键词用空格分隔"
+        clearable
+        class="f-keyword"
+        @keyup.enter="onSearch"
+      />
+      <el-cascader
+        v-model="filters.categoryId"
+        :options="categories"
+        :props="cascaderProps"
+        placeholder="全部分类"
+        clearable
+        class="f-category"
+      />
+      <div class="f-price">
+        <el-input-number
+          v-model="filters.priceFrom"
+          :min="0"
+          :controls="false"
+          placeholder="最低价"
         />
-        <el-cascader
-          v-model="filters.categoryId"
-          :options="categories"
-          :props="cascaderProps"
-          placeholder="全部分类"
-          clearable
-          class="category"
-        />
-        <el-input-number v-model="filters.priceFrom" :min="0" :controls="false" placeholder="最低价" class="price" />
         <span class="dash">—</span>
-        <el-input-number v-model="filters.priceTo" :min="0" :controls="false" placeholder="最高价" class="price" />
-        <el-select v-model="filters.sort" class="sort" @change="onSearch">
-          <el-option v-for="o in sortOptions" :key="o.value" :label="o.label" :value="o.value" />
-        </el-select>
+        <el-input-number v-model="filters.priceTo" :min="0" :controls="false" placeholder="最高价" />
+      </div>
+      <el-select v-model="filters.sort" class="f-sort" @change="onSearch">
+        <el-option v-for="o in sortOptions" :key="o.value" :label="o.label" :value="o.value" />
+      </el-select>
+      <div class="f-actions">
         <el-button type="primary" @click="onSearch">搜索</el-button>
         <el-button @click="onReset">重置</el-button>
       </div>
-      <div class="filter-hint">当前价格区间：{{ priceRange }}</div>
-    </el-card>
+    </div>
 
-    <div v-loading="loading" class="grid-wrap">
+    <div class="result-bar">
+      <span class="result-count">{{ resultText }}</span>
+      <span class="result-hint">价格区间：{{ priceRange }}</span>
+    </div>
+
+    <div v-loading="loading" class="shelf-wrap">
       <el-empty v-if="searched && items.length === 0" description="没有找到符合条件的商品" />
 
-      <div v-else class="grid">
-        <el-card
+      <div v-else class="shelf">
+        <article
           v-for="item in items"
           :key="item.id"
-          class="product"
-          shadow="hover"
-          :body-style="{ padding: '0' }"
+          class="card"
+          tabindex="0"
           @click="openDetail(item)"
+          @keyup.enter="openDetail(item)"
         >
-          <img :src="item.mainImage" :alt="item.title" class="cover" @error="onImageError" />
-          <div class="info">
-            <div class="title" :title="item.title">{{ item.title }}</div>
-            <div class="price">{{ formatPriceRange(item.priceMin, item.priceMax) }}</div>
-            <div class="meta">
-              <span>已售 {{ item.totalSold }}</span>
-              <span v-if="item.reviewCount > 0">{{ item.avgScore.toFixed(1) }} 分</span>
+          <div class="card-media">
+            <img :src="item.mainImage" :alt="item.title" loading="lazy" @error="onImageError" />
+          </div>
+          <div class="card-body">
+            <h3 class="card-title" :title="item.title">{{ item.title }}</h3>
+            <div class="card-price tnum">{{ formatPriceRange(item.priceMin, item.priceMax) }}</div>
+            <div class="card-meta">
+              <span class="tnum">已售 {{ item.totalSold }}</span>
+              <span v-if="item.reviewCount > 0" class="tnum">{{ item.avgScore.toFixed(1) }} 分</span>
             </div>
           </div>
-        </el-card>
+        </article>
       </div>
 
       <div v-if="hasMore" class="more">
@@ -173,97 +193,195 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.filters {
-  margin-bottom: 20px;
-}
+/* --------------------------------------------------------------------------
+ * 筛选工具栏
+ * ------------------------------------------------------------------------*/
 
-.filter-row {
+.toolbar {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
   align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
 }
 
-.keyword {
-  width: 260px;
+.f-keyword {
+  width: 280px;
 }
 
-.category {
-  width: 200px;
+.f-category {
+  width: 190px;
 }
 
-.price {
-  width: 110px;
+.f-price {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 240px;
+}
+
+.f-price :deep(.el-input-number) {
+  width: 100%;
 }
 
 .dash {
-  color: #c0c4cc;
+  color: var(--color-text-placeholder);
+  flex: 0 0 auto;
 }
 
-.sort {
+.f-sort {
   width: 150px;
 }
 
-.filter-hint {
-  margin-top: 10px;
-  font-size: 12px;
-  color: #909399;
+/* 主操作推到最右，工具栏左右分组更清晰 */
+.f-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-left: auto;
 }
 
-.grid-wrap {
+/* --------------------------------------------------------------------------
+ * 结果计数
+ * ------------------------------------------------------------------------*/
+
+.result-bar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin: var(--space-4) var(--space-1) var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
+}
+
+.result-count {
+  color: var(--color-text-secondary);
+}
+
+/* --------------------------------------------------------------------------
+ * 货架
+ *
+ * "货架感"来自**严格的行列对齐**，不是装饰：
+ *   - 图片区用 aspect-ratio 锁死比例，列宽变化时所有图仍然等高
+ *   - 标题固定两行高度，整排卡片的标题槽位一致
+ *   - card-price 用 margin-top:auto 压到底部，价格行跨卡片对齐
+ * 少了任何一条，卡片就会参差不齐，"货架"立刻散架。
+ * ------------------------------------------------------------------------*/
+
+.shelf-wrap {
   min-height: 200px;
 }
 
-.grid {
+.shelf {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--space-4);
 }
 
-.product {
+.card {
+  display: flex;
+  flex-direction: column;
+  background: var(--card-bg);
+  border: var(--card-border);
+  border-radius: var(--card-radius);
+  overflow: hidden;
   cursor: pointer;
+  transition:
+    border-color var(--dur) var(--ease-out),
+    box-shadow var(--dur) var(--ease-out),
+    transform var(--dur) var(--ease-out);
+}
+
+.card:hover,
+.card:focus-visible {
+  border-color: var(--color-border-strong);
+  box-shadow: var(--card-shadow-hover);
+  transform: translateY(-2px);
+}
+
+.card-media {
+  aspect-ratio: 1 / 1;
+  background: var(--media-bg);
   overflow: hidden;
 }
 
-.cover {
+.card-media img {
   width: 100%;
-  height: 210px;
+  height: 100%;
   object-fit: cover;
-  display: block;
-  background: #f5f7fa;
+  transition: transform var(--dur-slow) var(--ease-out);
 }
 
-.info {
-  padding: 12px;
+.card:hover .card-media img {
+  transform: scale(1.03);
 }
 
-.title {
-  font-size: 14px;
-  line-height: 1.4;
-  height: 39px;
-  overflow: hidden;
+.card-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4) var(--space-4);
+}
+
+.card-title {
+  /* 固定两行的高度：这是整排卡片能对齐的关键 */
+  height: calc(var(--text-base) * var(--leading-snug) * 2);
+  font-size: var(--text-base);
+  font-weight: var(--weight-normal);
+  line-height: var(--leading-snug);
+  color: var(--color-text);
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
-.price {
-  margin-top: 8px;
-  color: #d93025;
-  font-size: 16px;
-  font-weight: 600;
+.card-price {
+  /* 把价格行顶到卡片底部，跨卡片对齐 */
+  margin-top: auto;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+  color: var(--color-price);
 }
 
-.meta {
-  margin-top: 6px;
+.card-meta {
   display: flex;
   justify-content: space-between;
-  font-size: 12px;
-  color: #909399;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
 }
 
 .more {
-  margin-top: 24px;
+  margin-top: var(--space-6);
   text-align: center;
+}
+
+/* --------------------------------------------------------------------------
+ * 响应式
+ * ------------------------------------------------------------------------*/
+
+@media (max-width: 768px) {
+  .f-keyword,
+  .f-category,
+  .f-price,
+  .f-sort {
+    width: 100%;
+  }
+
+  .f-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .shelf {
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: var(--space-3);
+  }
 }
 </style>

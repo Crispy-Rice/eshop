@@ -144,7 +144,7 @@ seckill:result:{activityId}:{userId}
 第一期是单实例 Redis，分片的意义不是分散到多个节点，而是**降低单 key 上的冲突**：所有请求挤在一个 key 上时，一个分片售罄的判断、对账、展示都集中在热点上。分片设计同时为将来切 Redis Cluster 预留（届时不同分片自然落到不同节点）。做法：
 
 ```
-分片数 N = 8（可配）
+分片数 N = 8（可配）  ← ★ 实现取了 N=1，原因见 §11.1
 shardIdx = hash(skuId + userId) % N   ← 用 userId 参与散列，让同一用户固定落一片
 可用性判断：任一 shard > 0 即可下单（或要求指定 shard > 0）
 ```
@@ -386,6 +386,31 @@ ON CONFLICT DO NOTHING;
 | trade（发货） | `deliver(session, items, biz_key)` | 发货，`frozen→` 扣 `total` |
 | aftersale | `return_in(session, items, biz_key)` | 退货入库回补（**唯一**退货回补入口） |
 | product | `init(session, sku_id, wh_id, qty, biz_key)` | 初始化/覆盖库存（幂等 SET） |
-| 商家后台 | `POST /api/admin/inventory/adjust` | 手工调整，需审批 |
+| 商家后台 | `POST /api/merchant/inventory/adjust` | 手工调整 |
 
 **所有函数都必须接受 `biz_key` 参数**，没有例外。这是把幂等责任放在最底层的设计选择——底层可靠，上层就可以简化。
+
+### 11.1 实现状态与两处有意偏离
+
+本期已按上表实现（`app/modules/inventory/`），另有两处与本文原设计不同，以实现为准：
+
+| 项 | 本文原写法 | 实现 | 原因 |
+|---|---|---|---|
+| 手工调整 | "需审批" | **直接调整**，记 `operator` + 写 `stock_flow` 流水 | 目前没有审批模块；流水已能回答"谁改的"，审批留到有审批流时再接 |
+| 分片数 | §3.3 写 N=8 | **默认 N=1**（`INVENTORY_SHARD_COUNT`） | 见下 |
+
+**为什么默认不分片**：跨片不凑整（§10）意味着"超过单片余量的订单"必然失败——
+10 件库存分 4 片（3/3/2/2）时买 4 件就下不了单，尽管库存充足，这是正确性问题。
+而分片想换的收益（降低单 key 冲突）在单实例 Redis 上并不成立：Lua 脚本本就串行执行。
+多分片的代码路径保留，供将来切 Redis Cluster 时启用，但那条限制依然存在。
+
+### 11.2 HTTP 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/merchant/warehouses` | 仓库列表 |
+| POST | `/api/merchant/warehouses` | 建仓（首个自动设为默认仓） |
+| GET | `/api/merchant/inventory` | 库存列表；会先为该店铺**还没有库存记录的 SKU 补 0 库存行**，否则商家发布商品后在库存页看不到它 |
+| POST | `/api/merchant/inventory/adjust` | 手工调整，**需要 `Idempotency-Key`** |
+| GET | `/api/merchant/inventory/flows` | 库存流水 |
+| GET | `/api/skus/{sku_id}/stock` | 买家侧库存档位（**不回传真实库存**，见 §9） |

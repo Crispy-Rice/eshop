@@ -170,6 +170,7 @@ docker compose -f deploy/docker-compose.dev.yml down
 | - | [Redis Key 与 Lua 脚本汇总](docs/14-redis-keys.md) | ②③① 的原子操作实现 |
 | - | [接口清单与错误码](docs/15-api-and-errors.md) | 核心接口契约 |
 | - | [开发环境与部署](docs/16-deployment.md) | 本地环境、Docker Compose、腾讯云部署、凭证清单 |
+| - | [前端设计系统与开发约定](docs/17-frontend-design-system.md) | 视觉规范、三层 token、大促换肤机制、写页面的硬性约定 |
 
 ## 一页纸总览
 

@@ -91,6 +91,14 @@ def rate_limit_ip(ip: str) -> str:
     return f"rate:ip:{ip}"
 
 
+def review_daily(user_id: int, day: str) -> str:
+    """单用户当日评价计数（反刷频次，docs/12 §11）。
+
+    ``day`` 是 ``yyyymmdd``。按天分 key，TTL 给 2 天 —— 跨日与时钟漂移都留余量。
+    """
+    return f"review:daily:{user_id}:{day}"
+
+
 def login_fail_count(account_key: str) -> str:
     return f"login:fail:{account_key}"
 

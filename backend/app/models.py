@@ -14,7 +14,22 @@ from app.modules.account.models import (  # noqa: F401
     User,
     UserAddress,
 )
-from app.modules.core.models import LocalMessage  # noqa: F401
+from app.modules.aftersale.models import RefundItem, RefundOrder  # noqa: F401
+from app.modules.cart.models import CartItem  # noqa: F401
+from app.modules.core.models import LocalMessage, OpsAlert  # noqa: F401
+from app.modules.freight.models import (  # noqa: F401
+    FreightExcludeRegion,
+    FreightRegionRule,
+    FreightTemplate,
+    SkuFreightBind,
+)
+from app.modules.inventory.models import (  # noqa: F401
+    SkuStock,
+    StockBizKey,
+    StockFlow,
+    Warehouse,
+)
+from app.modules.payment.models import MockChannelTrade, Payment, PaymentRefund  # noqa: F401
 from app.modules.product.models import (  # noqa: F401
     Category,
     Sku,
@@ -22,6 +37,25 @@ from app.modules.product.models import (  # noqa: F401
     SpecGroup,
     SpecValue,
     Spu,
+)
+from app.modules.promotion.models import (  # noqa: F401
+    CouponCode,
+    CouponFlow,
+    CouponReceiveLog,
+    CouponTemplate,
+    CouponUserQuota,
+    PromoActivity,
+    PromoStackRule,
+)
+from app.modules.review.models import Review, ReviewReply  # noqa: F401
+from app.modules.trade.models import (  # noqa: F401
+    DeliveryItem,
+    DeliveryOrder,
+    OrderDiscountSnapshot,
+    OrderItem,
+    OrderMain,
+    OrderStateFlow,
+    OrderSub,
 )
 
 # 后续模块在这里登记，例如：

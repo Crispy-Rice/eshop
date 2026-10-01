@@ -20,6 +20,12 @@ DEV_PLACEHOLDER = "dev-only"
 # 对称密钥的最小字节数（RFC 7518 §3.2：HS256 密钥应 >= 哈希输出长度）
 MIN_SECRET_BYTES = 32
 
+# PHONE_ENC_KEY 的默认值。它是个**合法的** 32 字节 base64，所以
+# ``_validate_phone_enc_key`` 会放行、``DEV_PLACEHOLDER`` 前缀也拦不住 ——
+# 只能单独拿它比对。漏配的后果是生产环境用一个公开已知的 AES 密钥加密所有
+# 手机号，加密形同虚设（docs/13-schema.md §2 要求手机号加密存储）。
+KNOWN_PHONE_ENC_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -51,6 +57,27 @@ class Settings(BaseSettings):
     # 超时要短：Redis 卡住时应用要能快速走降级（docs/14 §5.2）
     redis_socket_timeout: float = 0.5
 
+    # ---------- 库存（docs/03-inventory.md）----------
+    # 分片数。**默认 1，这是对 docs/03 §3.3 的有意偏离**，原因：
+    #
+    #   分片把可售量拆成 N 份，而 docs/03 §10 明确"不允许跨分片凑、整片扣"。
+    #   于是任何超过单片余量的订单都会失败 —— 10 件库存分 4 片（3/3/2/2）时，
+    #   买 4 件就下不了单，尽管库存充足。这是正确性问题，不是性能问题。
+    #
+    #   而分片想换来的收益（降低单个 key 上的冲突）在**单实例 Redis 上并不成立**：
+    #   Lua 脚本是串行执行的，两个请求本就不会在脚本内部争用同一个 key。
+    #   真正需要分片的是 Redis Cluster（不同分片落在不同节点），那是二期的事。
+    #
+    # 值 > 1 时上面的限制依然存在，只在"库存远大于单笔最大购买量"时才安全
+    # （Quantity 上限 200，见 core/schemas.py）。要用请自行评估。
+    inventory_shard_count: int = 1
+    # 预占记录 TTL。要覆盖"下单 → 支付"的最长耗时，否则订单还没付记录就被清了
+    inventory_lock_ttl_seconds: int = 7200
+    # 售罄标记 TTL：存在即快速拒绝，省掉一次分片查询
+    inventory_zero_marker_ttl: int = 3600
+    # 每轮对账抽样的 SKU 数
+    inventory_reconcile_sample: int = 200
+
     # ---------- 安全 ----------
     jwt_secret: str = DEV_PLACEHOLDER
     jwt_access_ttl_minutes: int = 30
@@ -59,11 +86,15 @@ class Settings(BaseSettings):
     price_token_ttl_minutes: int = 30
     phone_hash_key: str = DEV_PLACEHOLDER
     # 必须是 32 字节的 base64（AES-256-GCM）
-    phone_enc_key: str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+    phone_enc_key: str = KNOWN_PHONE_ENC_KEY
     password_min_length: int = 8
 
     # ---------- 支付 ----------
     payment_mock_enabled: bool = True
+    # 演示环境没有真实渠道，却又要跑 production 的那一圈自检（密钥必须换掉、
+    # /docs 必须关闭），所以给模拟支付留一个**显式**口子。默认 false：真要对外
+    # 收款时忘了关 PAYMENT_MOCK_ENABLED，启动就会失败，而不是悄悄放行假支付。
+    allow_mock_payment_in_prod: bool = False
     mock_pay_secret: str = DEV_PLACEHOLDER
     pay_notify_base_url: str = "http://127.0.0.1:8000"
 
@@ -97,7 +128,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _guard_production(self) -> Settings:
-        """生产环境的启动自检：密钥必须换掉，模拟支付必须关闭。
+        """生产环境的启动自检：密钥必须换掉，模拟支付要有显式授权。
 
         对应 docs/16-deployment.md §9 上线检查清单的第 3 条。
         """
@@ -120,8 +151,16 @@ class Settings(BaseSettings):
                     f"{name} 太短（{len(value.encode())} 字节），至少需要 {MIN_SECRET_BYTES} 字节"
                 )
 
-        if self.payment_mock_enabled:
-            problems.append("PAYMENT_MOCK_ENABLED 必须为 false 才能接入真实渠道上线")
+        # 单独判 PHONE_ENC_KEY：它的默认值是合法的 32 字节 base64，
+        # 上面那圈"前缀 + 长度"检查对它无效（见 KNOWN_PHONE_ENC_KEY 的注释）。
+        if self.phone_enc_key == KNOWN_PHONE_ENC_KEY:
+            problems.append("PHONE_ENC_KEY 仍是仓库里的公开默认值，加密手机号形同虚设")
+
+        if self.payment_mock_enabled and not self.allow_mock_payment_in_prod:
+            problems.append(
+                "PAYMENT_MOCK_ENABLED=true 却没授权：真实上线请置为 false，"
+                "演示环境请显式设置 ALLOW_MOCK_PAYMENT_IN_PROD=true"
+            )
 
         if problems:
             raise ValueError("生产环境配置检查未通过：\n  - " + "\n  - ".join(problems))

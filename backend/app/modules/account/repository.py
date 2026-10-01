@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 
 from sqlalchemy import case, delete, func, select, update
@@ -147,6 +148,19 @@ async def get_shop_by_owner(session: AsyncSession, owner_user_id: int) -> Shop |
 
 async def get_shop_by_id(session: AsyncSession, shop_id: int) -> Shop | None:
     return await session.get(Shop, shop_id)
+
+
+async def list_shops_by_ids(session: AsyncSession, shop_ids: Sequence[int]) -> list[Shop]:
+    if not shop_ids:
+        return []
+    return list(await session.scalars(select(Shop).where(Shop.id.in_(shop_ids))))
+
+
+async def list_users_by_ids(session: AsyncSession, user_ids: Sequence[int]) -> list[User]:
+    """批量取用户。评价列表要展示昵称与头像，逐个查就是 N+1。"""
+    if not user_ids:
+        return []
+    return list(await session.scalars(select(User).where(User.id.in_(user_ids))))
 
 
 async def insert_shop(session: AsyncSession, shop: Shop) -> Shop:

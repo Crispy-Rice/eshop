@@ -5,7 +5,8 @@ import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 
 import { isBizError } from '@/api/errors'
 import { createSpu, fetchCategoryTree, type Category, type SkuIn, type SpuCreateInput } from '@/api/product'
-import { DEFAULT_IMAGE, onImageError } from '@/utils/placeholder'
+import ImageUploader from '@/components/ImageUploader.vue'
+import { DEFAULT_IMAGE } from '@/utils/placeholder'
 import { formatYuan, yuanToFen } from '@/utils/money'
 
 const router = useRouter()
@@ -57,7 +58,7 @@ const groups = ref<GroupRow[]>([
 const rules: FormRules = {
   categoryId: [{ required: true, message: '请选择末级类目', trigger: 'change' }],
   title: [{ required: true, message: '请输入商品标题', trigger: 'blur' }],
-  mainImage: [{ required: true, message: '请输入主图地址', trigger: 'blur' }],
+  mainImage: [{ required: true, message: '请上传主图', trigger: 'change' }],
 }
 
 const cascaderProps = {
@@ -254,7 +255,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div>
+  <div class="page">
     <el-card shadow="never">
       <template #header>
         <div class="card-header">
@@ -281,14 +282,16 @@ onMounted(async () => {
         </el-form-item>
         <el-form-item label="主图" prop="mainImage">
           <div class="image-row">
-            <el-input v-model="form.mainImage" maxlength="255" class="w360" />
-            <img :src="form.mainImage" alt="主图预览" class="preview" @error="onImageError" />
+            <ImageUploader v-model="form.mainImage" biz="products" />
+            <span class="inline-hint">
+              建议正方形。长边超过 1280px 会自动压缩，带 GPS 的元数据会被剔除
+            </span>
           </div>
         </el-form-item>
       </el-form>
     </el-card>
 
-    <el-card class="mt16" shadow="never">
+    <el-card shadow="never">
       <template #header>
         <div class="card-header">
           <span>规格</span>
@@ -309,7 +312,8 @@ onMounted(async () => {
         <div class="values">
           <div v-for="(value, vi) in group.values" :key="value.key" class="value-row">
             <el-input v-model="value.value" placeholder="取值，如 暗夜黑" class="w180" maxlength="32" />
-            <el-input v-model="value.image" placeholder="色块图 URL（选填）" class="w280" maxlength="255" />
+            <ImageUploader v-model="value.image" biz="products" size="small" clearable />
+            <span class="inline-hint">色块图（选填）</span>
             <el-button link type="danger" :disabled="group.values.length <= 1" @click="removeValue(group, vi)">
               删除
             </el-button>
@@ -318,7 +322,7 @@ onMounted(async () => {
         </div>
       </div>
 
-      <el-alert type="info" :closable="false" class="mt16">
+      <el-alert type="info" :closable="false">
         <template #title>
           已生成 {{ skuTable.length }} 个规格组合，默认全部上架。
           勾掉不需要的组合即可（例如"白色 + 512G"没有备货，取消勾选即可，前端会把它置灰）。
@@ -333,7 +337,7 @@ onMounted(async () => {
           <div class="header-actions">
             <span class="hint">
               上架 {{ enabledSkus.length }} 个<span v-if="disabledCount > 0">，不上架 {{ disabledCount }} 个</span>
-              ｜ 价格区间 {{ pricePreview }}
+              ｜ 价格区间 <span class="tnum">{{ pricePreview }}</span>
             </span>
             <el-button size="small" @click="generateCodes">按标题生成编码</el-button>
           </div>
@@ -378,12 +382,14 @@ onMounted(async () => {
             />
           </template>
         </el-table-column>
-        <el-table-column label="封面图" min-width="220">
+        <el-table-column label="封面图" width="110" align="center">
           <template #default="{ row }">
-            <div class="image-row">
-              <el-input v-model="row.coverImage" size="small" :disabled="!row.enabled" maxlength="255" />
-              <img :src="row.coverImage" alt="封面" class="thumb" @error="onImageError" />
-            </div>
+            <ImageUploader
+              v-model="row.coverImage"
+              biz="products"
+              size="small"
+              :disabled="!row.enabled"
+            />
           </template>
         </el-table-column>
       </el-table>
@@ -399,27 +405,80 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+/* 三张卡片用统一的纵向间隔串起来，替代原来散落的 .mt16 */
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
 .card-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-4);
   flex-wrap: wrap;
 }
 
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .hint {
-  font-size: 12px;
-  color: #909399;
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
 }
 
-.mt16 {
-  margin-top: 16px;
+.hint .tnum {
+  color: var(--color-price);
+  font-weight: var(--weight-medium);
+}
+
+/* --------------------------------------------------------------------------
+ * 规格组编辑器
+ *
+ * 每个规格组做成一块有底色的小面板 —— "模块化"在这里是字面意思：
+ * 一组规格就是一个可独立增删的模块，边界清楚比分隔线更好读。
+ * ------------------------------------------------------------------------*/
+
+.group {
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
+}
+
+.group + .group {
+  margin-top: var(--space-3);
+}
+
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.values {
+  margin-top: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: flex-start;
+}
+
+.value-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+}
+
+.image-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
 }
 
 .w110 {
@@ -442,47 +501,13 @@ onMounted(async () => {
   width: 360px;
 }
 
-.group {
-  padding: 12px 0;
-  border-bottom: 1px dashed #ebeef5;
-}
-
-.group:last-of-type {
-  border-bottom: none;
-}
-
-.group-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.values {
-  margin: 12px 0 0 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  align-items: flex-start;
-}
-
-.value-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.image-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
 .preview,
 .thumb {
-  object-fit: cover;
-  border-radius: 4px;
-  background: #f5f7fa;
   flex: 0 0 auto;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-inset);
 }
 
 .preview {
@@ -495,10 +520,25 @@ onMounted(async () => {
   height: 32px;
 }
 
+/* 主操作固定在右下，整页只有一个终点 */
 .submit-bar {
-  margin-top: 20px;
+  margin-top: var(--space-5);
   display: flex;
   justify-content: flex-end;
-  gap: 12px;
+  gap: var(--space-3);
+}
+
+@media (max-width: 900px) {
+  .w180,
+  .w200,
+  .w280,
+  .w360 {
+    width: 100%;
+  }
+
+  .value-row,
+  .image-row {
+    flex-wrap: wrap;
+  }
 }
 </style>

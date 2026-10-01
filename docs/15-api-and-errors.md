@@ -123,7 +123,7 @@ class OrderOut(CamelModel):
 | GET | `/api/skus/{skuId}/stock` | 库存查询（展示用，档位化） | - |
 | GET | `/api/search?kw=&categoryId=&priceFrom=&priceTo=&sort=&cursor=` | 商品搜索（[02 §7](02-domain-model.md)） | - |
 | GET | `/api/categories` | 类目树 | - |
-| POST | `/api/files/images` | 上传图片（评价、售后凭证），返回相对路径 | 登录，单张 ≤ 5MB |
+| POST | `/api/files/images?biz=reviews\|aftersale\|products` | 上传图片，返回相对路径与可直用的 url | 登录，单张 ≤ 5MB |
 
 ### 2.2 购物车
 
@@ -134,6 +134,17 @@ class OrderOut(CamelModel):
 | PUT | `/api/cart/items/{skuId}` | 修改数量（`num` 设置为指定值） | ✅ 天然幂等（SET 语义） |
 | DELETE | `/api/cart/items` | 批量删除（body：`skuIds`） | ✅ 天然幂等 |
 | PUT | `/api/cart/select` | 勾选/取消勾选 | ✅ 天然幂等 |
+
+> **实现补充**（在 docs/02 §4 定了"失效项不自动删、由用户主动清"之后新增的两个接口）：
+>
+> | 方法 | 路径 | 说明 |
+> |---|---|---|
+> | GET | `/api/cart/count` | 顶栏角标。单独一个轻接口，不必为了显示数字拉整个购物车 |
+> | DELETE | `/api/cart/invalid` | 清除失效商品。判定用**实时状态**而不只看"商品查不到"——已下架的商品同样是买了也没用的 |
+>
+> 另外 `GET /api/cart` 的分组规则：**失效与已下架**的商品放进 `invalidItems`（不参与合计），
+> **无货**的商品留在原分组（它是正常商品，补货后还能买，用户也需要看到它在哪个店铺）；
+> 金额一律只算**有效且已勾选**的项。
 
 ### 2.3 结算与下单
 
@@ -316,10 +327,16 @@ Idempotency-Key: 9a8b7c6d-...
 
 | 方法 | 路径 | 说明 | 幂等 |
 |---|---|---|---|
-| POST | `/api/payments` | ★ 发起支付（返回收银台地址/渠道参数） | ✅ `Idempotency-Key` + `uk_payment_main_active` |
-| GET | `/api/payments/{payNo}` | 查询支付状态（前端轮询，触发查单补偿） | - |
-| POST | `/api/pay/notify/{channel}` | ★ 渠道回调（不走 JWT，验签） | ✅ `uk_notify_trade` |
-| POST | `/api/mock-channel/pay` | 模拟收银台的支付操作（仅 `PAYMENT_MOCK_ENABLED=true` 时注册） | 按 `payNo` 幂等 |
+| POST | `/api/payments` | ★ 发起支付（同一母单重复调用返回同一张支付单） | ✅ `uk_payment_order_main_no` |
+| GET | `/api/payments/{payNo}` | 查询支付状态 | - |
+| POST | `/api/payments/{payNo}/mock-callback` | ★ **模拟渠道回调**（仅 `PAYMENT_MOCK_ENABLED=true` 可用，不需要登录） | ✅ 支付单 CAS `status = 待支付` |
+| POST | `/api/pay/notify/{channel}` | 真实渠道回调（不走 JWT，验签） | 二期，随真实渠道适配器一起做 |
+
+**关于模拟回调的形态**：[09 §3.1](09-payment.md) 描述的是"前端 → `POST /api/mock-channel/pay`
+→ 后端**再发起一次 HTTP 回调**到自己"的两跳模型，为的是把"渠道服务器回调我方"这一跳也演出来。
+第一期简化成**一跳**：前端点「确认支付」直接打 `mock-callback`，它承担"渠道通知我方"的语义，
+所做的三件事（写渠道交易 → CAS 推进支付单 → 调 `trade.mark_paid`）与真实回调完全一致，
+**回调幂等性也一并被验证到了**。二期接真实渠道时补上验签与两跳即可，业务侧调用不变。
 
 #### POST /api/payments
 
@@ -354,10 +371,15 @@ Idempotency-Key: 9a8b7c6d-...
 |---|---|---|---|
 | POST | `/api/aftersales/check` | 售后资格预检（可退数量、金额） | - |
 | POST | `/api/aftersales` | ★ 申请售后 | ✅ `Idempotency-Key` + 订单项行锁 |
+| GET | `/api/aftersales` | 我的售后列表（游标分页，可按状态筛） | - |
 | GET | `/api/aftersales/{refundNo}` | 售后详情 | - |
 | POST | `/api/aftersales/{refundNo}/return` | 填写退货物流 | ✅ 状态 CAS |
 | POST | `/api/aftersales/{refundNo}/revoke` | 撤销申请 | ✅ 状态 CAS |
-| POST | `/api/aftersales/{refundNo}/intervene` | 申请平台介入 | ✅ 状态 CAS |
+| POST | `/api/aftersales/{refundNo}/intervene` | 申请平台介入 | **本期未实现**（平台仲裁不在第一期范围） |
+
+**本期范围**：只做**仅退款**与**退货退款**两种类型，商家 48 小时未审核**自动同意**
+（而不是转平台介入）。状态 90（平台介入中）保留在枚举里但没有任何入边，
+所以 `/intervene` 这个接口一期不提供。换货、补寄、积分返还同样不在本期。
 
 #### POST /api/aftersales/check
 
@@ -398,10 +420,20 @@ Idempotency-Key: 9a8b7c6d-...
 |---|---|---|---|
 | GET | `/api/reviews/pending` | 待评价的订单项 | - |
 | POST | `/api/reviews/eligibility` | 评价资格检查 | - |
-| POST | `/api/reviews` | ★ 提交评价 | ✅ `uk_review_order_item` |
-| POST | `/api/reviews/{reviewId}/follow-up` | 追评 | ✅ `uk_review_follow_up` |
-| GET | `/api/spus/{spuId}/reviews?sort=&cursor=` | 商品评价列表（游标分页） | - |
-| GET | `/api/spus/{spuId}/review-stats` | 评价统计 | - |
+| POST | `/api/reviews` | ★ 提交评价 | ✅ `uk_review_order_item`（同一订单项只能一条首评） |
+| POST | `/api/reviews/{reviewId}/follow-up` | 追评 | ✅ `uk_review_follow_up`（一条首评只能追一次） |
+| GET | `/api/reviews/mine` | 我的评价（首评与追评都列出，游标分页） | - |
+| GET | `/api/spus/{spuId}/reviews` | 商品评价列表。**公开接口**，`sort=latest\|recommend`、`filter=all\|good\|with_image`、游标分页 | - |
+| GET | `/api/spus/{spuId}/review-stats` | 评价统计。**公开接口** | - |
+
+**两条前端必须知道的约定**：
+
+1. **`GET /api/spus/{spuId}/review-stats` 在商品没有任何已发布评价时，
+   `avgScore` 与 `goodRate` 都是 `null`** —— 不要渲染成 5.0 分或 0 分，
+   直接显示"暂无评价"（docs/12 §9）。
+2. 评价列表返回的 `images` 是对象数组 `{path, url, thumbUrl}`。**列表页用
+   `thumbUrl`**（200px 缩略图），详情查看用 `url`（长边 1280 的归一化图）。
+   入库时提交的是上传接口返回的 `path`（相对路径，不带 `/media/` 前缀）。
 
 ### 2.8 商家端（节选，`role = merchant`）
 
@@ -410,30 +442,47 @@ Idempotency-Key: 9a8b7c6d-...
 | GET/POST/PUT | `/api/merchant/spus[/{spuId}]` | 商品发布与编辑（[02 §9](02-domain-model.md)） |
 | POST | `/api/merchant/spus/{spuId}/submit` | 提交审核 |
 | PUT | `/api/merchant/skus/{skuId}/stock` | 设置库存（需审批记录，[03 §11](03-inventory.md)） |
-| GET/POST/PUT | `/api/merchant/freight-templates[/{id}]` | 运费模板 |
-| GET/POST | `/api/merchant/coupon-templates` | 店铺券 |
+| GET/POST/PUT | `/api/merchant/freight/templates[/{id}]` | 运费模板（实际路径带 `freight/`，早期文档写成 `freight-templates` 是错的） |
+| POST | `/api/merchant/freight/bind` | 把 SKU 绑到运费模板 |
+| GET | `/api/merchant/freight/templates/{id}/binds` | ★ 该模板绑了哪些 SKU。带商品标题/规格/仓库名（后端拼好）。**只有读，没有解绑** |
+| GET/POST | `/api/merchant/coupon-templates` | 店铺券（未实现） |
 | GET | `/api/merchant/orders?status=&cursor=` | 商家订单列表（`idx_order_sub_shop` 索引） |
 | POST | `/api/merchant/order-subs/{subNo}/ship` | 发货（填写快递公司与单号） |
+| GET | `/api/merchant/aftersales?status=&pendingOnly=&cursor=` | 商家售后列表。**列表项是精简对象**：不含凭证图、退货物流、质检结果、时间线 |
+| GET | `/api/merchant/aftersales/{refundNo}` | ★ 售后详情（完整对象：明细、凭证图、退货物流、质检、全部时间戳、`can*` 标志） |
 | POST | `/api/merchant/aftersales/{refundNo}/approve` | 同意售后 |
 | POST | `/api/merchant/aftersales/{refundNo}/reject` | 拒绝售后 |
 | POST | `/api/merchant/aftersales/{refundNo}/receive` | 确认收到退货 |
-| POST | `/api/merchant/aftersales/{refundNo}/quality` | ★ 提交质检结果（触发库存回补） |
-| POST | `/api/merchant/reviews/{reviewId}/reply` | 回复评价 |
+| POST | `/api/merchant/aftersales/{refundNo}/quality` | ★ 提交质检结果（触发库存回补）。`images` 支持 ≤9 张留证图 |
+| POST | `/api/merchant/reviews/{reviewId}/reply` | 回复评价（每条评价最多 3 次商家回复） |
+| GET | `/api/merchant/reviews?status=&cursor=` | 本店评价列表（走 `idx_review_shop_status`） |
 
 ### 2.9 平台运营端（节选，`role = admin / finance`）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET/POST | `/api/admin/shops` | 店铺入驻与管理 |
+| GET/POST | `/api/admin/shops` | 店铺入驻与管理（未实现） |
 | POST | `/api/admin/spus/{spuId}/audit` | 商品审核 |
-| GET/POST | `/api/admin/coupon-templates` | 平台券 |
-| GET/POST | `/api/admin/promo-activities` | 促销活动 |
-| GET | `/api/admin/aftersales?status=90` | 平台介入工单 |
-| POST | `/api/admin/aftersales/{refundNo}/judge` | 平台裁决 |
-| GET | `/api/admin/reviews/audit-queue` | 评价审核队列 |
-| GET | `/api/admin/reconcile/diffs` | 对账差异（finance） |
-| GET | `/api/admin/alerts` | 告警列表（对账异常、死信等） |
-| PUT | `/api/admin/switches/{name}` | 降级开关 |
+| GET | `/api/admin/coupons/templates` | 券模板列表（`status` 过滤 + 游标分页）。★ 出参比券中心那份**多带发行量/已发量/适用范围/getType** |
+| POST | `/api/admin/coupons/templates` | 新建券模板 |
+| POST | `/api/admin/coupons/issue` | 客服补发。**只支持单个 `userId`**，单次 ≤100 张，不占活动额度 |
+| GET | `/api/admin/promotions` | 促销活动列表（`status` 过滤 + 游标分页），带 `levelText`/`typeText`/`calcTypeText`/`statusText` |
+| POST | `/api/admin/promotions` | 新建促销活动。响应只回 `{id, name}` |
+| GET | `/api/admin/aftersales?status=90` | 平台介入工单（未实现） |
+| POST | `/api/admin/aftersales/{refundNo}/judge` | 平台裁决（未实现） |
+| GET | `/api/admin/reviews/audit-queue` | 评价审核队列（`secondAuditOnly=true` 看待抽检的） |
+| POST | `/api/admin/reviews/{reviewId}/audit` | 处置评价：APPROVE / REJECT / BLOCK / UNBLOCK。**会同步更新商品评分** |
+| GET | `/api/admin/reconcile/diffs` | 对账差异（finance，未实现） |
+| GET | `/api/admin/alerts` | 告警列表（对账异常、死信等，未实现） |
+| PUT | `/api/admin/switches/{name}` | 降级开关（未实现） |
+
+> 券与活动这两组 GET 是**后补的**：原先运营端三个接口全是 POST，
+> 运营建完券模板/活动后**界面上再也看不到**，会以为提交失败。
+> 路径刻意与同资源的 POST 一致（`/api/admin/coupons/templates`、
+> `/api/admin/promotions`），没有照早期文档写成 `/api/admin/coupon-templates`。
+>
+> ★ **叠加规则（`promo_stack_rule`）没有任何写接口**，那 10 条默认规则是迁移里插的，
+> 界面上配不了。
 
 **商家端与运营端接口的权限校验**：除了角色，每个接口必须校验**资源归属**（这个子单/售后单属于当前商家的店铺），不能只校验"是商家"：
 
@@ -537,6 +586,7 @@ class ErrorCode(StrEnum):
 | `PAY_CHANNEL_UNAVAILABLE` | 503 | 支付渠道维护中 | 提示稍后再试 |
 | **售后** | | | |
 | `AFTERSALE_EXPIRED` | 422 | 已超过售后期限 | 提示 |
+| `AFTERSALE_STATUS_INVALID` | 422 | 当前售后状态不允许该操作 | 刷新售后详情 |
 | `REFUND_NUM_EXCEED` | 422 | 退货数量超过可退数量 | 提示可退数 |
 | `REFUND_AMOUNT_EXCEED` | 422 | 退款金额超过实付 | 前端 Bug，上报 |
 | `AFTERSALE_IN_PROGRESS` | 422 | 已有进行中的售后 | 跳转售后详情 |
@@ -544,11 +594,17 @@ class ErrorCode(StrEnum):
 | **评价** | | | |
 | `ORDER_ITEM_NOT_FOUND` | 404 | 订单不存在（含"不是你的订单"） | 提示 |
 | `NOT_RECEIVED` | 422 | 确认收货后才能评价 | 提示 |
+| `ORDER_NOT_FINISHED` | 422 | 订单完成后才能评价（待付款 / 未发货） | 提示 |
 | `ALREADY_REVIEWED` | 422 | 该商品已评价 | ★ 提示（唯一索引拦截） |
 | `REVIEW_EXPIRED` | 422 | 评价期限已过 | 提示 |
 | `ALREADY_FOLLOWED_UP` | 422 | 已追评 | 提示 |
 | `ITEM_REFUNDED` | 422 | 已退款商品不能评价 | 提示 |
 | `IN_AFTERSALE` | 422 | 售后处理中，暂不能评价 | 提示 |
+| `REPLY_LIMIT_EXCEEDED` | 422 | 该评价的回复次数已达上限 | 提示（每条最多 3 次） |
+| `REVIEW_STATUS_INVALID` | 422 | 当前评价状态不允许该操作 | 刷新审核队列 |
+| **文件上传** | | | |
+| `INVALID_IMAGE` | 422 | 图片格式不支持或已损坏 | 提示重新选择 |
+| `IMAGE_TOO_LARGE` | 413 | 图片体积超过限制 | 提示压缩后再传 |
 
 ### 3.3 错误响应的安全原则
 

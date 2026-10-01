@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 
@@ -310,6 +311,24 @@ async def get_my_shop(session: AsyncSession, user_id: int) -> ShopOut:
     return ShopOut(
         id=shop.id, name=shop.name, logo=shop.logo, description=shop.description, status=shop.status
     )
+
+
+async def list_shop_names(session: AsyncSession, shop_ids: Sequence[int]) -> dict[int, str]:
+    """批量取店铺名。购物车按店铺分组展示时用，避免逐个查询。"""
+    shops = await repo.list_shops_by_ids(session, list(shop_ids))
+    return {s.id: s.name for s in shops}
+
+
+async def list_user_profiles(
+    session: AsyncSession, user_ids: Sequence[int]
+) -> dict[int, tuple[str, str | None]]:
+    """批量取用户的 ``(昵称, 头像)``。评价列表展示评价人时用，避免逐个查询。
+
+    评价模块只拿昵称与头像做展示，**不暴露手机号等其它字段** ——
+    所以这里返回元组而不是完整 DTO。
+    """
+    users = await repo.list_users_by_ids(session, list(user_ids))
+    return {u.id: (u.nickname, u.avatar) for u in users}
 
 
 # ============================================================

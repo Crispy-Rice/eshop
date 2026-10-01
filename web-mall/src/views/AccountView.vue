@@ -216,7 +216,7 @@ onMounted(() => {
 .account {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: var(--space-5);
 }
 
 .card-header {
@@ -226,20 +226,20 @@ onMounted(() => {
 }
 
 .shop-row {
-  margin-top: 16px;
+  margin-top: var(--space-4);
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 .hint {
-  font-size: 13px;
-  color: #909399;
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
 }
 
 .region {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
 }
 </style>

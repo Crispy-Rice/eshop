@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,17 @@ PASSWORD = "Str0ng-Pass!2026"  # noqa: S105
 # 账号用固定手机号，重复执行时复用而不是每次新建一个
 ADMIN_PHONE = "13900000001"
 MERCHANT_PHONE = "13800000001"
+
+# 演示商品没有真实图片，用一个内联 SVG 占位。
+# ★ 不能用 ``/media/placeholder.svg`` 这种路径：那个文件仓库里根本没有，
+#   而且 ``main_image`` 是 VARCHAR(255) 且 NOT NULL，指向静态文件还得保证它
+#   在商城（``/``）与后台（``/admin/``）两个路径下都存在 —— 内联最省事。
+# 与 web-admin/src/utils/placeholder.ts 的 DEFAULT_IMAGE 保持一致。
+DEFAULT_IMAGE = (
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
+    "width='300' height='300'%3E%3Crect width='300' height='300' "
+    "fill='%23f1f1f3'/%3E%3C/svg%3E"
+)
 
 # SKU 编码带时间戳，避免和之前跑出来的商品撞码
 SUFFIX = str(int(time.time()))[-6:]
@@ -126,8 +138,161 @@ def ensure_categories(client: httpx.Client, admin_h: dict[str, str]) -> dict[str
     return ids
 
 
+def ensure_coupons(client: httpx.Client, admin_h: dict[str, str]) -> int:
+    """按名字建几个演示券模板，已存在的跳过。
+
+    券模板一旦有券发出就**不可修改**（docs/04 §11），所以这里只判断"同名模板
+    是否已存在"，存在就跳过 —— 重复执行不会因为建不出来而中断。
+    """
+    existing = set()
+    for item in unwrap(client.get("/coupons/available", headers=admin_h)):
+        existing.add(item["template"]["name"])
+
+    # (名字, 门槛分, 减免分, 总量, 每人限领)
+    plans = [
+        ("满 100 减 20", 10000, 2000, 1000, 1),
+        ("满 500 减 80", 50000, 8000, 500, 2),
+        ("新人无门槛减 10", 0, 1000, 2000, 1),
+    ]
+
+    created = 0
+    for name, threshold, value, total, per_user in plans:
+        if name in existing:
+            continue
+        unwrap(
+            client.post(
+                "/admin/coupons/templates",
+                json={
+                    "name": name,
+                    "type": 3 if threshold == 0 else 1,
+                    "discountValue": value,
+                    "threshold": threshold,
+                    "totalCount": total,
+                    "perUserLimit": per_user,
+                    "validType": 1,
+                    "validStart": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+                    "validEnd": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+                    "scopeType": 1,
+                },
+                headers=admin_h,
+            )
+        )
+        created += 1
+    return created
+
+
+def ensure_stock(client: httpx.Client, merchant_h: dict[str, str], qty: int = 100) -> int:
+    """给还没上库存的 SKU 补货。
+
+    ★ 没有库存的商品**下不了单** —— 演示数据里这一步不能省。
+    只补 available 为 0 的，重复执行不会把已经卖掉的库存又加回去。
+    """
+    items = unwrap(
+        client.get("/merchant/inventory", params={"limit": 100}, headers=merchant_h)
+    )["items"]
+    filled = 0
+    for i, item in enumerate(items):
+        if item["available"] > 0:
+            continue
+        unwrap(
+            client.post(
+                "/merchant/inventory/adjust",
+                json={
+                    "skuId": item["skuId"],
+                    "warehouseId": item["warehouseId"],
+                    "delta": qty,
+                    "remark": "演示数据初始化",
+                },
+                headers={
+                    **merchant_h,
+                    # 每一条用不同的幂等键，否则第二条会被当成重放而跳过
+                    "Idempotency-Key": f"seed-stock-{item['skuId']}-{i}",
+                },
+            )
+        )
+        filled += 1
+    return filled
+
+
+def ensure_freight(client: httpx.Client, merchant_h: dict[str, str]) -> int:
+    """建一个运费模板并把商家的 SKU 全绑上。
+
+    ★ 不绑模板的商品**下不了单** —— 算不出运费。所以演示数据里这一步不能省。
+
+    模板参数：首重 1000g / 10 元，续重 500g / 3 元，满 99 元包邮。
+    """
+    templates = unwrap(client.get("/merchant/freight/templates", headers=merchant_h))
+    if templates:
+        return 0  # 已经建过，跳过（重复执行不会重复建）
+
+    tpl = unwrap(
+        client.post(
+            "/merchant/freight/templates",
+            json={
+                "name": "默认快递模板",
+                "chargeType": 1,
+                "firstUnit": 1000,
+                "firstPrice": 1000,
+                "addUnit": 500,
+                "addPrice": 300,
+                "freeShipping": False,
+                "freeThreshold": 9900,
+                "freeNum": 0,
+                "mergeType": 1,
+            },
+            headers=merchant_h,
+        )
+    )
+    # 必须有"全国默认"，否则其他地区一条规则都匹配不到
+    unwrap(
+        client.put(
+            f"/merchant/freight/templates/{tpl['id']}/regions",
+            json={
+                "rules": [
+                    {
+                        "regionCode": "0",
+                        "regionLevel": 1,
+                        "firstUnit": 1000,
+                        "firstPrice": 1000,
+                        "addUnit": 500,
+                        "addPrice": 300,
+                        "priority": 0,
+                    }
+                ]
+            },
+            headers=merchant_h,
+        )
+    )
+
+    # 把商家的 SKU 全绑到这个模板（仓库取库存页里的默认仓）
+    warehouses = unwrap(client.get("/merchant/warehouses", headers=merchant_h))
+    if not warehouses:
+        return 1
+    wh_id = warehouses[0]["id"]
+
+    bound = 0
+    for item in unwrap(
+        client.get("/merchant/inventory", params={"limit": 100}, headers=merchant_h)
+    )["items"]:
+        unwrap(
+            client.post(
+                "/merchant/freight/bind",
+                json={
+                    "skuId": item["skuId"],
+                    "templateId": tpl["id"],
+                    "warehouseId": wh_id,
+                    "priority": 0,
+                },
+                headers=merchant_h,
+            )
+        )
+        bound += 1
+    print(f"运费模板已建，绑定 {bound} 个 SKU")
+    return 1
+
+
 def build_products(category_ids: dict[str, str]) -> list[dict]:
-    img = "/media/placeholder.svg"
+    img = DEFAULT_IMAGE
     return [
         {
             "categoryId": category_ids["智能手机"],
@@ -264,6 +429,9 @@ def main() -> int:
         category_ids = ensure_categories(client, admin_h)
         print(f"类目就绪：{len(category_ids)} 个（已存在的复用，不重复创建）")
 
+        coupon_count = ensure_coupons(client, admin_h)
+        print(f"券模板就绪：新建 {coupon_count} 个（已存在的跳过）")
+
         # ---------- 商家 ----------
         merchant_h = login_or_register(client, MERCHANT_PHONE, "演示商家")
 
@@ -296,6 +464,13 @@ def main() -> int:
             )
             published += 1
             print(f"已上架：{payload['title']}（{len(created['skus'])} 个 SKU）")
+
+        # ---------- 库存与运费 ----------
+        # 顺序不能反：运费模板要绑定库存记录里的 SKU
+        filled = ensure_stock(client, merchant_h)
+        if filled:
+            print(f"补库存：{filled} 个 SKU 各 +100 件")
+        ensure_freight(client, merchant_h)
 
     print()
     print("=" * 56)

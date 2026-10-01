@@ -404,7 +404,9 @@ def _to_card(spu: Spu) -> SpuCardOut:
         price_min=spu.price_min,
         price_max=spu.price_max,
         total_sold=spu.total_sold,
-        avg_score=float(spu.avg_score),
+        # ★ 零评价返回 null 而不是 5.00 或 0.0 —— 前者会显示成"5 分好评"，
+        #   后者会显示成"0 分差评"，都在误导用户（docs/12 §9）
+        avg_score=float(spu.avg_score) if spu.avg_score is not None else None,
         review_count=spu.review_count,
         status=spu.status,
     )
@@ -545,8 +547,17 @@ async def get_spu_detail(
     )
 
 
-async def batch_get_skus(session: AsyncSession, sku_ids: list[int]) -> list[SkuBriefOut]:
-    """购物车/结算页批量取 SKU。**不返回已下架的商品**，由调用方提示用户失效。"""
+async def batch_get_skus(
+    session: AsyncSession, sku_ids: list[int], *, only_on_shelf: bool = True
+) -> list[SkuBriefOut]:
+    """批量取 SKU。
+
+    ``only_on_shelf=True``（默认，买家侧）**不返回已下架的商品**，
+    由调用方提示用户失效。
+
+    ``only_on_shelf=False`` 给商家后台用：商家要能看自己**草稿/已下架**商品的
+    SKU，否则库存页里那些行会没有名字。
+    """
     skus = await repo.list_skus_by_ids(session, sku_ids)
     if not skus:
         return []
@@ -556,8 +567,10 @@ async def batch_get_skus(session: AsyncSession, sku_ids: list[int]) -> list[SkuB
     result: list[SkuBriefOut] = []
     for sku in skus:
         spu = spus.get(sku.spu_id)
-        # SPU 已删除、或已下架 → 该 SKU 视为失效，不返回
-        if spu is None or spu.status != SPU_ON_SHELF or sku.status != 1:
+        if spu is None:
+            continue
+        # SPU 已下架或 SKU 已停用 → 买家侧视为失效；商家侧照常返回
+        if only_on_shelf and (spu.status != SPU_ON_SHELF or sku.status != 1):
             continue
         result.append(
             SkuBriefOut(
@@ -565,11 +578,14 @@ async def batch_get_skus(session: AsyncSession, sku_ids: list[int]) -> list[SkuB
                 spu_id=sku.spu_id,
                 shop_id=sku.shop_id,
                 title=spu.title,
+                sku_code=sku.sku_code,
                 spec_text=sku.spec_text,
                 price=sku.price,
                 cover_image=sku.cover_image,
                 weight_g=sku.weight_g,
                 status=sku.status,
+                spu_status=spu.status,
+                category_id=spu.category_id,
             )
         )
     return result
@@ -578,6 +594,41 @@ async def batch_get_skus(session: AsyncSession, sku_ids: list[int]) -> list[SkuB
 # ============================================================
 # 供其他模块调用
 # ============================================================
+async def list_shop_sku_ids(session: AsyncSession, shop_id: int, *, limit: int = 500) -> list[int]:
+    """该店铺的全部 SKU id。
+
+    inventory 的库存页按 SKU 驱动，需要它来"补齐"那些还没有库存记录的 SKU ——
+    否则商家发布商品后在库存页看不到它，也就无从设置库存。
+    """
+    return [s.id for s in await repo.list_skus_by_shop(session, shop_id, limit=limit)]
+
+
+async def apply_review_stat_delta(
+    session: AsyncSession,
+    spu_id: int,
+    *,
+    count_delta: int = 0,
+    score_delta: int = 0,
+    good_delta: int = 0,
+) -> None:
+    """增减某商品的评价统计。**由评价模块在它自己的事务里调用。**
+
+    谁拥有 schema 谁提供写入口 —— 评价模块不能直接改 ``product.spu``，
+    所以入口建在这里（与 ``trade`` 给库存/优惠提供写入口同一套做法）。
+
+    同一事务内更新意味着"用户点完发布、回到详情页就能看到计数 +1"，
+    没有中间的空窗期。代价是事务末尾会短暂锁住那一行 SPU；
+    同一商品的瞬时并发评价才会争锁，量级远低于下单。
+    """
+    await repo.incr_spu_review_stats(
+        session,
+        spu_id,
+        count_delta=count_delta,
+        score_delta=score_delta,
+        good_delta=good_delta,
+    )
+
+
 async def get_sku_for_order(session: AsyncSession, sku_id: int) -> tuple[Sku, Spu]:
     """下单时取 SKU 与它的 SPU，用于生成订单项快照。
 

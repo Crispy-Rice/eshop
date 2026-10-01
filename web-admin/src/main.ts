@@ -1,5 +1,9 @@
-import './assets/main.css'
+// ★ 导入顺序不能改：
+//   element-plus 先，我们的 token 后 —— 两边都在 :root 上定义 --el-* 变量，
+//   优先级相同，靠"后者胜"来覆盖 EP 的默认值。顺序反了主题就不生效。
 import 'element-plus/dist/index.css'
+import './assets/tokens.css'
+import './assets/base.css'
 
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'

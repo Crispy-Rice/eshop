@@ -16,6 +16,7 @@ import {
   type SkuDetail,
   type SpuDetail,
 } from '@/api/product'
+import ImageUploader from '@/components/ImageUploader.vue'
 import { placeholderImage, onImageError } from '@/utils/placeholder'
 import { formatYuan, yuanToFen } from '@/utils/money'
 
@@ -152,8 +153,8 @@ onMounted(load)
         </el-form-item>
         <el-form-item label="主图">
           <div class="image-row">
-            <el-input v-model="form.mainImage" maxlength="255" class="w360" />
-            <img :src="form.mainImage" alt="主图" class="preview" @error="onImageError" />
+            <ImageUploader v-model="form.mainImage" biz="products" />
+            <span class="inline-hint">长边超过 1280px 会自动压缩</span>
           </div>
         </el-form-item>
         <el-form-item>
@@ -213,9 +214,9 @@ onMounted(load)
             />
           </template>
         </el-table-column>
-        <el-table-column label="封面图" min-width="220">
+        <el-table-column label="封面图" width="110" align="center">
           <template #default="{ row }">
-            <el-input v-model="skuDraft[row.id]!.coverImage" size="small" maxlength="255" />
+            <ImageUploader v-model="skuDraft[row.id]!.coverImage" biz="products" size="small" />
           </template>
         </el-table-column>
         <el-table-column label="操作" width="90">
@@ -233,34 +234,50 @@ onMounted(load)
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-4);
   flex-wrap: wrap;
 }
 
 .left {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
+/* 区块标题：左侧一道短竖线做锚点，比单纯加粗更容易在长表单里定位 */
 .section {
-  margin: 0 0 12px;
-  font-size: 15px;
-  font-weight: 600;
+  position: relative;
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-3);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+
+.section::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 14px;
+  border-radius: var(--radius-pill);
+  background: var(--color-accent);
 }
 
 .mb16 {
-  margin-bottom: 16px;
+  margin-bottom: var(--space-4);
 }
 
 .mr8 {
-  margin-right: 8px;
-  margin-bottom: 4px;
+  margin-right: var(--space-2);
+  margin-bottom: var(--space-1);
 }
 
 .w110 {
@@ -274,15 +291,16 @@ onMounted(load)
 .image-row {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .preview,
 .thumb {
-  object-fit: cover;
-  border-radius: 4px;
-  background: #f5f7fa;
   flex: 0 0 auto;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-inset);
 }
 
 .preview {

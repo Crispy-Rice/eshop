@@ -22,6 +22,49 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
+    path: '/inventory',
+    name: 'inventory',
+    component: () => import('@/views/InventoryView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/orders',
+    name: 'orders',
+    component: () => import('@/views/OrderListView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/aftersales',
+    name: 'aftersales',
+    component: () => import('@/views/AfterSaleView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/reviews',
+    name: 'reviews',
+    component: () => import('@/views/ReviewView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    // 运营专属（后端只放给 admin / finance）；商家进来会看到空状态而不是报错
+    path: '/promotions',
+    name: 'promotions',
+    component: () => import('@/views/PromotionView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/inventory/flows',
+    name: 'inventory-flows',
+    component: () => import('@/views/InventoryFlowsView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/freight',
+    name: 'freight',
+    component: () => import('@/views/FreightTemplateView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/login',
     name: 'login',
     component: () => import('@/views/LoginView.vue'),

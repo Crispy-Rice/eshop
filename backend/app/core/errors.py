@@ -51,8 +51,16 @@ class ErrorCode(StrEnum):
     # ---------- 库存 ----------
     STOCK_INSUFFICIENT = ("STOCK_INSUFFICIENT", 410, "商品库存不足")
     STOCK_SOLD_OUT = ("STOCK_SOLD_OUT", 410, "商品已售罄")
+    STOCK_IN_USE = ("STOCK_IN_USE", 409, "该商品有在途的预占或待发货库存，不能直接覆盖")
+    # 运费：商品没绑运费模板就算不出运费，只能拒单（docs/06 §10）
+    SKU_NOT_SUPPORTED = ("SKU_NOT_SUPPORTED", 422, "该商品暂时无法配送")
     SECKILL_ENDED = ("SECKILL_ENDED", 410, "秒杀已结束")
     PURCHASE_LIMIT_EXCEEDED = ("PURCHASE_LIMIT_EXCEEDED", 422, "超出限购数量")
+
+    # ---------- 购物车 ----------
+    CART_ITEM_NOT_FOUND = ("CART_ITEM_NOT_FOUND", 404, "购物车里没有这件商品")
+    CART_ITEM_INVALID = ("CART_ITEM_INVALID", 422, "该商品已失效，请先移除")
+    CART_FULL = ("CART_FULL", 422, "购物车已满，请先清理")
 
     # ---------- 排队 ----------
     SECKILL_QUEUED = ("SECKILL_QUEUED", 202, "排队中")
@@ -61,6 +69,7 @@ class ErrorCode(StrEnum):
 
     # ---------- 优惠券与活动 ----------
     COUPON_SOLD_OUT = ("COUPON_SOLD_OUT", 410, "优惠券已被抢光")
+    COUPON_NOT_FOUND = ("COUPON_NOT_FOUND", 404, "优惠券不存在")
     COUPON_LIMIT_EXCEEDED = ("COUPON_LIMIT_EXCEEDED", 422, "超出每人限领数量")
     COUPON_EXPIRED = ("COUPON_EXPIRED", 422, "优惠券已过期")
     COUPON_THRESHOLD_NOT_MET = ("COUPON_THRESHOLD_NOT_MET", 422, "未达到优惠券使用门槛")
@@ -85,6 +94,7 @@ class ErrorCode(StrEnum):
 
     # ---------- 售后 ----------
     AFTERSALE_EXPIRED = ("AFTERSALE_EXPIRED", 422, "已超过售后申请期限")
+    AFTERSALE_STATUS_INVALID = ("AFTERSALE_STATUS_INVALID", 422, "当前售后状态不允许该操作")
     REFUND_NUM_EXCEED = ("REFUND_NUM_EXCEED", 422, "退货数量超过可退数量")
     REFUND_AMOUNT_EXCEED = ("REFUND_AMOUNT_EXCEED", 422, "退款金额超过实付金额")
     AFTERSALE_IN_PROGRESS = ("AFTERSALE_IN_PROGRESS", 422, "该订单已有进行中的售后")
@@ -92,11 +102,18 @@ class ErrorCode(StrEnum):
 
     # ---------- 评价 ----------
     NOT_RECEIVED = ("NOT_RECEIVED", 422, "确认收货后才能评价")
+    ORDER_NOT_FINISHED = ("ORDER_NOT_FINISHED", 422, "订单完成后才能评价")
     ALREADY_REVIEWED = ("ALREADY_REVIEWED", 422, "该商品已评价")
     REVIEW_EXPIRED = ("REVIEW_EXPIRED", 422, "评价期限已过")
     ALREADY_FOLLOWED_UP = ("ALREADY_FOLLOWED_UP", 422, "该评价已追评过")
     ITEM_REFUNDED = ("ITEM_REFUNDED", 422, "该商品已退款，无法评价")
     IN_AFTERSALE = ("IN_AFTERSALE", 422, "售后处理中，暂不能评价")
+    REPLY_LIMIT_EXCEEDED = ("REPLY_LIMIT_EXCEEDED", 422, "该评价的回复次数已达上限")
+    REVIEW_STATUS_INVALID = ("REVIEW_STATUS_INVALID", 422, "当前评价状态不允许该操作")
+
+    # ---------- 文件上传 ----------
+    INVALID_IMAGE = ("INVALID_IMAGE", 422, "图片格式不支持或已损坏")
+    IMAGE_TOO_LARGE = ("IMAGE_TOO_LARGE", 413, "图片体积超过限制")
 
 
 class BizError(Exception):

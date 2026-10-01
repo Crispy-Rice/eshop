@@ -14,7 +14,7 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import pool, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -42,16 +42,41 @@ VERSION_TABLE_SCHEMA = "public"
 # 这些是数据库自带的，不该参与比对
 EXCLUDED_SCHEMAS = frozenset({"information_schema", "pg_catalog", "pg_toast"})
 
+# 分区子表（如 inventory.stock_flow_202610）由迁移和定时任务用 DDL 创建，
+# 不在 metadata 里。不排除的话 autogenerate 会认为它们"库里多出来的表"
+# 并生成 drop_table —— 把流水数据删掉。
+# 用 pg_inherits 判断而不是靠表名模式匹配，分区命名变了也不会失效。
+_partition_tables: set[str] = set()
+
+
+def _load_partition_tables(connection: Connection) -> None:
+    rows = connection.execute(
+        text(
+            "SELECT n.nspname || '.' || c.relname "
+            "FROM pg_class c "
+            "JOIN pg_inherits i ON i.inhrelid = c.oid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace"
+        )
+    )
+    _partition_tables.update(row[0] for row in rows)
+
 
 def _include_object(obj: object, name: str | None, type_: str, reflected: bool, compare_to: object) -> bool:
     """过滤掉不该被 autogenerate 插手的对象。
 
-    ★ 必须排除 alembic 自己的版本表：开了 include_schemas 之后，
-    它会出现在 public schema 里却不在 metadata 中，autogenerate 会
-    生成 ``op.drop_table('alembic_version')`` —— 直接把迁移历史删掉。
+    两类必须排除：
+
+    1. **alembic 自己的版本表**：开了 include_schemas 之后它会出现在
+       public schema 里却不在 metadata 中，autogenerate 会生成
+       ``op.drop_table('alembic_version')`` —— 直接把迁移历史删掉。
+    2. **分区子表**：见 ``_partition_tables`` 的说明。
     """
-    if type_ == "table" and name == "alembic_version":
-        return False
+    if type_ == "table":
+        if name == "alembic_version":
+            return False
+        schema = getattr(obj, "schema", None)
+        if f"{schema}.{name}" in _partition_tables:
+            return False
     return getattr(obj, "schema", None) not in EXCLUDED_SCHEMAS
 
 
@@ -82,6 +107,11 @@ def run_migrations_offline() -> None:
 def do_run_migrations(connection: Connection) -> None:
     _configure(connection=connection)
     with context.begin_transaction():
+        # ★ 分区表名单必须在 begin_transaction() **之内**加载。
+        #   在它之前碰连接会先开启一个隐式事务，Alembic 见状会认为事务
+        #   已由外部管理、不再负责提交，连接关闭时整个迁移被静默回滚 ——
+        #   表现是 downgrade/upgrade 报成功却什么都没发生，且退出码为 0。
+        _load_partition_tables(connection)
         context.run_migrations()
 
 

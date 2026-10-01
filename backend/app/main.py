@@ -8,13 +8,16 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -27,6 +30,7 @@ from app.core.redis import close_redis, get_redis, ping_redis
 from app.core.response import ApiResponse
 from app.core.snowflake import start_snowflake, stop_snowflake
 from app.router import register_routers
+from app.worker.enqueue import close_pool as close_arq_pool
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +49,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 容器编排会重启，比起用重复的 worker id 发出重复 ID，宁可暂时不可用。
     await start_snowflake(get_redis())
 
+    # 上传目录要存在，否则第一条上传就会失败。挂载点用了 check_dir=False，
+    # 所以这里建目录是"让 /media 立刻可用"，不是"避免启动报错"。
+    # 启动期一次性操作，阻塞事件循环无所谓，不值得为它包一层线程池
+    Path(settings.media_root).mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
+
     logger.info("服务已就绪")
     try:
         yield
     finally:
         logger.info("服务关闭中")
         await stop_snowflake()
+        await close_arq_pool()
         await close_redis()
         await dispose_engine()
         logger.info("服务已关闭")
@@ -203,3 +213,19 @@ async def readyz() -> JSONResponse:
 
 
 register_routers(app)
+
+# 开发环境由这个进程直接提供上传的图片：两个前端的 Vite 已经把 /media 代理到后端，
+# 但后端原先没有响应方。生产由 nginx 提供（docs/16 §4：/media/ → /data/media，
+# 只读、禁止执行），请求根本到不了应用，所以这里只在非生产挂载，避免重复。
+#
+# check_dir=False：挂载发生在导入期，而建目录在 lifespan；目录还不存在时不该报错
+if not get_settings().is_production:
+    # ★ .webp 不是所有平台都内置识别（Windows 上就没有），不知道的话 StaticFiles
+    #   会把它当 application/octet-stream 发出去。配上 nginx 的 X-Content-Type-Options:
+    #   nosniff（docs/16 §4），浏览器会直接**拒绝渲染**这些图片。
+    mimetypes.add_type("image/webp", ".webp")
+    app.mount(
+        get_settings().media_url_prefix,
+        StaticFiles(directory=get_settings().media_root, check_dir=False),
+        name="media",
+    )

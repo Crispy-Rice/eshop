@@ -212,7 +212,9 @@ class SpuCardOut(CamelModel):
     price_min: int
     price_max: int
     total_sold: int
-    avg_score: float = 0.0
+    # ★ 可空：**没有评价时是 null**，前端据此显示"暂无评价"。
+    #   给 0.0 会被渲染成"0 分商品"，给 5.0 会被渲染成"满分好评" —— 都在误导
+    avg_score: float | None = None
     review_count: int = 0
     status: int = 2
 
@@ -224,11 +226,16 @@ class SkuBriefOut(CamelModel):
     spu_id: SnowflakeId
     shop_id: SnowflakeId
     title: str
+    sku_code: str
     spec_text: str
     price: int
     cover_image: str
     weight_g: int
     status: int
+    # SPU 的状态。购物车要区分"已下架"与"有效"，只看 SKU 状态不够
+    spu_status: int
+    # 末级类目。促销的"指定类目"范围匹配要用
+    category_id: SnowflakeId
 
 
 class SkuBatchRequest(CamelModel):

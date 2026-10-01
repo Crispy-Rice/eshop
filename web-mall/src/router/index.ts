@@ -14,6 +14,80 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/ProductDetailView.vue'),
   },
   {
+    path: '/cart',
+    name: 'cart',
+    component: () => import('@/views/CartView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/checkout',
+    name: 'checkout',
+    component: () => import('@/views/CheckoutView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/orders',
+    name: 'orders',
+    component: () => import('@/views/OrderListView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/orders/:orderMainNo',
+    name: 'order-detail',
+    component: () => import('@/views/OrderDetailView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/pay/:payNo',
+    name: 'payment',
+    component: () => import('@/views/PaymentView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/reviews',
+    name: 'reviews',
+    component: () => import('@/views/ReviewListView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    // 发评价与追评共用一页：带 ?followUp=<reviewId> 就是追评模式
+    path: '/reviews/submit/:orderItemId?',
+    name: 'review-submit',
+    component: () => import('@/views/ReviewSubmitView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/refunds',
+    name: 'refunds',
+    component: () => import('@/views/RefundListView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/refunds/apply/:orderSubNo',
+    name: 'refund-apply',
+    component: () => import('@/views/RefundApplyView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/refunds/:refundNo',
+    name: 'refund-detail',
+    component: () => import('@/views/RefundDetailView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/coupons',
+    name: 'coupons',
+    component: () => import('@/views/CouponCenterView.vue'),
+    // 券中心要显示"你已领几张"，接口需要登录，路由也就跟着要
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/my/coupons',
+    name: 'my-coupons',
+    component: () => import('@/views/MyCouponsView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/login',
     name: 'login',
     component: () => import('@/views/LoginView.vue'),

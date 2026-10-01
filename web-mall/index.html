@@ -1,10 +1,31 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="neutral">
   <head>
     <meta charset="UTF-8">
     <link rel="icon" href="/favicon.ico">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#f7f7f8">
     <title>eshop 商城</title>
+    <script>
+      /*
+       * 首屏前把上次选的皮肤读回来。
+       *
+       * 必须内联、必须早于样式生效：否则刷新时会先按默认主题渲染一帧，
+       * 再被 JS 改成上次选的皮肤，肉眼看就是"闪一下"。
+       *
+       * key 要和 src/composables/useTheme.ts 里的 STORAGE_KEY 一致。
+       */
+      ;(function () {
+        try {
+          var theme = localStorage.getItem('eshop.theme')
+          if (theme) {
+            document.documentElement.setAttribute('data-theme', theme)
+          }
+        } catch (e) {
+          /* 读不到 localStorage（隐私模式）就用 html 上的默认主题 */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

@@ -80,3 +80,35 @@ def client_ip(request: Request) -> str | None:
         # X-Forwarded-For 可能是 "客户端, 代理1, 代理2"，取第一个
         return forwarded.split(",")[0].strip()[:64]
     return request.client.host if request.client else None
+
+
+# 幂等键长度的上限。调用方会再拼上前缀与 skuId 组成最终的业务幂等键，
+# 而那个字段是 VARCHAR(64)，所以这里留足余量。
+MAX_IDEMPOTENCY_KEY_LEN = 32
+
+
+async def idempotency_key(
+    key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> str:
+    """取 ``Idempotency-Key`` 请求头，缺失就报错。
+
+    ★ 这一层只负责**校验与提取**，真正的幂等由底层保证：
+    库存变更写 ``inventory.stock_biz_key``（主键冲突即已处理过），
+    不依赖这个头本身。所以即使客户端换一个 key 重放，DB 也不会重复扣减——
+    幂等键只是让**同一笔操作的重试**能被识别出来。
+
+    docs/10 描述的通用幂等层（Redis ``SET NX`` + 缓存上次响应体，
+    配 ``CachedResponse``）留到 trade/payment 需要"重放原响应"时再建。
+    """
+    if not key or not key.strip():
+        raise BizError(ErrorCode.IDEMPOTENCY_KEY_REQUIRED)
+    cleaned = key.strip()
+    if len(cleaned) > MAX_IDEMPOTENCY_KEY_LEN:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            f"Idempotency-Key 不能超过 {MAX_IDEMPOTENCY_KEY_LEN} 个字符",
+        )
+    return cleaned
+
+
+IdempotencyKeyDep = Annotated[str, Depends(idempotency_key)]

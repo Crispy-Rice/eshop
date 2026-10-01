@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { computed, onMounted } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
@@ -9,6 +9,9 @@ import { useAuthStore } from '@/stores/auth'
 const auth = useAuthStore()
 const router = useRouter()
 const route = useRoute()
+
+/** 营销中心只有平台运营能进：后端接口只放给 admin / finance */
+const isAdmin = computed(() => auth.user?.role === 'admin' || auth.user?.role === 'finance')
 
 setUnauthorizedHandler(() => {
   auth.clearLocal()
@@ -26,21 +29,30 @@ async function onLogout(): Promise<void> {
 </script>
 
 <template>
-  <el-container class="layout">
-    <el-header class="header">
+  <div class="layout">
+    <header class="header">
       <div class="header-inner">
-        <RouterLink to="/" class="brand">eshop 商家后台</RouterLink>
+        <RouterLink to="/" class="brand">
+          <span class="brand-mark">eshop</span>
+          <span class="brand-sub">商家后台</span>
+        </RouterLink>
 
         <nav v-if="auth.isLoggedIn" class="nav">
           <RouterLink to="/" class="nav-link">我的商品</RouterLink>
           <RouterLink to="/products/new" class="nav-link">发布商品</RouterLink>
+          <RouterLink to="/orders" class="nav-link">订单</RouterLink>
+          <RouterLink to="/aftersales" class="nav-link">售后</RouterLink>
+          <RouterLink to="/reviews" class="nav-link">评价</RouterLink>
+          <RouterLink v-if="isAdmin" to="/promotions" class="nav-link">营销</RouterLink>
+          <RouterLink to="/inventory" class="nav-link">库存</RouterLink>
+          <RouterLink to="/freight" class="nav-link">运费</RouterLink>
         </nav>
 
         <div class="spacer" />
 
         <div v-if="auth.isLoggedIn" class="user">
           <span class="nickname">{{ auth.user?.nickname }}</span>
-          <el-tag size="small" type="success">
+          <el-tag :type="auth.user?.shopId ? 'success' : 'info'" size="small" disable-transitions>
             {{ auth.user?.shopId ? '商家' : '未开店' }}
           </el-tag>
           <el-button link type="primary" @click="onLogout">退出</el-button>
@@ -49,58 +61,100 @@ async function onLogout(): Promise<void> {
           <el-button type="primary" size="small">登录</el-button>
         </RouterLink>
       </div>
-    </el-header>
+    </header>
 
-    <el-main class="content">
+    <main class="content">
       <RouterView />
-    </el-main>
+    </main>
 
-    <el-footer class="footer">
-      <RouterLink to="/status" class="footer-link">系统状态</RouterLink>
-    </el-footer>
-  </el-container>
+    <footer class="footer">
+      <div class="footer-inner">
+        <span class="footer-copy">eshop 商家 / 运营后台 · 演示环境</span>
+        <RouterLink to="/status" class="footer-link">系统状态</RouterLink>
+      </div>
+    </footer>
+  </div>
 </template>
 
 <style scoped>
 .layout {
+  display: flex;
+  flex-direction: column;
   min-height: 100%;
 }
 
+/* ---------- 头部 ---------- */
+
 .header {
-  background: #fff;
-  border-bottom: 1px solid #e4e7ed;
-  padding: 0;
+  position: sticky;
+  top: 0;
+  z-index: var(--z-header);
+  background: var(--color-bg-surface);
+  border-bottom: 1px solid var(--color-border);
 }
 
+/* 比前台矮 4px：后台每一像素都留给内容 */
 .header-inner {
-  height: 56px;
-  max-width: 1200px;
+  height: var(--header-h);
+  max-width: var(--layout-max);
   margin: 0 auto;
-  padding: 0 24px;
+  padding: 0 var(--layout-gutter);
   display: flex;
   align-items: center;
-  gap: 28px;
+  gap: var(--space-6);
 }
 
 .brand {
-  font-size: 16px;
-  font-weight: 600;
-  color: #409eff;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex: 0 0 auto;
+}
+
+.brand-mark {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
+  color: var(--color-accent);
+}
+
+.brand-sub {
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
 }
 
 .nav {
   display: flex;
-  gap: 20px;
+  gap: var(--space-5);
+  flex: 0 0 auto;
 }
 
 .nav-link {
-  color: #606266;
-  font-size: 14px;
+  position: relative;
+  font-size: var(--text-base);
+  color: var(--color-text-secondary);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.nav-link:hover {
+  color: var(--color-text);
 }
 
 .nav-link.router-link-exact-active {
-  color: #303133;
-  font-weight: 500;
+  color: var(--color-text);
+  font-weight: var(--weight-medium);
+}
+
+/* 当前模块用一条短下划线标记位置 */
+.nav-link.router-link-exact-active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -19px;
+  height: 2px;
+  background: var(--color-accent);
+  border-radius: var(--radius-pill);
 }
 
 .spacer {
@@ -110,25 +164,55 @@ async function onLogout(): Promise<void> {
 .user {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
+  flex: 0 0 auto;
 }
 
 .nickname {
-  font-size: 14px;
+  font-size: var(--text-base);
+  color: var(--color-text);
 }
+
+/* ---------- 内容 ---------- */
 
 .content {
-  max-width: 1200px;
+  flex: 1;
   width: 100%;
+  max-width: var(--layout-max);
   margin: 0 auto;
+  padding: var(--space-5) var(--layout-gutter) var(--space-8);
 }
+
+/* ---------- 页脚 ---------- */
 
 .footer {
-  text-align: center;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg-surface);
 }
 
+.footer-inner {
+  max-width: var(--layout-max);
+  margin: 0 auto;
+  padding: var(--space-4) var(--layout-gutter);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.footer-copy,
 .footer-link {
-  font-size: 12px;
-  color: #a8abb2;
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+}
+
+.footer-link:hover {
+  color: var(--color-text-secondary);
+}
+
+@media (max-width: 768px) {
+  .nav {
+    display: none;
+  }
 }
 </style>

@@ -301,8 +301,10 @@ ssh -i ~/.ssh/eshop_deploy -L 15432:127.0.0.1:15432 ubuntu@<服务器IP>
 
 ### 4.2 关键配置要点
 
+完整文件在 `deploy/docker-compose.yml`（2 核 2G 演示机的内存裁剪叠加
+`docker-compose.demo.yml`）。下面是几处需要解释的：
+
 ```yaml
-# deploy/docker-compose.yml（节选，完整文件在代码阶段提供）
 services:
   api:
     image: eshop-api:${APP_VERSION}
@@ -310,6 +312,10 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      # 等迁移跑完再起，避免新代码撞旧表结构
+      migrate: { condition: service_completed_successfully }
+    volumes:
+      - /data/media:/data/media        # 上传目录要可写
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
@@ -323,23 +329,37 @@ services:
   postgres:
     image: postgres:17.6
     environment:
-      POSTGRES_USER: eshop_owner
-      POSTGRES_PASSWORD_FILE: /run/secrets/pg_owner_password
-      POSTGRES_DB: eshop
+      # 前三个是 postgres 镜像认识的；后四个是 init 脚本建角色用的
+      POSTGRES_USER: ${POSTGRES_OWNER_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      APP_USER: ${POSTGRES_APP_USER}
+      APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+      READONLY_USER: ${POSTGRES_READONLY_USER}
+      READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD}
     volumes:
       - /data/pgdata:/var/lib/postgresql/data
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
-    ports: ["127.0.0.1:15432:5432"]
+    ports: ["127.0.0.1:15432:5432"]   # 只绑回环，外部要经 SSH 隧道
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U eshop_owner -d eshop"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_OWNER_USER} -d ${POSTGRES_DB}"]
     deploy:
       resources: { limits: { memory: 3g } }
     shm_size: 256mb
 ```
 
-**数据库角色**（`deploy/postgres/init/01-roles.sql`，首次初始化时执行）：
+> **关于密钥注入**：口令走 `env_file: .env` 进容器环境，因此
+> `docker inspect` 能读到（需要宿主机 root）。要做到 inspect 也读不到，
+> 得把所有密钥改走 docker secrets 并在应用侧支持 `*_FILE` 后缀 ——
+> 演示环境不做这层，但**不要把 `docker inspect` 的输出贴到任何外部地方**。
+
+> **Redis 的 `maxmemory-policy` 必须是 `noeviction`**。这不是性能选项而是
+> 正确性选项：库存与券的可售量存在 Redis 里，一旦按 LRU 淘汰，库存键会凭空
+> 消失 —— 表现就是超卖。宁可写失败（应用侧有 DB 兜底与对账），也不能静默丢键。
+
+**数据库角色**（`deploy/postgres/init/01-init.sh`，首次初始化时执行）：
 
 | 角色 | 权限 | 使用者 |
 |---|---|---|
@@ -349,14 +369,33 @@ services:
 
 应用账号不能执行 DDL，即使出现 SQL 注入也无法删表；审计流水表从权限上不可篡改（[07 §4.5](07-order-and-split.md)）。
 
-**Nginx 要点**：
+> **审计表的权限要"迁移之后再收一次"。** `01-init.sh` 里的
+> `ALTER DEFAULT PRIVILEGES` 会给**所有将来创建的表**授予
+> `SELECT/INSERT/UPDATE/DELETE`（否则每加一张表都要手工 `GRANT`），
+> 而 `trade.order_state_flow` 是之后由 Alembic 建出来的，建的时候就带上了
+> `UPDATE/DELETE`。所以 `migrate` 服务的命令是两步：
+>
+> ```bash
+> alembic upgrade head && python scripts/harden_grants.py
+> ```
+>
+> 第二步执行 `REVOKE UPDATE, DELETE` 并回读校验（用 `has_table_privilege`），
+> 不通过就让发布失败。脚本是幂等的，每次发布都能安全跑。
 
-- `/` → 商城静态文件，`/admin/` → 后台静态文件，`/api/` → `api:8000`，`/media/` → 上传图片目录（`/data/media`，只读挂载，禁止执行）；
-- `limit_req_zone` 按 IP 限速；`/api/pay/notify/` 单独限速；
+**Nginx 要点**（完整文件 `deploy/nginx/nginx.conf`）：
+
+- `/` → 商城静态文件，`/admin/` → 后台静态文件，`/api/` → `api:8000`，`/media/` → 上传图片目录（`/data/media`，只读挂载，按后缀拒绝非图片）；
+- `limit_req_zone` 按 IP 限速三档：一般接口 20r/s、`/api/auth/{login,register,refresh}` 2r/s、支付回调 50r/s（回调是渠道发起的，要允许突发）；
 - `client_max_body_size 10m`；
 - 响应头：`Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: same-origin`；
-- 前端带 hash 的静态文件 `Cache-Control: max-age=31536000, immutable`，`index.html` 不缓存；
-- 生成 `$request_id` 并以 `X-Request-Id` 头传给后端。
+- 前端带 hash 的静态文件 `Cache-Control: max-age=31536000, immutable`，`index.html` 不缓存（否则发版后用户拿到旧壳去请求已删除的 hash 资源，白屏）；
+- 生成 `$request_id` 并以 `X-Request-Id` 头传给后端，后端回显同一个值，前后端日志能串起来。
+
+> ★ **`add_header` 不叠加。** 某个 location 里只要写了任意一条 `add_header`，
+> 父级（server / http）的所有 `add_header` 就都不再作用于它。所以安全头抽成了
+> `deploy/nginx/snippets/security-headers.conf`，凡是有自定义缓存头的静态
+> location 都要重新 `include` 一次 —— 静态文件恰恰是最需要 `nosniff` 的。
+> 改动这几个头之后务必在浏览器控制台确认没有 CSP 报错。
 
 ## 5. 腾讯云部署
 
@@ -388,25 +427,54 @@ sudo apt-get update && sudo apt-get -y upgrade
 #   "registry-mirrors": ["https://mirror.ccs.tencentyun.com"]   ← 腾讯云内网镜像加速，仅腾讯云服务器可用
 #   "log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "5"}
 # 格式化并挂载数据盘到 /data，写入 /etc/fstab（使用 UUID）
-# 创建目录：/data/{pgdata,redis,media,backup}，/opt/eshop
 # 开启 unattended-upgrades 自动安全更新
 # 禁用 SSH 密码登录（PasswordAuthentication no），只允许密钥登录
 ```
 
+建数据目录并设好属主这一步由脚本做（Docker 不会替你设属主，
+设不对 PG 会拒绝启动、图片也写不进去）：
+
+```bash
+sudo ./scripts/prepare-host.sh
+```
+
+它会建 `/data/{pgdata,redis,media,backup}`、按各容器内的运行 uid 设属主
+（pgdata/redis 是 999，media 是 10001，backup 是 root），并在内存不足 4GB 时
+提示加 swap。
+
 ### 5.3 发布流程
 
-第一期不引入镜像仓库，**在服务器上直接构建镜像**：
+第一期不引入镜像仓库，**在服务器上直接构建镜像**。
+`APP_VERSION` 同时是 `.env` 里的变量和镜像 tag，两者必须一致。
 
+```bash
+cd /opt/eshop/deploy
+
+# ⓪ 首次上传后给脚本加可执行位（git 不一定保留）
+chmod +x scripts/*.sh
+
+# ① 生成密钥（只在首次；已存在 .env 时脚本会拒绝覆盖）
+./scripts/gen-secrets.sh <服务器公网 IP>
+
+# ② 构建镜像（api/worker/migrate 共用一个，nginx 一个）
+docker compose build
+
+# ③ 迁移 + 审计表加固（失败就让整个发布停下）
+docker compose -f docker-compose.yml -f docker-compose.demo.yml run --rm migrate
+
+# ④ 起服务
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+
+# ⑤ 冒烟检查（注意路径是 /healthz，不带 /api 前缀）
+curl -fsS http://127.0.0.1/healthz && echo OK
 ```
-① 本地：git tag v0.1.0
-② 本地 → 服务器：上传代码（任选一种）
-     a. git archive 打包 + scp 上传（无需服务器访问代码仓库，推荐）
-     b. 服务器 git pull（需要给服务器配置只读 Deploy Key）
-③ 服务器：docker compose build
-④ 服务器：docker compose run --rm migrate          ← 迁移失败则停止发布
-⑤ 服务器：docker compose up -d                     ← 滚动替换 api / worker / nginx
-⑥ 服务器：curl http://127.0.0.1/api/healthz        ← 冒烟检查
-```
+
+> **构建放在哪跑。** 文档原来写"在服务器上直接构建"，2 核 2G 的演示机上
+> 构建两个 Vue 前端 + 装 Python 依赖相当吃力（`npm ci` 与 `vite build`
+> 都是内存大户，可能把 PG 挤到 OOM）。如果构建时机器吃紧，改成
+> **本地构建后推镜像**：本地 `docker compose build`，再
+> `docker save eshop-api:v0.1.0 eshop-nginx:v0.1.0 | gzip | ssh <服务器> 'gunzip | docker load'`。
+> 前提是本机与服务器同为 `linux/amd64`。
 
 **回滚**：镜像按版本打标签（`eshop-api:v0.1.0`），回滚时把 `.env` 中的 `APP_VERSION` 改回上一版本并 `docker compose up -d`。数据库迁移要求**向前兼容**（新增列带默认值、不在同一版本里删除旧列），保证旧版本代码在新表结构上仍能运行。
 
@@ -414,9 +482,30 @@ sudo apt-get update && sudo apt-get -y upgrade
 
 ### 5.4 备份与恢复
 
+由 `deploy/scripts/backup.sh` 执行（宿主机 root 的 cron）：
+
+```bash
+chmod +x /opt/eshop/deploy/scripts/backup.sh
+sudo crontab -e
+# 加一行（用 root 的 crontab：/data/backup 是 root:700，普通用户写不进去）：
+#   30 3 * * * /opt/eshop/deploy/scripts/backup.sh >> /var/log/eshop-backup.log 2>&1
+
+# 装完先手工跑一次，确认能出产物 —— 没验证过的备份等于没有备份
+sudo /opt/eshop/deploy/scripts/backup.sh
+sudo ls -lh /data/backup/
+```
+
+> **不要把脚本拷到 `deploy/` 之外再让 cron 调**。脚本要找同目录的 `.env`，
+> 早年文档写的是拷到 `/opt/eshop/backup.sh`，那样它会去找 `/opt/.env` 然后失败。
+> 现在直接原地调用；真要挪地方，用 `ES_DEPLOY_DIR` 指回去。
+
+脚本先写 `.part` 再改名，中途失败不会留下"看起来正常、实际截断"的备份；
+`pg_dump` 之后还会用 `pg_restore -l` 回读一次归档目录，读不出来就整脚本失败 ——
+宁可这天没有备份，也不要留一个坏备份让人以为有得可恢复。
+
 | 内容 | 方式 | 频率 | 保留 |
 |---|---|---|---|
-| PostgreSQL | 宿主机 cron：`docker compose exec -T postgres pg_dump -Fc -U eshop_owner eshop > /data/backup/eshop-$(date +%F).dump` | 每日 03:30 | 本机 7 天 |
+| PostgreSQL | `backup.sh`：`docker compose exec -T postgres pg_dump -Fc` | 每日 03:30 | 本机 7 天 |
 | PostgreSQL（异地） | 定期下载到本地，或二期用 COS 存储 | 每周 | 4 周 |
 | Redis | AOF 持续写入 + RDB 快照拷贝到 `/data/backup` | 每日 | 3 天 |
 | 上传图片 `/data/media` | 随数据盘快照 | 每日 | 7 天 |
@@ -632,39 +721,58 @@ ssh -i ~/.ssh/eshop_deploy ubuntu@<服务器IP> "echo ok && sudo -n true && echo
 | 支付宝：应用 AppID、应用私钥、支付宝公钥 | 二期：接入支付宝 | 同上 |
 | 腾讯云内容安全密钥 | 二期：评价图片/文字机审 | |
 
-## 8. 环境变量清单（`.env.example`）
+## 8. 环境变量清单
 
-```dotenv
-# ---- 应用 ----
-APP_ENV=production                 # development / production
-APP_VERSION=v0.1.0
-API_WORKERS=4
-LOG_LEVEL=INFO
+**事实来源是 `deploy/.env.production.example`**，本节不再抄一份 ——
+抄一份就会漂移，而这里漂移的代价是启动失败（见下面 §8.2）。
 
-# ---- 数据库 ----
-DATABASE_URL=postgresql+asyncpg://eshop_app:${PG_APP_PASSWORD}@postgres:5432/eshop
-PG_OWNER_PASSWORD=                 # 部署时生成
-PG_APP_PASSWORD=                   # 部署时生成
+生成 `deploy/.env` 用脚本，不要手工填：
 
-# ---- Redis ----
-REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-REDIS_PASSWORD=                    # 部署时生成
-
-# ---- 安全 ----
-JWT_SECRET=                        # 部署时生成
-PRICE_TOKEN_SECRET=                # 部署时生成
-PHONE_HASH_KEY=                    # 部署时生成
-PHONE_ENC_KEY=                     # 部署时生成（32 字节，base64）
-
-# ---- 支付 ----
-PAYMENT_MOCK_ENABLED=true          # ★ 接入真实渠道上线前必须改为 false
-MOCK_PAY_SECRET=                   # 部署时生成
-PAY_NOTIFY_BASE_URL=http://<服务器IP>
-
-# ---- 存储 ----
-MEDIA_ROOT=/data/media
-MEDIA_URL_PREFIX=/media/
+```bash
+cd deploy
+./scripts/gen-secrets.sh <服务器公网 IP>
 ```
+
+脚本从模板复制出 `.env`（权限 600，先 `umask 077` 再创建），把每个
+`__GENERATE__` 换成新的安全随机值，再用刚生成的口令拼出
+`DATABASE_URL` / `MIGRATION_DATABASE_URL` / `REDIS_URL`（这三个无法静态
+写好，因为里面嵌着口令）。已存在 `.env` 时脚本拒绝覆盖 —— 覆盖会换掉
+`PHONE_ENC_KEY`，已存储的手机号就再也解不出来了。
+
+### 8.1 环境变量与本地开发的区别
+
+| 变量 | 本地 `backend/.env` | 生产 `deploy/.env` | 说明 |
+|---|---|---|---|
+| `APP_ENV` | `development` | `production` | 生产会开启启动自检、关闭 `/docs` |
+| `DATABASE_URL` 主机 | `127.0.0.1` | `postgres` | 容器里用 compose 服务名 |
+| `REDIS_URL` | 无密码 | 带密码 | 生产 Redis 开了 `requirepass` |
+| `MEDIA_ROOT` | `./data/media` | `/data/media` | 生产是绑定到宿主机的卷 |
+| `API_WORKERS` | `1` | `4`（演示机用覆盖文件降到 `1`） | |
+
+### 8.2 ★ 模拟支付与生产自检的关系
+
+这一条以前写错过，照抄会**启动即崩**，所以单独说明。
+
+应用的启动自检（`app/core/config.py` 的 `_guard_production`）在
+`APP_ENV=production` 时会检查若干条件，其中两条容易踩：
+
+1. **`PAYMENT_MOCK_ENABLED`**。第一期只有模拟渠道，所以它必须是 `true`；
+   但自检默认不允许生产环境开模拟支付。两者由
+   **`ALLOW_MOCK_PAYMENT_IN_PROD=true`** 这个显式开关调和：
+   `PAYMENT_MOCK_ENABLED=true` 且没有这个开关 ⇒ 启动失败。
+   将来接真实渠道：把 `PAYMENT_MOCK_ENABLED` 改成 `false` 即可，
+   那个开关留着不起作用。
+
+   演示环境**用 `APP_ENV=production`**（这样密钥自检、`/docs` 关闭等生产行为
+   都会生效），因此这个开关是必须的。
+
+2. **`PHONE_ENC_KEY`** 必须换掉。它的默认值是个**合法的** 32 字节 base64，
+   所以既不会触发"用了 dev-only 前缀"的检查，也过得了 base64 格式校验 ——
+   漏配时应用会正常启动，却用一个人人皆知的 AES 密钥加密所有手机号。
+   自检里因此单独比对了一个常量 `KNOWN_PHONE_ENC_KEY`。
+
+`PAY_NOTIFY_BASE_URL` 要填服务器的对外地址（`http://<IP>`，不带结尾斜杠），
+模拟渠道的回调地址由它拼出来。
 
 ## 9. 上线前检查清单
 
@@ -673,10 +781,15 @@ MEDIA_URL_PREFIX=/media/
 | 1 | 安全组只放行 22（限 IP）与 80；从外网 `telnet <IP> 5432`、`6379` 均不通 |
 | 2 | SSH 已禁用密码登录 |
 | 3 | `.env` 权限为 600，已备份到密码管理器；仓库中 `git log -p` 搜索不到任何真实密钥 |
-| 4 | 生产环境 `/docs`、`/openapi.json` 返回 404 |
+| 4 | 生产环境**不提供 API 文档**。断言方式是看应用本身而不是看 URL 状态码：`docker compose exec -T api python -c "from app.main import app; print(app.openapi_url, app.docs_url)"` 必须输出 `None None`。★ 直接访问 `/docs` 会拿到 **200 + 商城首页** —— 那是 nginx 的 SPA 兜底路由（`try_files ... /index.html`），**不是**文档被暴露，别误判 |
 | 5 | 应用以 `eshop_app` 角色连接数据库，执行 `DROP TABLE` 会被拒绝 |
 | 6 | Redis 设置了密码，`FLUSHALL`、`KEYS` 命令已禁用 |
 | 7 | `pg_dump` 定时任务已生效，并完成过一次恢复演练 |
 | 8 | 数据盘快照策略已开启 |
 | 9 | 模拟支付的 7 种故障注入场景（[09 §3.2](09-payment.md)）全部验证通过，对账任务能发现并修复"不回调"的订单 |
 | 10 | 停止 Redis 容器后下单走 DB 降级路径，恢复后对账任务能修正 Redis 库存 |
+| 11 | **`PHONE_ENC_KEY` 已换成新值**（不是仓库里的默认值）。最简单的判定：`APP_ENV=production` 下应用能启动 —— 自检里有一条专门比对默认值（见 §8.2） |
+| 12 | 审计表不可改：`eshop_app` 对 `trade.order_state_flow` 执行 `UPDATE` 应被拒绝（`migrate` 里的 `harden_grants.py` 负责，发布日志里应有"审计表已加固"） |
+| 13 | 两个前端都能打开：`http://<IP>/`（商城）与 `http://<IP>/admin/`（后台）。后台**必须**带 `/admin/` 前缀 |
+| 14 | 浏览器控制台无 CSP 报错；商品图与评价图能正常渲染（`/media/` 返回 `Content-Type: image/webp`） |
+| 15 | 一次完整下单链路走通：注册 → 加购 → 结算 → 支付 → 发货 → 收货 → 评价 |

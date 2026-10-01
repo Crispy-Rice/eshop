@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from arq import cron
 from arq.connections import RedisSettings
 
 from app.core.config import get_settings
@@ -17,6 +18,28 @@ from app.core.db import dispose_engine, get_session_factory
 from app.core.logging import get_logger, setup_logging
 from app.core.redis import close_redis, get_redis
 from app.core.snowflake import start_snowflake, stop_snowflake
+from app.modules.aftersale.tasks import (
+    execute_refund,
+    process_refund_timeouts,
+    reconcile_refunds,
+    retry_refunds,
+)
+from app.modules.inventory.tasks import (
+    ensure_flow_partition,
+    rebuild_stock_daily,
+    reconcile_stock,
+)
+from app.modules.promotion.tasks import (
+    expire_coupons,
+    reconcile_coupons,
+    unlock_stale_coupons,
+)
+from app.modules.review.tasks import recompute_spu_stats
+from app.modules.trade.tasks import (
+    auto_receive,
+    close_order_if_unpaid,
+    scan_timeout_orders,
+)
 
 logger = get_logger(__name__)
 
@@ -51,16 +74,62 @@ async def ping(ctx: dict[str, Any]) -> str:
 
 
 # 任务函数注册表。模块实现后在这里追加：
-#   from app.modules.trade.tasks import close_order_if_unpaid, scan_timeout_orders
+#   from app.modules.aftersale.tasks import ...
 FUNCTIONS: list[Any] = [
     ping,
+    reconcile_stock,
+    rebuild_stock_daily,
+    ensure_flow_partition,
+    expire_coupons,
+    reconcile_coupons,
+    unlock_stale_coupons,
+    # 延迟任务：下单时按 pay_deadline 投递
+    close_order_if_unpaid,
+    scan_timeout_orders,
+    auto_receive,
+    # 售后：延迟任务（进"退款中"时投递）+ 三个定时任务
+    execute_refund,
+    retry_refunds,
+    process_refund_timeouts,
+    reconcile_refunds,
+    # 评价：统计全量重算
+    recompute_spu_stats,
 ]
 
-# 定时任务。模块实现后追加，例如：
-#   cron(scan_timeout_orders, minute=set(range(0, 60, 2)), unique=True)   每 2 分钟扫超时订单
-#   cron(process_refund_timeouts, minute=None, second=0, unique=True)     每分钟扫售后超时
-#   cron(daily_reconcile, hour=2, minute=10, unique=True)                 每日对账
-CRON_JOBS: list[Any] = []
+# 定时任务。
+#   unique=True 保证多副本部署时同一时刻只有一个 worker 跑（否则两边的对账
+#   会同时改同一个 sku 的 Redis 值，虽然结果相同但白费资源）。
+CRON_JOBS: list[Any] = [
+    # ---------- 库存 ----------
+    # 漂移要尽快发现，所以 5 分钟一次（docs/03 §7）
+    cron(reconcile_stock, minute=set(range(0, 60, 5)), second=7, unique=True),
+    # 全量重建：低峰期，每日 04:10
+    cron(rebuild_stock_daily, hour=4, minute=10, second=0, unique=True),
+    # 建下月分区：每月 25 日，留足提前量
+    cron(ensure_flow_partition, day=25, hour=3, minute=20, second=0, unique=True),
+    # ---------- 促销 ----------
+    # 券对账：比库存更敏感（涉及资金），10 分钟一次（docs/04 §10）
+    cron(reconcile_coupons, minute=set(range(1, 60, 10)), second=17, unique=True),
+    # 券过期：每小时扫一次即可，过期不是实时性要求高的事
+    cron(expire_coupons, minute=23, second=0, unique=True),
+    # 僵尸锁：券被锁超 40 分钟未释放，10 分钟扫一次
+    cron(unlock_stale_coupons, minute=set(range(4, 60, 10)), second=37, unique=True),
+    # ---------- 订单 ----------
+    # 超时关单兜底：延迟任务可能丢，2 分钟扫一次（命中部分索引，代价极低）
+    cron(scan_timeout_orders, minute=set(range(0, 60, 2)), second=11, unique=True),
+    # 自动确认收货：15 天量级的期限，10 分钟一次足够
+    cron(auto_receive, minute=set(range(6, 60, 10)), second=47, unique=True),
+    # ---------- 售后 ----------
+    # 超时处理：四个环节共用一个 deadline，1 分钟一次才能保证时限"准点"
+    cron(process_refund_timeouts, minute=set(range(0, 60, 1)), second=23, unique=True),
+    # 退款重试兜底：即时投递可能丢，1 分钟一次（命中部分索引，代价极低）
+    cron(retry_refunds, minute=set(range(2, 60, 3)), second=33, unique=True),
+    # 资金对账：低峰期每日一次，有问题写 P0 告警
+    cron(reconcile_refunds, hour=4, minute=40, second=0, unique=True),
+    # ---------- 评价 ----------
+    # 统计全量重算：增量靠业务代码，正确性靠它，低峰期每日一次
+    cron(recompute_spu_stats, hour=3, minute=40, second=0, unique=True),
+]
 
 
 class WorkerSettings:

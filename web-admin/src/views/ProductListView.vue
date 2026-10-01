@@ -16,7 +16,7 @@ import {
 } from '@/api/product'
 import { useAuthStore } from '@/stores/auth'
 import { formatPriceRange } from '@/utils/money'
-import { placeholderImage } from '@/utils/placeholder'
+import { placeholderImage, onImageError } from '@/utils/placeholder'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -99,132 +99,194 @@ onMounted(() => {
 </script>
 
 <template>
-  <div>
+  <div class="page">
     <el-alert
       v-if="auth.user && !auth.user.shopId"
       type="info"
       :closable="false"
       class="shop-alert"
-      title="你还没有店铺"
-      description="上架商品前需要先开通店铺。"
+      show-icon
     >
-      <template #default>
-        <div class="alert-body">
-          <span>上架商品前需要先开通店铺。</span>
-          <el-button type="primary" size="small" :loading="shopLoading" @click="openShop">
-            立即开通
-          </el-button>
-        </div>
-      </template>
+      <template #title>你还没有店铺</template>
+      <div class="alert-body">
+        <span>上架商品前需要先开通店铺。</span>
+        <el-button type="primary" size="small" :loading="shopLoading" @click="openShop">
+          立即开通
+        </el-button>
+      </div>
     </el-alert>
 
-    <el-card shadow="never">
-      <template #header>
-        <div class="card-header">
-          <el-radio-group v-model="statusFilter" @change="load">
-            <el-radio-button v-for="tab in statusTabs" :key="String(tab.value)" :value="tab.value">
-              {{ tab.label }}
-            </el-radio-button>
-          </el-radio-group>
-          <div class="actions">
-            <el-button :loading="loading" @click="load">刷新</el-button>
-            <el-button type="primary" :disabled="!auth.user?.shopId" @click="router.push('/products/new')">
-              发布商品
-            </el-button>
-          </div>
-        </div>
-      </template>
+    <!-- 工具栏：左侧分段筛选状态，右侧主操作。动作永远在右手边。 -->
+    <div class="toolbar">
+      <el-radio-group v-model="statusFilter" size="small" @change="load">
+        <el-radio-button v-for="tab in statusTabs" :key="String(tab.value)" :value="tab.value">
+          {{ tab.label }}
+        </el-radio-button>
+      </el-radio-group>
 
+      <div class="spacer" />
+
+      <el-button size="small" :loading="loading" @click="load">刷新</el-button>
+      <el-button
+        type="primary"
+        size="small"
+        :disabled="!auth.user?.shopId"
+        @click="router.push('/products/new')"
+      >
+        发布商品
+      </el-button>
+    </div>
+
+    <div class="panel">
       <el-empty v-if="!loading && items.length === 0" description="还没有商品" />
 
       <el-table v-else v-loading="loading" :data="items">
         <el-table-column label="商品" min-width="280">
           <template #default="{ row }">
             <div class="cell-product">
-              <img :src="row.mainImage || placeholderImage(row.title)" class="thumb" :alt="row.title" />
-              <div>
-                <div class="title">{{ row.title }}</div>
-                <div class="sub">ID {{ row.id }}</div>
+              <img
+                :src="row.mainImage || placeholderImage(row.title)"
+                class="thumb"
+                :alt="row.title"
+                @error="onImageError"
+              />
+              <div class="cell-text">
+                <div class="cell-title">{{ row.title }}</div>
+                <div class="cell-sub tnum">ID {{ row.id }}</div>
               </div>
             </div>
           </template>
         </el-table-column>
+
         <el-table-column label="价格区间" width="180">
-          <template #default="{ row }">{{ formatPriceRange(row.priceMin, row.priceMax) }}</template>
-        </el-table-column>
-        <el-table-column label="销量" width="90">
-          <template #default="{ row }">{{ row.totalSold }}</template>
-        </el-table-column>
-        <el-table-column label="状态" width="110">
           <template #default="{ row }">
-            <el-tag :type="SPU_STATUS_TYPE[row.status] ?? 'info'" size="small">
+            <span class="tnum price">{{ formatPriceRange(row.priceMin, row.priceMax) }}</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="销量" width="90" align="right">
+          <template #default="{ row }">
+            <span class="tnum">{{ row.totalSold }}</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag :type="SPU_STATUS_TYPE[row.status] ?? 'info'" size="small" disable-transitions>
               {{ SPU_STATUS_TEXT[row.status] ?? row.status }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="220">
+
+        <el-table-column label="操作" width="200" align="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="router.push(`/products/${row.id}`)">编辑</el-button>
             <el-button v-if="row.status === 1" link type="primary" @click="act(row, 'submit')">
               提交审核
             </el-button>
-            <el-button v-if="row.status === 3" link type="success" @click="act(row, 'on')">上架</el-button>
-            <el-button v-if="row.status === 2" link type="warning" @click="act(row, 'off')">下架</el-button>
+            <el-button v-if="row.status === 3" link type="success" @click="act(row, 'on')">
+              上架
+            </el-button>
+            <el-button v-if="row.status === 2" link type="warning" @click="act(row, 'off')">
+              下架
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
-    </el-card>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
 .shop-alert {
-  margin-bottom: 16px;
+  margin: 0;
 }
 
 .alert-body {
   display: flex;
   align-items: center;
-  gap: 16px;
-  margin-top: 4px;
+  gap: var(--space-4);
+  margin-top: var(--space-1);
 }
 
-.card-header {
+/* --------------------------------------------------------------------------
+ * 工具栏
+ * ------------------------------------------------------------------------*/
+
+.toolbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-2);
   flex-wrap: wrap;
 }
 
-.actions {
-  display: flex;
-  gap: 8px;
+.spacer {
+  flex: 1;
 }
+
+/* --------------------------------------------------------------------------
+ * 表格容器
+ *
+ * 用底色的层次（页面 n-100 / 面板 n-0）来分区，而不是到处加边框和阴影，
+ * 这样一屏里的"块"少、视觉噪声低，符合"极简高效"。
+ * ------------------------------------------------------------------------*/
+
+.panel {
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  padding: var(--space-1) 0;
+}
+
+.panel :deep(.el-empty) {
+  padding: var(--space-8) 0;
+}
+
+/* --------------------------------------------------------------------------
+ * 商品单元格
+ * ------------------------------------------------------------------------*/
 
 .cell-product {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .thumb {
-  width: 48px;
-  height: 48px;
-  object-fit: cover;
-  border-radius: 4px;
-  background: #f5f7fa;
+  width: 40px;
+  height: 40px;
   flex: 0 0 auto;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-inset);
 }
 
-.title {
-  font-size: 14px;
-  line-height: 1.4;
+.cell-text {
+  min-width: 0;
 }
 
-.sub {
-  font-size: 12px;
-  color: #a8abb2;
+.cell-title {
+  font-size: var(--text-base);
+  color: var(--color-text);
+  line-height: var(--leading-snug);
+}
+
+.cell-sub {
   margin-top: 2px;
+  font-size: var(--text-xs);
+  color: var(--color-text-placeholder);
+}
+
+.price {
+  color: var(--color-price);
+  font-weight: var(--weight-medium);
 }
 </style>

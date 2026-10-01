@@ -1,7 +1,10 @@
 # ===== 密钥与环境（务必忽略）=====
 .env
 .env.*
+# 只放行模板。注意 .env.production.example 也匹配上面的 .env.*，
+# 所以下面这条不能少 —— 少了它模板会被静默忽略掉。
 !.env.example
+!.env.*.example
 deploy/secrets/
 *.pem
 *.key

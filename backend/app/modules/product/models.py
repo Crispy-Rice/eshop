@@ -112,12 +112,16 @@ class Spu(Base):
     price_max: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=text("0"), comment="展示最高价（分）"
     )
-    # 冗余统计，由 outbox 事件异步更新
+    # 冗余统计，由评价模块在同一事务内更新（另有每日全量重算兜底）
     total_sold: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     review_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     review_score_sum: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     good_review_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
-    avg_score: Mapped[Decimal] = mapped_column(Numeric(3, 2), nullable=False, server_default=text("5.00"))
+    # ★ 可空：**零评价必须是 NULL**。原来的 `NOT NULL DEFAULT 5.00` 会让没有评价的商品
+    #   读出 5.00，前端就显示"5.0 分 / 100% 好评"（docs/12 §9 明令禁止）
+    avg_score: Mapped[Decimal | None] = mapped_column(
+        Numeric(3, 2), nullable=True, comment="平均分；无评价时为 NULL"
+    )
     status: Mapped[int] = mapped_column(
         SmallInteger,
         nullable=False,

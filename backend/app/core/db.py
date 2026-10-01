@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.core.after_commit import discard_pending, run_pending
 from app.core.config import get_settings
 
 _engine: AsyncEngine | None = None
@@ -77,12 +78,17 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
     这也正是模块化单体相对微服务的最大红利：下单、预占库存、锁券、
     写 outbox 全在一个本地事务里（docs/07-order-and-split.md）。
+
+    **提交后回调**也在这里统一执行：service 用 ``after_commit.defer`` 注册，
+    提交成功才跑，回滚就整批丢弃（见 ``app.core.after_commit``）。
     """
     async with get_session_factory()() as session:
         try:
             yield session
         except Exception:
             await session.rollback()
+            discard_pending(session)
             raise
         else:
             await session.commit()
+            await run_pending(session)

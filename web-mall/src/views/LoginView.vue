@@ -120,7 +120,7 @@ function switchMode(): void {
 .wrap {
   display: flex;
   justify-content: center;
-  padding-top: 32px;
+  padding: var(--space-10) var(--space-4);
 }
 
 .card {
@@ -129,9 +129,10 @@ function switchMode(): void {
 }
 
 .title {
-  margin: 0 0 20px;
-  font-size: 20px;
-  font-weight: 600;
+  margin: 0 0 var(--space-5);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
 }
 
 .submit {
@@ -139,9 +140,9 @@ function switchMode(): void {
 }
 
 .switch {
-  margin-top: 16px;
-  font-size: 13px;
-  color: #909399;
+  margin-top: var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
   text-align: center;
 }
 </style>

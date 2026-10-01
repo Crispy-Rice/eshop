@@ -69,8 +69,8 @@ onMounted(check)
 }
 
 .hint {
-  margin: 16px 0 0;
-  color: #909399;
-  font-size: 13px;
+  margin: var(--space-4) 0 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
 }
 </style>

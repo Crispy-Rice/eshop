@@ -64,3 +64,34 @@ class LocalMessage(Base):
     error_msg: Mapped[str | None] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
+
+
+class OpsAlert(Base):
+    """运维告警。
+
+    库存对账发现 Redis 与 DB 漂移时写入（docs/03 §7），后续售后、支付的对账
+    任务同样用它。**本期只写入，不做后台展示页**——那是 docs/08 §10 说的
+    "运营后台首页红色提示"，属于后续工作。
+
+    暂放在 core 下：``ops`` 是运维域的 schema，但目前还没有 ops 模块，
+    等它出现时把这个类搬过去即可。
+    """
+
+    __tablename__ = "alert"
+    __table_args__ = (
+        # 部分索引：只包含未处理的告警，体积始终很小
+        Index("idx_alert_unhandled", "created_at", postgresql_where=text("handled_at IS NULL")),
+        {"schema": "ops"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    level: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("2"), comment="1=P0 2=P1 3=P2"
+    )
+    source: Mapped[str] = mapped_column(
+        String(64), nullable=False, comment="产生告警的模块/任务，如 inventory.reconcile"
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
+    handled_at: Mapped[datetime | None] = mapped_column(TS, comment="NULL 表示未处理")
