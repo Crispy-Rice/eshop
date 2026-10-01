@@ -6,7 +6,22 @@ v2.0 技术栈：**Vue 3 前端 + Python/FastAPI 模块化单体 + PostgreSQL + 
 
 ## 快速开始（本地开发）
 
-前置：**Docker Desktop 已启动**（需要 WSL2）。Python 与 Node 的依赖安装见 [16-deployment §2](docs/16-deployment.md)。
+### 先说终端
+
+下面的命令**在 Git Bash 和 PowerShell 里都能直接粘贴执行**，为此用了两处写法：
+
+| 写法 | 原因 |
+|---|---|
+| 用 `;` 串联命令，不用 `&&` | Windows PowerShell 5.1 不支持 `&&`（会报"不是有效的语句分隔符"） |
+| npm 写成 `npm.cmd` | PowerShell 默认执行策略会拦截 `npm.ps1`，报 `UnauthorizedAccess`。在 Git Bash 里写 `npm` 即可 |
+
+用什么终端都行：
+
+- **Git Bash**（本项目脚本都是 bash，推荐）：开始菜单搜 "Git Bash"，或在项目目录右键 → "Git Bash Here"
+- **PowerShell / cmd**：直接粘贴下面的命令
+- **PyCharm 的 Terminal**：注意改过环境变量后要**重启 PyCharm** 才生效
+
+> 前置：**Docker Desktop 已启动**（它依赖 WSL2）。工具链安装见 [16-deployment §2](docs/16-deployment.md)。
 
 ### 1. 启动数据库与 Redis
 
@@ -14,33 +29,44 @@ v2.0 技术栈：**Vue 3 前端 + Python/FastAPI 模块化单体 + PostgreSQL + 
 docker compose -f deploy/docker-compose.dev.yml up -d
 ```
 
-首次启动会自动建好 3 个角色、3 个扩展、14 个 schema（`deploy/postgres/init/01-init.sh`）。
-端口只绑定 `127.0.0.1`，不对局域网暴露。
+首次启动会自动建好 3 个角色、3 个扩展、14 个 schema（`deploy/postgres/init/01-init.sh`）。端口只绑定 `127.0.0.1`，不对局域网暴露。
 
-### 2. 初始化后端
+确认健康状态（两个都应是 `healthy`）：
 
 ```bash
-cd backend && cp ../deploy/.env.example .env
+docker compose -f deploy/docker-compose.dev.yml ps
+```
+
+### 2. 初始化后端（只需一次）
+
+```bash
+cd backend; cp ../deploy/.env.example .env
 ```
 
 ```bash
-cd backend && uv sync && uv run alembic upgrade head
+cd backend; uv sync; uv run alembic upgrade head
 ```
 
-`uv sync` 会自动使用 3.12（见 `backend/.python-version`）。
+`uv sync` 会自动使用 Python 3.12（见 `backend/.python-version`），不影响系统里已有的其它版本。
+
+**每次 `git pull` 之后都要重跑迁移**：
+
+```bash
+cd backend; uv run alembic upgrade head
+```
 
 ### 3. 起三个服务（各开一个终端窗口）
 
 ```bash
-cd backend && uv run uvicorn app.main:app --reload --port 8000
+cd backend; uv run uvicorn app.main:app --reload --port 8000
 ```
 
 ```bash
-cd web-mall && npm run dev
+cd web-mall; npm.cmd run dev
 ```
 
 ```bash
-cd web-admin && npm run dev
+cd web-admin; npm.cmd run dev
 ```
 
 | 服务 | 地址 | 说明 |
@@ -49,23 +75,20 @@ cd web-admin && npm run dev
 | 买家商城 | http://localhost:5173 | 搜索商品、规格选择 |
 | 商家后台 | http://localhost:5174 | 发布商品、上下架 |
 
-### 4. 造演示数据（可选）
+两个前端都用 Vite 把 `/api` 代理到 8000 端口，**前后端同源，不需要 CORS**。
+
+### 4. 造演示数据（可选，但强烈建议）
 
 ```bash
-cd backend && uv run python scripts/seed_demo.py
+cd backend; uv run python scripts/seed_demo.py
 ```
 
-会建好类目树、一个平台管理员、一个商家和三个已上架商品，并在最后打印两个账号的密码。
-用商家账号登录 http://localhost:5174 就能看到商品；用买家身份在 http://localhost:5173 浏览。
+会建好类目树、一个平台管理员、一个商家和三个已上架商品，**并在结尾打印两个账号的手机号和密码**。
+用商家账号登录 http://localhost:5174 就能看到商品；在 http://localhost:5173 用买家身份浏览。
 
 ### 5. 跑测试
 
-```bash
-cd backend && uv run pytest -q
-```
-
-测试连的是**真实的 PostgreSQL 和 Redis**（独立 `eshop_test` 库），每个用例前清表。
-首次运行前需要建一次测试库：
+首次需要建一次测试库（用 `eshop_owner` 连接，避免和应用角色纠缠权限）：
 
 ```bash
 docker exec eshop-postgres psql -U eshop_owner -d eshop -c "CREATE DATABASE eshop_test OWNER eshop_owner;"
@@ -74,6 +97,14 @@ docker exec eshop-postgres psql -U eshop_owner -d eshop -c "CREATE DATABASE esho
 ```bash
 docker exec eshop-postgres psql -U eshop_owner -d eshop_test -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin; CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
 ```
+
+之后直接跑即可（夹具会自动把测试库迁移到最新并清表）：
+
+```bash
+cd backend; uv run pytest -q
+```
+
+测试连的是**真实的 PostgreSQL 和 Redis**，不 mock 数据库。
 
 ### 常用命令
 
@@ -90,8 +121,34 @@ docker exec -it eshop-redis redis-cli
 ```
 
 ```bash
-cd backend && uv run alembic revision --autogenerate -m "描述"
+cd backend; uv run alembic revision --autogenerate -m "描述"
 ```
+
+> 生成迁移后**务必先看一眼**：确认里面没有 `drop_table('alembic_version')`，也没有把别的模块的表当成"多余的表"删掉。
+
+### 代码检查
+
+```bash
+cd backend; uv run ruff check .; uv run ruff format --check .
+```
+
+```bash
+cd web-mall; npm.cmd run type-check; npm.cmd run lint
+```
+
+```bash
+cd web-admin; npm.cmd run type-check; npm.cmd run lint
+```
+
+### 停止
+
+三个服务窗口按 `Ctrl+C`。数据库与 Redis：
+
+```bash
+docker compose -f deploy/docker-compose.dev.yml down
+```
+
+加 `-v` 会**连数据一起删掉**（下次要重新迁移建表），平时别加。
 
 ## 文档索引
 

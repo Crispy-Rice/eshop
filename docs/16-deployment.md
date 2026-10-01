@@ -154,10 +154,20 @@ CI 会加一条比对检查（15 §3.1）。将来这套代码变大后，再考
 
 ### 3.2 本地启动步骤
 
-**准备**：Docker Desktop 已启动（需要 WSL2）。本机若还没有 `backend/.env`：
+**先说终端。** 下面的命令在 **Git Bash 和 PowerShell 里都能直接粘贴执行**，为此有两处刻意的写法：
+
+| 写法 | 原因 |
+|---|---|
+| 用 `;` 串联，不用 `&&` | Windows PowerShell 5.1 不支持 `&&`，会报"不是有效的语句分隔符" |
+| npm 写成 `npm.cmd` | PowerShell 的默认执行策略会拦截 `npm.ps1`，报 `UnauthorizedAccess`。Git Bash 里写 `npm` 就行 |
+
+用什么终端都可以：Git Bash（本项目脚本都是 bash，推荐）、PowerShell、cmd。
+**PyCharm 的 Terminal 要注意**：它的环境变量在 PyCharm 启动时固定，改过 PATH 后必须重启 PyCharm。
+
+**准备**：Docker Desktop 已启动（依赖 WSL2）。本机若还没有 `backend/.env`：
 
 ```bash
-cd backend && cp ../deploy/.env.example .env
+cd backend; cp ../deploy/.env.example .env
 ```
 
 **① PostgreSQL 与 Redis**（端口只绑定 127.0.0.1，不对局域网暴露）
@@ -167,25 +177,32 @@ docker compose -f deploy/docker-compose.dev.yml up -d
 ```
 
 首次启动会自动执行 `deploy/postgres/init/01-init.sh`：建 3 个角色、3 个扩展、14 个 schema 并配好默认权限。
+确认健康状态（两个都应是 `healthy`）：
+
+```bash
+docker compose -f deploy/docker-compose.dev.yml ps
+```
 
 **② 后端依赖与迁移**
 
 ```bash
-cd backend && uv sync && uv run alembic upgrade head
+cd backend; uv sync; uv run alembic upgrade head
 ```
+
+每 `git pull` 之后都要重跑一次迁移：`cd backend; uv run alembic upgrade head`
 
 **③ 起三个服务**（各开一个终端窗口）
 
 ```bash
-cd backend && uv run uvicorn app.main:app --reload --port 8000
+cd backend; uv run uvicorn app.main:app --reload --port 8000
 ```
 
 ```bash
-cd web-mall && npm run dev
+cd web-mall; npm.cmd run dev
 ```
 
 ```bash
-cd web-admin && npm run dev
+cd web-admin; npm.cmd run dev
 ```
 
 | 服务 | 地址 | 说明 |
@@ -197,13 +214,13 @@ cd web-admin && npm run dev
 **④ 异步任务 worker**（用到延迟任务与定时任务时才需要）
 
 ```bash
-cd backend && uv run arq app.worker.main.WorkerSettings
+cd backend; uv run arq app.worker.main.WorkerSettings
 ```
 
 **⑤ 演示数据**（可选）
 
 ```bash
-cd backend && uv run python scripts/seed_demo.py
+cd backend; uv run python scripts/seed_demo.py
 ```
 
 会建好类目树、一个平台管理员、一个商家和三个已上架商品，并在结尾打印两个账号的密码。
@@ -223,6 +240,18 @@ docker exec -it eshop-postgres psql -U eshop_owner -d eshop
 ```bash
 docker exec -it eshop-redis redis-cli
 ```
+
+**代码检查**
+
+```bash
+cd backend; uv run ruff check .; uv run ruff format --check .
+```
+
+```bash
+cd web-mall; npm.cmd run type-check; npm.cmd run lint
+```
+
+**停止服务**：三个窗口按 `Ctrl+C`；数据库用 `docker compose -f deploy/docker-compose.dev.yml down`（加 `-v` 会连数据一起删）。
 
 ### 3.3 测试
 
@@ -246,7 +275,7 @@ docker exec eshop-postgres psql -U eshop_owner -d eshop_test -c "CREATE EXTENSIO
 之后直接跑 pytest 即可，夹具会自动把测试库迁移到最新版本，并在每个用例前清空业务表：
 
 ```bash
-cd backend && uv run pytest -q
+cd backend; uv run pytest -q
 ```
 
 ## 4. 生产环境：Docker Compose

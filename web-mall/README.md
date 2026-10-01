@@ -1,48 +1,37 @@
-# web-mall
+# web-mall · 买家 PC 商城
 
-This template should help get you started developing with Vue 3 in Vite.
+Vue 3 + Vite + TypeScript + Pinia + Element Plus。
 
-## Recommended IDE Setup
+**完整的启动步骤见仓库根目录的 [README](../README.md)** —— 那里写了终端选择、依赖安装、数据库准备和演示数据。
 
-[VS Code](https://code.visualstudio.com/) + [Vue (Official)](https://marketplace.visualstudio.com/items?itemName=Vue.volar) (and disable Vetur).
+简单说：
 
-## Recommended Browser Setup
-
-- Chromium-based browsers (Chrome, Edge, Brave, etc.):
-  - [Vue.js devtools](https://chromewebstore.google.com/detail/vuejs-devtools/nhdogjmejiglipccpnnnanhbledajbpd)
-  - [Turn on Custom Object Formatter in Chrome DevTools](http://bit.ly/object-formatters)
-- Firefox:
-  - [Vue.js devtools](https://addons.mozilla.org/en-US/firefox/addon/vue-js-devtools/)
-  - [Turn on Custom Object Formatter in Firefox DevTools](https://fxdx.dev/firefox-devtools-custom-object-formatters/)
-
-## Type Support for `.vue` Imports in TS
-
-TypeScript cannot handle type information for `.vue` imports by default, so we replace the `tsc` CLI with `vue-tsc` for type checking. In editors, we need [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar) to make the TypeScript language service aware of `.vue` types.
-
-## Customize configuration
-
-See [Vite Configuration Reference](https://vite.dev/config/).
-
-## Project Setup
-
-```sh
-npm install
+```bash
+cd web-mall; npm.cmd run dev
 ```
 
-### Compile and Hot-Reload for Development
+跑在 http://localhost:5173，通过 Vite 把 `/api` 代理到 http://127.0.0.1:8000。
 
-```sh
-npm run dev
+> Windows 上写 `npm.cmd` 是为了绕过 PowerShell 的脚本执行策略（它会拦截 `npm.ps1`）。
+> 在 Git Bash 或 cmd 里写 `npm` 即可。
+
+## 目录
+
+```
+src/
+├── api/          # 接口层：errors（错误码镜像）/ http（axios 封装）/ auth / product / system
+├── stores/       # Pinia：auth（令牌与登录态）
+├── router/       # 路由与守卫（requiresAuth / guestOnly）
+├── utils/        # money（分↔元）、placeholder（图片占位）
+└── views/        # 登录、商品列表、商品详情（含规格选择器）、我的、系统状态
 ```
 
-### Type-Check, Compile and Minify for Production
+## 脚本
 
-```sh
-npm run build
-```
-
-### Lint with [ESLint](https://eslint.org/)
-
-```sh
-npm run lint
-```
+| 命令 | 作用 |
+|---|---|
+| `npm.cmd run dev` | 开发服务器（5173） |
+| `npm.cmd run build` | 生产构建 |
+| `npm.cmd run type-check` | vue-tsc 类型检查 |
+| `npm.cmd run lint` | oxlint + eslint |
+| `npm.cmd run format` | prettier 格式化 |
