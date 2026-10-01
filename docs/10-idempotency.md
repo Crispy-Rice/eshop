@@ -9,7 +9,7 @@
 | 手段 | 能挡住吗 |
 |---|---|
 | 按钮置灰 | 部分。用户可能刷新页面重来、或用多标签页、或抓包重放请求 |
-| 前端计时器 | 部分。同 上 |
+| 前端计时器 | 部分。同上 |
 | 后端限流 | 不精确。限流是"速率"控制，不是"同一请求只执行一次" |
 | **幂等键** | ✅ 精确。同一逻辑请求，无论来多少次，只产生一次效果 |
 
@@ -33,217 +33,231 @@
 
 ### 3.1 客户端的责任
 
-```javascript
-// 前端：进入结算页时生成一次，直到下单成功/失败才重新生成
-class OrderSubmitter {
-  constructor() {
-    this.idempotencyKey = this.generateUUID();   // ★ 只在初始化时生成一次
-    this.submitting = false;
-  }
+前端统一封装在 axios 实例里，业务代码只需声明"这个请求需要幂等键"：
 
-  async submit() {
-    if (this.submitting) return;      // ★ 同步锁，防同一页面的连点
-    this.submitting = true;
+```ts
+// web-mall/src/api/http.ts
+import axios, { type AxiosRequestConfig } from 'axios'
+
+export const http = axios.create({ baseURL: '/api', timeout: 10_000 })
+
+// 调用方传入 idempotencyKey，拦截器负责写入请求头
+http.interceptors.request.use((config) => {
+  const key = (config as AxiosRequestConfig & { idempotencyKey?: string }).idempotencyKey
+  if (key) config.headers.set('Idempotency-Key', key)
+  return config
+})
+```
+
+```ts
+// web-mall/src/composables/useIdempotentSubmit.ts
+import { ref } from 'vue'
+
+/** 进入页面时生成一次 key；只有成功或用户修改了提交内容才换新 key。 */
+export function useIdempotentSubmit<T>(request: (key: string) => Promise<T>) {
+  let key = crypto.randomUUID()
+  const submitting = ref(false)
+
+  async function submit(): Promise<T | undefined> {
+    if (submitting.value) return            // ★ 同一页面的连点直接忽略
+    submitting.value = true
     try {
-      const resp = await fetch('/api/order/create', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Idempotency-Key': this.idempotencyKey   // ★ 每次提交都用同一个
-        },
-        body: JSON.stringify(this.buildPayload())
-      });
-      // 成功后才重置（允许下一次购买）
-      if (resp.ok) this.idempotencyKey = this.generateUUID();
-      return resp.json();
+      const result = await request(key)     // ★ 失败重试时仍用同一个 key
+      key = crypto.randomUUID()             // 成功后才换 key（允许下一次购买）
+      return result
     } finally {
-      // ★ 不重置 submitting！保持按钮禁用，避免失败后立刻重试
-      // 失败时给用户"重试"按钮，重试时用同一个 key（这是关键）
-      // this.submitting = false;
+      submitting.value = false
     }
   }
+
+  /** 用户修改了地址、数量、优惠券等提交内容时调用：这是一个新的逻辑请求 */
+  function resetKey() {
+    key = crypto.randomUUID()
+  }
+
+  return { submit, submitting, resetKey }
 }
 ```
 
-**关键点**：**失败后重试必须用同一个 key**。这样如果第 1 次实际上成功了（只是响应丢失），重试会拿到"已存在"的结果，而不是创建第 2 个订单。
+**关键点**：**失败后重试必须用同一个 key**。这样如果第 1 次实际上成功了（只是响应丢失），重试会拿到第 1 次的结果，而不是创建第 2 个订单。
 
-### 3.2 服务端的实现（网关层）
+> `crypto.randomUUID()` 只在安全上下文（HTTPS 或 `localhost`）中可用。第一期用 IP + HTTP 访问时浏览器不提供该函数，需要改用 `uuid` 包的 `v4()`（版本锁定，见 [16](16-deployment.md)）。
 
-```java
-@Component
-public class IdempotencyInterceptor implements HandlerInterceptor {
+### 3.2 服务端的实现（FastAPI 依赖）
 
-    private static final String HEADER = "Idempotency-Key";
-    private static final long TTL_SECONDS = 300;   // 5 分钟窗口
+幂等以**依赖注入**的方式挂在需要它的路由上，而不是全局中间件——这样每个路由显式声明自己的 TTL，查询接口不受影响。
 
-    @Override
-    public boolean preHandle(HttpServletRequest req, HttpServletResponse resp, Object handler) {
-        String key = req.getHeader(HEADER);
-        if (key == null || key.isBlank()) {
-            // 强制要求（白名单接口除外）
-            throw new BusinessException(IDEMPOTENCY_KEY_REQUIRED);
-        }
+```python
+# app/core/idempotency.py
+IDEM_PROCESSING = "__PROCESSING__"
 
-        String userId = UserContext.getUserId();
-        String redisKey = "idem:" + userId + ":" + req.getRequestURI() + ":" + key;
+class Idempotency:
+    """在路由中使用：idem: IdemContext = Depends(Idempotency(ttl=300))"""
 
-        // ★ 原子占位
-        Boolean first = redisTemplate.opsForValue()
-            .setIfAbsent(redisKey, "PROCESSING", Duration.ofSeconds(TTL_SECONDS));
+    def __init__(self, ttl: int = 300) -> None:
+        self.ttl = ttl
 
-        if (Boolean.TRUE.equals(first)) {
-            // 首次请求，放行
-            req.setAttribute("idemKey", redisKey);
-            return true;
-        }
+    async def __call__(
+        self,
+        request: Request,
+        user: CurrentUser,
+        redis: RedisDep,
+        key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> AsyncIterator["IdemContext"]:
+        if not key or len(key) > 64:
+            raise BizError(ErrorCode.IDEMPOTENCY_KEY_REQUIRED)
 
-        // 已存在：查状态
-        String status = (String) redisTemplate.opsForValue().get(redisKey);
+        redis_key = f"idem:{user.id}:{request.method}:{request.url.path}:{key}"
 
-        if ("PROCESSING".equals(status)) {
-            // ★ 正在处理中：返回"处理中"而不是"重复提交"，让前端知道要等待
-            throw new BusinessException(REQUEST_PROCESSING, "请求处理中，请稍候");
-        }
+        # ★ 原子占位：SET NX EX
+        if not await redis.set(redis_key, IDEM_PROCESSING, nx=True, ex=self.ttl):
+            cached = await redis.get(redis_key)
+            if cached is None or cached == IDEM_PROCESSING:
+                # ★ 正在处理中：返回"处理中"而不是"重复提交"，让前端知道要等待
+                raise BizError(ErrorCode.REQUEST_PROCESSING)
+            # 已完成：直接返回缓存的响应，不再执行业务
+            raise CachedResponse(json.loads(cached))
 
-        // 已完成：返回缓存的结果
-        String cachedResult = status;   // 存的就是序列化后的响应
-        resp.setContentType("application/json;charset=UTF-8");
-        resp.getWriter().write(cachedResult);
-        return false;   // 不再进 Controller
-    }
+        ctx = IdemContext(redis, redis_key, self.ttl)
+        try:
+            yield ctx
+        except BizError:
+            # ★ 明确的业务校验失败（库存不足、价格变化等）：删除 key，允许用户修正后重试
+            await redis.delete(redis_key)
+            raise
+        # 其他异常（系统错误、超时）不删除：业务可能已经提交，
+        # 用户在 TTL 内重试会得到 REQUEST_PROCESSING，而不是创建第二单
 
-    @Override
-    public void afterCompletion(HttpServletRequest req, HttpServletResponse resp, Object handler, Exception ex) {
-        String redisKey = (String) req.getAttribute("idemKey");
-        if (redisKey == null) return;
 
-        if (ex != null) {
-            // ★ 异常时删除 key，允许用户重试
-            //   但如果异常发生在"业务已提交、只是响应失败"的情况，删除会有风险
-            //   → 因此只对明确的"业务校验失败"删除，系统异常保留（用户重试拿到 PROCESSING 提示）
-            if (isBusinessException(ex)) {
-                redisTemplate.delete(redisKey);
-            }
-            return;
-        }
-
-        // 成功：把响应体写入 Redis，供重复请求返回
-        // 实现上通常用 ResponseBodyAdvice 拿到响应体
-        String body = (String) req.getAttribute("idemResponseBody");
-        if (body != null) {
-            redisTemplate.opsForValue().set(redisKey, body, Duration.ofSeconds(TTL_SECONDS));
-        }
-    }
-}
+class IdemContext:
+    async def save(self, response: BaseModel) -> None:
+        """路由在业务成功、事务提交后调用，把响应体写入 Redis。"""
+        await self.redis.set(self.redis_key, response.model_dump_json(by_alias=True), ex=self.ttl)
 ```
+
+`CachedResponse` 是一个自定义异常，由全局异常处理器转换成 `200` + 缓存的 JSON。路由用法：
+
+```python
+@router.post("/api/orders", response_model=ApiResponse[OrderCreated])
+async def create_order(
+    body: CreateOrderRequest,
+    user: CurrentUser,
+    session: DbSession,
+    idem: Annotated[IdemContext, Depends(Idempotency(ttl=300))],
+) -> ApiResponse[OrderCreated]:
+    async with session.begin():
+        result = await order_service.create(session, user.id, body, request_id=idem.redis_key)
+    resp = ApiResponse.ok(result)
+    await idem.save(resp)                    # ★ 事务提交之后再写缓存
+    return resp
+```
+
+> FastAPI 0.106 起，带 `yield` 的依赖在**响应发送前**执行退出代码，因此依赖内能捕获到路由抛出的异常。实现时以项目锁定的 FastAPI 版本跑一遍 §11 的测试用例确认行为。
 
 ### 3.3 为什么存"响应体"而不是"只标记已处理"
 
 如果只标记"已处理"，重复请求需要重新走业务逻辑查询结果（比如"查这个用户的最近订单"）。**存响应体**更直接：重复请求直接返回一模一样的 JSON，前端体验完全一致。
 
-**代价**：Redis 存储空间。缓解：TTL 5 分钟 + 只对关键接口（下单、支付、领券）启用。
+**代价**：Redis 存储空间。缓解：TTL 5 分钟 + 只对关键接口（下单、支付、领券、售后申请）启用。
 
 ### 3.4 三种状态的语义
 
 | Redis 值 | 含义 | 返回行为 |
 |---|---|---|
-| 不存在 | 首次请求 | 放行，设为 `PROCESSING` |
-| `PROCESSING` | 上一次还在处理中 | 返回 `409 REQUEST_PROCESSING`，"请稍候" |
+| 不存在 | 首次请求 | 放行，设为 `__PROCESSING__` |
+| `__PROCESSING__` | 上一次还在处理中（或系统异常后未清理） | 返回 `409 REQUEST_PROCESSING`，"请稍候" |
 | 一段 JSON | 上次已完成 | 直接返回该 JSON（HTTP 200） |
 
-**为什么 `PROCESSING` 不返回成功**：如果返回成功但业务其实失败了，用户会以为下单成功。返回"处理中"更诚实，前端可以轮询或提示等待。
+**为什么 `PROCESSING` 不返回成功**：如果返回成功但业务其实失败了，用户会以为下单成功。返回"处理中"更诚实，前端可以提示等待后再试。
+
+**系统异常后卡在 `PROCESSING` 怎么办**：TTL 到期后自动释放。下单接口额外有 `request_id`（= 幂等 Redis key）写入 `order_main`，用户在订单列表能看到第一次是否已成功，见 §5。
 
 ## 4. 第 2 层：业务状态机守卫
 
-**每个写操作前，先校验当前状态是否允许。**
+**每个写操作前，先校验当前状态是否允许。** 统一用"带状态条件的 UPDATE + 检查 rowcount"实现：
 
-```java
-// 支付：只有待付款的订单能支付
-int rows = payMapper.createIfAbsent(payNo, mainOrderNo, amount,
-    "WHERE STATUS = 10");   // 隐含在业务校验中
-```
-
-```java
-// 取消订单：只有待付款才能取消
-public void cancel(String mainOrderNo) {
-    // CAS：状态必须是待付款
-    int rows = mainMapper.cancel(mainOrderNo, OrderMainStatus.WAIT_PAY);
-    if (rows == 0) {
-        // 已经支付过了 → 提示"订单已支付，请申请退款"
-        throw new BusinessException(ORDER_ALREADY_PAID);
-    }
-    // ...
-}
+```python
+async def cancel_order(session: AsyncSession, user_id: int, order_main_no: str) -> None:
+    # CAS：只有本人的、待付款的订单能取消
+    result = await session.execute(
+        update(OrderMain)
+        .where(OrderMain.order_main_no == order_main_no,
+               OrderMain.user_id == user_id,
+               OrderMain.status == SubOrderStatus.WAIT_PAY)
+        .values(status=SubOrderStatus.CLOSED, close_time=func.now())
+    )
+    if result.rowcount == 0:
+        # 已经支付过了 / 已关闭 / 不是本人订单 → 查一次给出准确提示
+        raise BizError(await explain_cancel_failure(session, user_id, order_main_no))
+    ...
 ```
 
 ```sql
-UPDATE order_main
-SET status = 50, close_time = NOW(3)
-WHERE order_main_no = ? AND status = 10;
--- RowsAffected = 0 → 不是待付款状态，取消失败（幂等）
+UPDATE trade.order_main
+SET status = 50, close_time = now()
+WHERE order_main_no = :no AND user_id = :user_id AND status = 10;
+-- rowcount = 0 → 不是待付款状态，取消失败（幂等）
 ```
 
 **状态机守卫的价值**：它把"幂等"变成"业务语义正确"。不只是"不重复执行"，而是"这个操作在当前状态下本来就无意义，拒绝掉"。
 
 ## 5. 第 3 层：数据库唯一约束
 
-**所有幂等键最终都要落到唯一索引上**。这是最后一道防线，也是排查问题时最可靠的证据。
+**所有幂等键最终都要落到唯一约束上**。这是最后一道防线，也是排查问题时最可靠的证据。
 
 ```sql
--- 订单
-UNIQUE KEY `uk_main_no` (`order_main_no`)
-
--- 一个母单一个支付单
-UNIQUE KEY `uk_main_order` (`order_main_no`)
-
+-- 订单号
+CONSTRAINT uk_order_main_no UNIQUE (order_main_no)
+-- 下单请求（幂等键持久化，Redis 丢失时仍能挡住重复下单）
+CREATE UNIQUE INDEX uk_order_main_request ON trade.order_main (user_id, request_id);
+-- 一个母单同时只有一个有效支付单（部分唯一索引）
+CREATE UNIQUE INDEX uk_payment_main_active ON payment.payment (order_main_no) WHERE status IN (0, 1, 2, 5);
 -- 渠道交易号不重复入账
-UNIQUE KEY `uk_channel_trade` (`channel`, `out_trade_no`)
-
--- 库存流水
-UNIQUE KEY `uk_biz_key` (`biz_key`)
-
--- 积分流水
-UNIQUE KEY `uk_biz_key` (`biz_key`)
-
+CONSTRAINT uk_payment_channel_trade UNIQUE (channel, out_trade_no)
+-- 库存 / 积分幂等键
+inventory.stock_biz_key (biz_key PRIMARY KEY)
+account.points_biz_key  (biz_key PRIMARY KEY)
 -- 领券记录
-UNIQUE KEY `uk_idem` (`idempotency_key`)
-
+CONSTRAINT uk_coupon_receive_idem UNIQUE (idempotency_key)
 -- 评价（见 12-review）
-UNIQUE KEY `uk_user_sku` (`user_id`, `sku_id`, `order_item_id`)
-
--- 售后
-UNIQUE KEY `uk_biz_no` (`refund_biz_no`)  -- 一个售后单一次退款
+CREATE UNIQUE INDEX uk_review_order_item ON review.review (order_item_id) WHERE NOT is_follow_up;
+-- 资金退款：一个售后单一次退款
+CONSTRAINT uk_payment_refund_biz UNIQUE (refund_biz_no)
 ```
+
+`order_main.request_id VARCHAR(160) NOT NULL` 需要加到 [07 §3.1](07-order-and-split.md) 的母单表中。
+
+写入时统一用 `INSERT ... ON CONFLICT DO NOTHING RETURNING id`：返回空即"已处理过"，比捕获 `IntegrityError` 更清晰，也不会让事务进入失败状态（PG 中任何语句报错都会使当前事务进入 aborted 状态，后续语句全部失败）。
 
 **命名规范**：幂等键统一叫 `biz_key` 或 `idempotency_key`，值用 `{动作}:{业务ID}` 格式，便于排查：
 
 ```
-LOCK:SO20260930123:1001      库存预占
-PAY:M20260930123             支付实扣
-USE:M20260930123:88001       用券
-RETURN:R20260930123:1001     退货入库
-REFUND:R20260930123          积分返还
+LOCK:M20260930...-1:1001     库存预占
+PAY:M20260930...             支付实扣
+USE:M20260930...:88001       用券
+RETURN:R20260930...:1001     退货入库
+REFUND:R20260930...          积分返还
 ```
 
 ## 6. 各接口的幂等方案总表
 
 | 接口 | 幂等键 | 幂等实现 | 前端防连点 |
 |---|---|---|---|
-| 提交订单 | `Idempotency-Key` | 网关 SETNX + 订单号唯一 | 按钮置灰 + 5s 冷却 |
-| 发起支付 | `Idempotency-Key` | 网关 SETNX + `uk_main_order` | 按钮置灰 |
-| 支付回调 | `(channel, out_trade_no)` | 落库唯一 + 状态 CAS | N/A（渠道触发） |
-| 领取优惠券 | `Idempotency-Key` | Lua 脚本内幂等 + `uk_idem` | 按钮置灰 + 3s |
-| 锁定优惠券 | `LOCK:{mainNo}:{codeId}` | 状态 CAS（`status=1`） | N/A（内部调用） |
-| 核销优惠券 | `USE:{mainNo}:{codeId}` | 状态 CAS + 流水唯一 | N/A |
-| 库存预占 | `LOCK:{orderSubNo}:{skuId}` | Lua 检查 + `uk_biz_key` | N/A |
-| 库存回补 | `CANCEL:{mainOrderNo}` | SQL 条件 + `uk_biz_key` | N/A |
-| 退货入库 | `RETURN:{refundNo}:{skuId}` | `uk_biz_key` | N/A |
-| 申请售后 | `Idempotency-Key` + 订单项 CAS | `refunded_num` 条件更新 | 按钮置灰 |
-| 确认收货 | 状态 CAS | `WHERE status = 30` | 按钮置灰 |
-| 取消订单 | 状态 CAS | `WHERE status = 10` | 按钮置灰 |
-| 提交评价 | `uk_user_sku` | 唯一索引 | 按钮置灰 |
-| 商品收藏 | `uk_user_spu` | 唯一索引 | 前端本地状态 |
-| 加购物车 | `uk_user_sku` + `num = num + N` | 唯一索引 | 允许连点（累加是合理的） |
+| 提交订单 | `Idempotency-Key` | Redis `SET NX` + `uk_order_main_request` | 按钮 loading |
+| 发起支付 | `Idempotency-Key` | Redis `SET NX` + `uk_payment_main_active` | 按钮 loading |
+| 支付回调 | `(channel, notify_type, out_trade_no)` | 落库唯一 + 状态 CAS | N/A（渠道触发） |
+| 领取优惠券 | `Idempotency-Key` | Lua 脚本内幂等 + `uk_coupon_receive_idem` | 按钮 loading + 3s 冷却 |
+| 锁定优惠券 | `LOCK:{mainNo}:{codeId}` | 状态 CAS（`status = 1`） | N/A（内部调用） |
+| 核销优惠券 | `USE:{mainNo}:{codeId}` | 状态 CAS（`status = 2`） | N/A |
+| 库存预占 | `LOCK:{orderSubNo}:{skuId}` | Lua 检查 + `stock_biz_key` | N/A |
+| 库存回补 | `CANCEL:{mainOrderNo}` | SQL 条件 + `stock_biz_key` | N/A |
+| 退货入库 | `RETURN:{refundNo}:{skuId}` | `stock_biz_key` | N/A |
+| 申请售后 | `Idempotency-Key` + 订单项行锁 | `refunding_num` 条件更新 | 按钮 loading |
+| 确认收货 | 状态 CAS | `WHERE status = 30` | 按钮 loading |
+| 取消订单 | 状态 CAS | `WHERE status = 10` | 按钮 loading |
+| 提交评价 | `uk_review_order_item` | 唯一约束 | 按钮 loading |
+| 商品收藏 | `uk_user_spu` | 唯一约束 + `ON CONFLICT DO NOTHING` | 前端本地状态 |
+| 加购物车 | `uk_cart_user_sku` + `num = num + N` | upsert | 允许连点（累加是合理的） |
 
 **注意最后一条**：**加购物车不应该被幂等挡住**。用户快速点 3 次"加入购物车"期望数量变成 3，而不是 1。这提醒我们：**幂等策略要按业务语义决定，不能一刀切**。
 
@@ -252,7 +266,8 @@ REFUND:R20260930123          积分返还
 | 错误做法 | 问题 |
 |---|---|
 | 用 `SELECT` 判断后 `INSERT` | 并发下两个请求都 SELECT 到空，都 INSERT → 重复 |
-| 用 `SELECT ... FOR UPDATE` 但事务提交晚 | 锁等待超时，用户体验差（下单要 3 秒） |
+| 用 `SELECT ... FOR UPDATE` 但事务里有慢操作 | 锁等待超时，用户体验差（下单要 3 秒） |
+| 捕获 `IntegrityError` 后继续在同一事务里执行 | PG 事务已处于 aborted 状态，后续语句全部报错；应改用 `ON CONFLICT` 或 `SAVEPOINT` |
 | 用时间戳当幂等键 | 两次点击时间不同，不认为是同一个请求 |
 | 用"用户 ID + 商品 ID"当幂等键 | 用户确实会买两次同一个商品 |
 | 幂等键 TTL 太长（24h） | 用户第二天想重新下单，被判定为重复 |
@@ -266,160 +281,137 @@ REFUND:R20260930123          积分返还
 |---|---|---|
 | 提交订单 | 5 分钟 | 足够覆盖网络重试，又不会妨碍用户重新下单 |
 | 领券 | 1 分钟 | 领券是短促动作，1 分钟足够 |
-| 支付 | 10 分钟 | 支付可能涉及跳转，窗口稍长 |
+| 支付 | 10 分钟 | 支付涉及跳转收银台，窗口稍长 |
 | 确认收货 | 1 分钟 | |
 
-## 8. 分布式场景下的幂等
+## 8. 多进程部署下的幂等
 
-### 8.1 多实例部署
+### 8.1 多 worker / 多实例
 
-幂等键必须存**外部存储**（Redis），不能用 JVM 内存（8 个实例各有一份，挡不住）。
+Uvicorn 以多 worker 进程运行，`docker compose --scale api=N` 还会有多个容器。幂等键必须存**外部存储**（Redis / PG），不能用进程内存（`dict`、`functools.lru_cache`），否则每个进程各有一份，挡不住。
 
-### 8.2 Redis 集群下的原子性
+### 8.2 原子性
 
-`SETNX` 在 Redis Cluster 下单 key 操作是原子的，可放心使用。
-
-**但如果幂等键需要跨 key 操作**（如"检查限领 + 扣库存 + 写幂等"），必须用 Lua 脚本（见 [04](04-coupon.md)）。
+`SET key value NX EX ttl` 是单命令，天然原子。**如果幂等判断需要跨 key 操作**（如"检查限领 + 扣库存 + 写幂等"），必须用 Lua 脚本（见 [04](04-coupon.md)）。第一期是单实例 Redis；将来切 Redis Cluster 时，同一脚本涉及的 key 需要用 hash tag（如 `coupon:{tpl123}:stock`）保证落在同一 slot。
 
 ### 8.3 Redis 不可用时的降级
 
 | 接口 | 降级策略 |
 |---|---|
-| 提交订单 | **拒绝服务**（无幂等保护会产生重复订单，代价太高） |
-| 领券 | 拒绝服务（会超发） |
-| 查询类接口 | 正常服务（无幂等需求） |
-| 加购物车 | 可降级为 DB 唯一索引兜底（影响小） |
+| 提交订单 | **降级为 DB 幂等**：依赖 `uk_order_main_request` 唯一索引兜底，库存直接走 DB 条件更新；同时应用层把下单接口限流到正常的 1/10 |
+| 发起支付 | 依赖 `uk_payment_main_active` 兜底，可正常服务 |
+| 领券 | **拒绝服务**（没有 Redis 计数，DB 扛不住领券并发，且容易绕过限领） |
+| 查询类接口 | 正常服务（无幂等需求），缓存未命中直接查库 |
+| 加购物车 | 正常服务，依赖 DB upsert |
 
-**核心原则**：**资金和库存相关的接口，拿不到 Redis 就拒绝，不要"降级放行"**。少卖比超卖好，用户重试比重复下单好。
+**核心原则**：**能用数据库约束兜底的写接口可以降级，兜不住的（领券、秒杀）直接拒绝**。少卖比超卖好，用户重试比重复下单好。降级开关由健康检查自动判断 Redis 状态，也可由运营后台手动切换（开关存 PG 的 `ops.switch` 表，Redis 故障时依然可读）。
+
+> 降级状态下的应用层限流不能再依赖 Redis，改用进程内令牌桶（每个 worker 独立计数，总量 = 单 worker 限额 × worker 数）。
 
 ## 9. 特殊场景：同一请求的"部分成功"
 
 **场景**：批量预占 5 个 SKU，前 3 个成功，第 4 个失败。
 
-**处理**：**整单回滚**。不允许部分成功。
+**处理**：**整单失败**，不允许部分成功。
 
-```java
-public LockResult lockBatch(List<LockItem> items, String bizKey) {
-    // 按 (warehouseId, skuId) 排序防死锁
-    items.sort(...);
+- **DB 侧**：5 个 SKU 的预占在同一个事务里（[03 §5.1](03-inventory.md)），第 4 个失败抛异常，事务回滚，前 3 个自动撤销，**不需要手写回滚代码**。
+- **Redis 侧**：Redis 没有事务回滚，需要显式补偿。
 
-    // 使用同一幂等键加序号
-    List<LockedItem> locked = new ArrayList<>();
-    try {
-        for (int i = 0; i < items.size(); i++) {
-            LockItem item = items.get(i);
-            String itemBizKey = bizKey + ":" + item.getSkuId();
-            if (!doLock(item, itemBizKey)) {
-                throw new StockShortageException(item.getSkuId());
-            }
-            locked.add(...);
-        }
-        return LockResult.success();
-    } catch (Exception e) {
-        // ★ 回滚已成功的部分
-        for (LockedItem l : locked) {
-            releaseOne(l, bizKey + ":ROLLBACK:" + l.getSkuId());
-        }
-        throw e;
-    }
-}
+```python
+async def redis_lock_batch(redis: Redis, items: list[LockItem], biz_key: str) -> None:
+    locked: list[LockItem] = []
+    try:
+        for it in sorted(items, key=lambda x: (x.warehouse_id, x.sku_id)):
+            ok = await lua.stock_lock(redis, it, biz_key=f"{biz_key}:{it.sku_id}")
+            if not ok:
+                raise StockShortageError(it.sku_id)
+            locked.append(it)
+    except BaseException:
+        # ★ 回补已成功的部分；回补脚本按 biz_key 幂等，重复执行无副作用
+        for it in locked:
+            await lua.stock_release(redis, it, biz_key=f"{biz_key}:{it.sku_id}")
+        raise
 ```
 
-**为什么不允许部分成功**：用户体验上，用户要的是 5 件一起买，缺 1 件不如整个失败并提示"XX 商品库存不足"。
+> 进一步的优化：把整批 SKU 的检查与扣减写进**一个** Lua 脚本（先全部检查，都够了再全部扣减），由 Redis 单线程保证整批原子，就不存在部分成功。代价是脚本涉及多个 key，将来切 Cluster 时需要 hash tag 让它们落在同一 slot。第一期单实例 Redis 推荐用这种方式，见 [14](14-redis-keys.md)。
 
-**回滚本身也必须幂等**：用 `bizKey + ":ROLLBACK:" + skuId` 作为回滚的幂等键。
+**为什么不允许部分成功**：用户要的是 5 件一起买，缺 1 件不如整个失败并提示"XX 商品库存不足"。
 
 ## 10. 防连点的前端完整方案
 
-```html
-<button id="submitBtn" onclick="submitOrder()">提交订单</button>
+```vue
+<!-- web-mall/src/views/checkout/SubmitBar.vue -->
+<script setup lang="ts">
+import { ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import { createOrder, type CreateOrderPayload } from '@/api/order'
+import { useIdempotentSubmit } from '@/composables/useIdempotentSubmit'
+import { BizCode, isBizError } from '@/api/errors'
 
-<script>
-const state = {
-  idempotencyKey: uuidv4(),
-  phase: 'IDLE',          // IDLE | SUBMITTING | SUCCESS | FAILED
-  lastClickTime: 0
-};
+const props = defineProps<{ payload: CreateOrderPayload }>()
+const router = useRouter()
+const label = ref('提交订单')
 
-async function submitOrder() {
-  const btn = document.getElementById('submitBtn');
+const { submit, submitting, resetKey } = useIdempotentSubmit((key) => createOrder(props.payload, key))
 
-  // ① 状态检查
-  if (state.phase === 'SUBMITTING') return;
-  if (state.phase === 'SUCCESS') { router.push('/order/success'); return; }
+// 只有用户修改了订单内容（地址、数量、优惠券）才换 key —— 这是一个新的逻辑请求
+watch(() => props.payload, resetKey, { deep: true })
 
-  // ② 点击冷却（300ms，纯体验优化）
-  const now = Date.now();
-  if (now - state.lastClickTime < 300) return;
-  state.lastClickTime = now;
-
-  // ③ 进入提交态，按钮置灰
-  state.phase = 'SUBMITTING';
-  btn.disabled = true;
-  btn.textContent = '提交中...';
-
+async function onSubmit() {
   try {
-    const resp = await api.post('/order/create', payload, {
-      headers: { 'Idempotency-Key': state.idempotencyKey },
-      timeout: 10000
-    });
-
-    if (resp.code === 0) {
-      state.phase = 'SUCCESS';
-      router.push(`/order/pay?no=${resp.data.orderMainNo}`);
-      return;
-    }
-
-    if (resp.code === 'REQUEST_PROCESSING') {
-      // ★ 服务端在处理中，不是失败
-      btn.textContent = '处理中，请稍候...';
-      setTimeout(() => { state.phase = 'IDLE'; btn.disabled = false;
-                         btn.textContent = '提交订单'; }, 2000);
-      return;
-    }
-
-    // 业务失败
-    showError(resp.message);
-    state.phase = 'FAILED';
-    btn.disabled = false;
-    btn.textContent = '重新提交';   // ★ 重试时 idempotencyKey 不变（关键）
-    // 只有用户修改了订单内容（改地址、改数量）才重新生成 key
-
+    const data = await submit()
+    if (data) router.push({ name: 'pay', query: { no: data.orderMainNo } })
   } catch (e) {
-    // 网络异常：key 保持不变，用户重试
-    state.phase = 'FAILED';
-    btn.disabled = false;
-    btn.textContent = '网络异常，重试';
-    showError('网络异常，请重试');
+    if (isBizError(e, BizCode.REQUEST_PROCESSING)) {
+      // ★ 服务端还在处理，不是失败；稍后用同一个 key 重试即可
+      label.value = '处理中，请稍候...'
+      setTimeout(() => (label.value = '提交订单'), 2000)
+      return
+    }
+    // 业务失败或网络异常：key 保持不变，用户点"重新提交"
+    ElMessage.error(isBizError(e) ? e.message : '网络异常，请重试')
+    label.value = '重新提交'
   }
 }
 </script>
+
+<template>
+  <el-button type="primary" size="large" :loading="submitting" :disabled="submitting" @click="onSubmit">
+    {{ label }}
+  </el-button>
+</template>
 ```
 
 **关键细节**：
 
-1. **`SUBMITTING` 状态不自动解除**（除非服务端明确说"处理中，可重试"）——防止失败后立即重试造成第 2 单。
+1. **提交中按钮不可点**（`:loading` + `:disabled`），由 `useIdempotentSubmit` 内的 `submitting` 统一控制。
 2. **重试时 key 不变** —— 让服务端能识别出这是同一个请求。
 3. **只有用户修改了订单内容才换 key** —— 修改内容是一个新的逻辑请求。
+4. `el-button` 的 `loading` 状态自带屏幕阅读器可感知的忙碌提示；错误提示用 `ElMessage`，同时在表单区域保留文字提示，不只依赖颜色。
 
 ## 11. 测试清单
 
+后端用 `pytest` + `pytest-asyncio` + `httpx.AsyncClient` 并发发请求，连接 docker 中的测试 PG/Redis（不 mock 数据库，唯一约束和行锁只有真库才能测出来）。
+
 | # | 场景 | 期望 |
 |---|---|---|
-| 1 | 并发 100 次提交同一幂等键 | 只创建 1 个订单，其余返回相同结果 |
+| 1 | 并发 100 次提交同一幂等键 | 只创建 1 个订单，其余返回相同结果或 `REQUEST_PROCESSING` |
 | 2 | 第 1 次请求处理中，第 2 次到达 | 第 2 次返回 `REQUEST_PROCESSING` |
-| 3 | 第 1 次失败后重试（同 key） | 正常处理（key 已删除） |
+| 3 | 第 1 次业务失败后重试（同 key） | 正常处理（key 已删除） |
 | 4 | 第 1 次成功，5 分钟内重试 | 返回缓存的成功响应 |
-| 5 | 第 1 次成功，6 分钟后重试 | 创建新订单（key 已过期） |
+| 5 | 第 1 次成功，6 分钟后重试 | 被 `uk_order_main_request` 拦截，返回第 1 单的信息（而不是创建新单） |
 | 6 | 无 `Idempotency-Key` 请求下单 | 返回 400，拒绝 |
 | 7 | 并发支付回调 10 次 | 只处理 1 次，其余幂等返回 |
 | 8 | 并发领券 10 次（限领 1） | 只成功 1 次 |
 | 9 | 并发取消订单 5 次 | 只成功 1 次，库存只回补 1 次 |
 | 10 | 取消后再次取消 | 返回"订单状态不正确" |
 | 11 | 支付已关闭的订单 | 返回"订单已关闭" |
-| 12 | 批量预占，第 3 个 SKU 缺货 | 前 2 个回滚，全单失败 |
+| 12 | 批量预占，第 3 个 SKU 缺货 | DB 事务回滚 + Redis 已扣部分回补，全单失败 |
 | 13 | 100 个并发请求不同幂等键 | 创建 100 个订单（正常） |
-| 14 | Redis 宕机时下单 | 拒绝服务，友好提示 |
+| 14 | Redis 停止后下单 | 走 DB 降级路径成功，重复提交被唯一索引拦截 |
 | 15 | 同一 user 在两个标签页下单 | 两个不同的 key，创建 2 个订单（合理） |
+
+**第 5 条与原方案不同**：原方案在 key 过期后会创建新订单；持久化 `request_id` 后，同一个 key 永远只对应一个订单。前端在下单成功后一定会换新 key，所以这不会妨碍用户正常地再下一单。
 
 **第 15 条是刻意的设计**：用户在两个标签页各下一单，是两个独立的意图，应该都成功。幂等只针对"同一个逻辑请求的重复提交"，不是"同一用户的所有请求"。

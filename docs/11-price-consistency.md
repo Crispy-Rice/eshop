@@ -20,85 +20,78 @@
 
 | 理由 | 说明 |
 |---|---|
-| **交互响应** | 用户勾选/取消一个商品、换一张券，金额要立刻变。每次都调后端会有 200ms 延迟，体验差 |
+| **交互响应** | 用户勾选/取消一个商品、换一张券，金额要立刻变。每次都调后端会有明显延迟 |
 | **本地推算** | 优惠券列表、可用性提示、凑单提示都需要本地快速计算 |
 | **减少请求** | 用户反复调整购物车选择时，不需要每次请求后端 |
 
 **但要求**：**前端算法与后端算法必须严格一致**。差异会导致"前端显示 355，下单显示 358"这种致命体验问题。
 
-## 3. 一致性方案：单一算法 + 双端实现
+## 3. 一致性方案：单一规则 + 双端实现
 
 ### 3.1 方案对比
 
 | 方案 | 优点 | 缺点 | 结论 |
 |---|---|---|---|
 | A. 前端只展示后端算的结果 | 绝不不一致 | 每次调整都要请求，体验差 | ❌ |
-| B. 前端独立实现算法 | 响应快 | 两套代码必然漂移 | ❌ |
-| **C. 用同一份算法（跨端代码生成/WASM/公式配置）** | 一份逻辑 | 工程成本 | ✅ **推荐** |
+| B. 前端独立实现全部算法 | 响应快 | 两套代码必然漂移 | ❌ |
+| **C. 规则数据化 + 双端实现同一组纯函数 + 共享测试用例** | 一份规则，算法有自动化对齐 | 双端各写一份基础函数 | ✅ **采用** |
 | D. 前端先本地算（预估）+ 后端返回权威结果覆盖 | 体验好且最终一致 | 可能出现短暂闪变 | ✅ **配合 C 使用** |
 
-### 3.2 实现：算法下沉为"规则 + 解释器"
-
-**核心思路**：把算价逻辑抽象成**数据驱动的规则计算**，前端和后端跑同一份规则。
+### 3.2 实现：规则由后端下发，前端只做"汇总 + 局部重算"
 
 ```
                      ┌──────────────────┐
-                     │  促销规则 DSL     │  ← 活动配置生成
+                     │  促销规则         │  ← 活动配置，后端以 JSON 下发
                      │  (JSON)          │
                      └────────┬─────────┘
                               │
               ┌───────────────┴───────────────┐
               ▼                               ▼
       ┌───────────────┐              ┌───────────────┐
-      │ 后端计算引擎   │              │ 前端计算引擎   │
-      │ (Java)        │              │ (TypeScript)  │
+      │ 后端计算引擎   │              │ 前端计算函数   │
+      │ (Python)      │              │ (TypeScript)  │
       └───────────────┘              └───────────────┘
               │                               │
               └───────────┬───────────────────┘
                           ▼
-                 同一份规则，同样的算法
-                 同样的整数运算，同样的舍入
-                 同样的分摊（最大余数法）
+                 同一份规则，同样的整数运算
+                 同样的舍入，同样的最大余数法分摊
+                 同一份 testcases.json 验证（§8）
 ```
 
-**落地方式（成本从低到高）**：
-
-| 方式 | 说明 | 适合 |
-|---|---|---|
-| 1. 规则数据化（推荐起点） | 优惠规则由后端以 JSON 下发（`{type, threshold, value, rate}`），前端按固定算法解释。**算法代码双端各写一份，但规则只有一份** | 大多数团队 |
-| 2. 共享代码库 | 把算法写成 TypeScript，前端直接用；后端用 GraalVM JS 或转译运行 | 有前端工程能力 |
-| 3. WASM | 核心算法用 Rust/C 写，编译成 WASM，两端调用 | 追求极致一致 |
-
-**方案 1 的具体做法**：
+前后端技术栈不同（Python / TypeScript），没有低成本的"一份代码两端运行"方案，所以采用：**规则只有一份（后端下发）+ 基础算法双端各写一份（取整、分摊、门槛判断）+ 共享测试用例强制对齐**。前端只实现会在本地重算的部分，复杂的跨店叠加仍以后端结果为准。
 
 后端接口返回算价的**"明细解释"**而非仅数字：
 
 ```json
 {
   "items": [
-    { "skuId": 1001, "num": 2, "unitPrice": 799900,
+    { "skuId": "1001", "num": 2, "unitPrice": 799900,
       "promoPrice": 749900, "itemDiscount": 100000,
       "couponAmount": 30000, "pointAmount": 0,
       "payAmount": 1369800 }
   ],
   "shops": [
-    { "shopId": 100, "shopDiscount": 30000, "shopDiscountName": "满200减30" }
+    { "shopId": "100", "shopDiscount": 30000, "shopDiscountName": "满200减30" }
   ],
   "platform": { "platformDiscount": 5000, "platformDiscountName": "平台9折券" },
   "points": { "used": 0, "deduction": 0 },
-  "freight": { "amount": 1600, "detail": [{"warehouse":"WH-1","weight":1400,"first":"1000/1000","add":1,"fee":1600}] },
+  "freight": { "amount": 1600, "detail": [{"warehouse":"WH-1","weightG":1400,"fee":1600}] },
   "totalAmount": 1599800,
   "discountTotal": 135000,
-  "payableAmount": 1484400
+  "payableAmount": 1484400,
+  "priceToken": "eyJ1aWQiOi..."
 }
 ```
+
+ID 类字段以字符串返回（雪花 ID 超过 JS 安全整数范围），金额以整数分返回（见 §7）。
 
 **关键**：**后端返回的是"每个环节的明细"，前端做的是"汇总 + 局部重算"**。
 
 例如用户取消勾选商品 C，前端只需：
 1. 从 items 中移除 C
 2. 重新汇总（`totalAmount` 重新求和）
-3. **优惠部分请求后端重算**（因为优惠是全局依赖的）
+3. **优惠部分请求后端重算**（因为优惠是全局依赖的），请求做 300ms 防抖
 
 **这样前端只在"无优惠变化"的场景本地算，有优惠变化的场景调后端**。既快又准。
 
@@ -107,130 +100,115 @@
 ### 4.1 结构
 
 ```
-priceToken = base64url(payload) + "." + HMAC_SHA256(payload, SECRET)
+priceToken = base64url(payload_json) + "." + base64url(HMAC_SHA256(payload_json, SECRET))
 
 payload = {
-  "uid":  88001,                          // 用户
-  "its": [                                // 商品项（排序后）
-    {"s": 1001, "n": 2, "up": 799900, "pa": 1369800},
-    {"s": 1002, "n": 1, "up": 899900, "pa": 869900}
+  "uid":  "88001",                        // 用户
+  "its": [                                // 商品项（按 skuId 排序）
+    {"s": "1001", "n": 2, "up": 799900, "pa": 1369800},
+    {"s": "1002", "n": 1, "up": 899900, "pa": 869900}
   ],
-  "itsHash": "a3f8c1...",                 // ★ 商品项的 hash，用于快速比对
-  "cp":  [88001_1001, ...],               // 使用的券 ID 列表
-  "cpSnap": [{"id":..., "amt":30000}],    // 券的抵扣快照
+  "cp":  ["90001"],                       // 使用的券 ID 列表
+  "cpSnap": [{"id": "90001", "amt": 30000}], // 券的抵扣快照
   "pt":  0,                               // 使用的积分
   "fr":  1600,                            // 运费
   "ta":  1599800,                         // 商品原价总额
   "dt":  135000,                          // 优惠总额
   "pba": 1484400,                         // 应付
-  "ad":  "addrId:12345",                  // 地址 ID 的 hash
-  "exp": 1759240000000,                   // 过期时间（签发 + 30 分钟）
-  "iat": 1759238200000
+  "ad":  "12345",                         // 收货地址 ID
+  "exp": 1759240000,                      // 过期时间（签发 + 30 分钟，Unix 秒）
+  "iat": 1759238200
 }
 ```
 
 ### 4.2 签名与验签
 
-```java
-public class PriceTokenSigner {
-    private final SecretKeySpec key;   // 从 KMS/配置中心获取，不入代码库
+```python
+# app/modules/trade/price_token.py
+class PriceTokenSigner:
+    def __init__(self, secret: str) -> None:
+        self._key = secret.encode()          # 来自环境变量 PRICE_TOKEN_SECRET，不入代码库
 
-    public String sign(CalcContext ctx, CalcPriceResponse resp) {
-        String payload = buildPayload(ctx, resp);
-        String sig = hmacSha256(payload, key);
-        return Base64Url.encode(payload.getBytes(UTF_8)) + "." + sig;
-    }
+    def sign(self, payload: PriceTokenPayload) -> str:
+        body = payload.model_dump_json(by_alias=True).encode()
+        sig = hmac.new(self._key, body, hashlib.sha256).digest()
+        return f"{_b64e(body)}.{_b64e(sig)}"
 
-    public PriceToken verify(String token, Long userId) {
-        String[] parts = token.split("\\.");
-        if (parts.length != 2) throw new BusinessException(INVALID_PRICE_TOKEN);
+    def verify(self, token: str, user_id: int) -> PriceTokenPayload:
+        try:
+            body_b64, sig_b64 = token.split(".")
+            body, sig = _b64d(body_b64), _b64d(sig_b64)
+        except ValueError:
+            raise BizError(ErrorCode.INVALID_PRICE_TOKEN) from None
 
-        String payload = new String(Base64Url.decode(parts[0]), UTF_8);
-        String expectedSig = hmacSha256(payload, key);
+        expected = hmac.new(self._key, body, hashlib.sha256).digest()
+        # ★ 常量时间比较，防时序攻击
+        if not hmac.compare_digest(expected, sig):
+            raise BizError(ErrorCode.INVALID_PRICE_TOKEN, "价格校验失败")
 
-        // ★ 常量时间比较，防时序攻击
-        if (!MessageDigest.isEqual(expectedSig.getBytes(), parts[1].getBytes())) {
-            throw new BusinessException(INVALID_PRICE_TOKEN, "价格校验失败");
-        }
+        payload = PriceTokenPayload.model_validate_json(body)
+        if payload.uid != user_id:
+            raise BizError(ErrorCode.INVALID_PRICE_TOKEN, "令牌不属于当前用户")
+        if time.time() > payload.exp:
+            raise BizError(ErrorCode.PRICE_TOKEN_EXPIRED, "页面已过期，请刷新后重试")
+        return payload
 
-        PriceToken pt = JSON.parseObject(payload, PriceToken.class);
 
-        if (!pt.getUid().equals(userId)) {
-            throw new BusinessException(INVALID_PRICE_TOKEN, "令牌不属于当前用户");
-        }
-        if (System.currentTimeMillis() > pt.getExp()) {
-            throw new BusinessException(PRICE_TOKEN_EXPIRED, "页面已过期，请刷新后重试");
-        }
-        return pt;
-    }
-}
+def _b64e(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+def _b64d(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 ```
+
+验签只验证"这份数据是我们签发的、属于这个用户、没过期"，**签名本身不代表价格仍然有效**——有效性由 §4.3 的重算对比决定。
 
 ### 4.3 下单时的完整比对
 
-**这是需求的核心**："支付时后端计算后进行对比"。
+**这是需求的核心**："支付时后端计算后进行对比"（实现位置的说明见 §11）。
 
-```java
-@Transactional
-public OrderCreateResult createOrder(OrderCreateRequest req) {
-    // ========== ① 幂等检查（见 10-idempotency） ==========
-    // ...
+```python
+async def create_order(session: AsyncSession, user_id: int, req: CreateOrderRequest,
+                       request_id: str) -> OrderCreated:
+    # ========== ① 幂等检查：由路由上的 Idempotency 依赖完成（见 10-idempotency）==========
 
-    // ========== ② 验证 priceToken 签名与有效期 ==========
-    PriceToken clientToken = priceTokenSigner.verify(req.getPriceToken(), req.getUserId());
+    # ========== ② 验证 priceToken 签名与有效期 ==========
+    client = price_token_signer.verify(req.price_token, user_id)
 
-    // ========== ③ 后端重新算价 ==========
-    CalcPriceRequest calcReq = buildCalcRequest(req);
-    CalcPriceResponse serverCalc = promotionEngine.calc(calcReq);
+    # ========== ③ 后端重新算价（与结算页同一个函数）==========
+    server = await promotion_service.calc_price(session, user_id, req.to_calc_request())
 
-    // ========== ④ 逐项对比 ==========
-    List<PriceDiff> diffs = new ArrayList<>();
+    # ========== ④ 逐项对比 ==========
+    diffs: list[PriceDiff] = []
+    compare_items(client, server, diffs)                 # 4.1 SKU 集合、数量、单价、行实付
+    if client.dt != server.discount_total:               # 4.2 优惠
+        diffs.append(PriceDiff.of("优惠金额", client.dt, server.discount_total))
+    if client.fr != server.freight:                      # 4.3 运费
+        diffs.append(PriceDiff.of("运费", client.fr, server.freight))
+    if client.pt != server.point_used:                   # 4.4 积分（比较的是积分数量）
+        diffs.append(PriceDiff.of("积分抵扣", client.pt, server.point_used))
+    if client.pba != server.payable_amount:              # 4.5 ★ 应付总额（最关键）
+        diffs.append(PriceDiff.of("应付金额", client.pba, server.payable_amount))
 
-    // 4.1 商品项对比（SKU 集合、数量、单价）
-    compareItems(clientToken, serverCalc, diffs);
+    # ========== ⑤ 有不一致 → 拒绝下单 ==========
+    if diffs:
+        logger.warning("价格校验不一致", user_id=user_id, diffs=diffs)
+        price_mismatch_counter.labels(kind=classify(diffs)).inc()      # 见 §9
+        # ★ 异常里带上"最新的算价结果 + 新 token"，
+        #   前端可以直接展示"商品价格有变动，请确认"并让用户一键继续
+        raise PriceChangedError(diffs, new_price_token=server.price_token)
 
-    // 4.2 优惠对比
-    if (!Objects.equals(clientToken.getDt(), serverCalc.getDiscountTotal())) {
-        diffs.add(PriceDiff.of("优惠金额",
-            clientToken.getDiscountTotal(), serverCalc.getDiscountTotal()));
-    }
-
-    // 4.3 运费对比
-    if (!Objects.equals(clientToken.getFr(), serverCalc.getFreight())) {
-        diffs.add(PriceDiff.of("运费",
-            clientToken.getFr(), serverCalc.getFreight()));
-    }
-
-    // 4.4 积分对比
-    if (!Objects.equals(clientToken.getPt(), serverCalc.getPointUsed())) {
-        diffs.add(PriceDiff.of("积分抵扣",
-            clientToken.getPt(), serverCalc.getPointDeduction()));
-    }
-
-    // 4.5 ★ 应付总额对比（最关键）
-    if (!Objects.equals(clientToken.getPba(), serverCalc.getPayableAmount())) {
-        diffs.add(PriceDiff.of("应付金额",
-            clientToken.getPba(), serverCalc.getPayableAmount()));
-    }
-
-    // ========== ⑤ 有不一致 → 拒绝下单 ==========
-    if (!diffs.isEmpty()) {
-        log.warn("价格校验不一致: userId={}, diffs={}", req.getUserId(), diffs);
-        throw new PriceChangedException(diffs, serverCalc.getPriceToken());
-        // ★ 异常里带上"最新的算价结果 + 新 token"，
-        //   前端可以直接展示"商品价格有变动，请确认"并让用户一键继续
-    }
-
-    // ========== ⑥ 一致 → 继续下单流程 ==========
-    return doCreateOrder(req, serverCalc);
-}
+    # ========== ⑥ 一致 → 继续下单流程（同一事务内落单、预占、锁券、冻结积分）==========
+    return await do_create_order(session, user_id, req, server, request_id)
 ```
+
+> 注意 `PriceChangedError` 是 `BizError` 的子类，幂等依赖捕获到它会删除幂等键（[10 §3.2](10-idempotency.md)），用户点"确认并支付"时用新 token 重新提交即可。前端同时要调用 `resetKey()`，因为提交内容（token）已经变了。
 
 ### 4.4 差异的响应格式
 
 ```json
 {
-  "code": "409001",
+  "code": "PRICE_CHANGED",
   "message": "商品信息发生变化，请确认后重新提交",
   "data": {
     "diffs": [
@@ -241,27 +219,29 @@ public OrderCreateResult createOrder(OrderCreateRequest req) {
         "reason": "券已被其他订单占用" },
       { "field": "应付金额", "before": 1484400, "after": 1578800, "diffAmount": 94400 }
     ],
-    "newPriceToken": "eyJ1aWQiOjg4MDAx...",
+    "newPriceToken": "eyJ1aWQiOi...",
     "note": "确认后将以新价格下单"
   }
 }
 ```
 
-前端展示：
+HTTP 状态码为 `409`，错误码体系见 [15](15-api-and-errors.md)。
+
+前端展示（`el-dialog`，标题与金额变化用文字说明，不只靠红绿颜色区分涨跌）：
 
 ```
 ┌─────────────────────────────────────────┐
 │  ⚠️ 商品信息有变化                        │
 │                                          │
 │  iPhone 16 Pro 256G                      │
-│  ¥7999.00  →  ¥8199.00   (+¥200.00)     │
+│  ¥7999.00  →  ¥8199.00   (上涨 ¥200.00) │
 │                                          │
 │  运费                                     │
-│  ¥16.00    →  ¥20.00     (+¥4.00)       │
+│  ¥16.00    →  ¥20.00     (上涨 ¥4.00)   │
 │                                          │
 │  ─────────────────────────────────────   │
 │  应付金额                                 │
-│  ¥14844.00 →  ¥15788.00  (+¥944.00)     │
+│  ¥14844.00 →  ¥15788.00  (上涨 ¥944.00) │
 │                                          │
 │     [ 取消 ]      [ 确认并支付 ]           │
 └─────────────────────────────────────────┘
@@ -282,7 +262,7 @@ public OrderCreateResult createOrder(OrderCreateRequest req) {
 | 券过期 | 查有效期 | 移除该券 |
 | 活动结束 | 查活动时间 | 移除该优惠 |
 | 运费模板变更 | 重算运费 | 提示运费变化 |
-| 收货地址变更 | 比对地址 hash | 重算运费 |
+| 收货地址变更 | 比对地址 ID | 重算运费 |
 | 积分余额变化 | 查积分 | 调整积分抵扣 |
 | 会员等级变化 | 查等级 | 调整会员折扣 |
 
@@ -294,12 +274,13 @@ public OrderCreateResult createOrder(OrderCreateRequest req) {
 
 ```sql
 -- ✅ 正确
-`price` BIGINT NOT NULL COMMENT '价格（分）'
-`amount` BIGINT NOT NULL COMMENT '金额（分）'
+price   BIGINT NOT NULL,   -- 价格（分）
+amount  BIGINT NOT NULL,   -- 金额（分）
 
 -- ❌ 禁止
-`price` DECIMAL(10,2) COMMENT '元'     -- 虽然 DECIMAL 精确，但与 Java 的 BigDecimal 交互成本高
-`price` FLOAT / DOUBLE                  -- 绝对禁止，精度丢失
+price NUMERIC(10,2)        -- 元。精确，但与"全链路整数分"的约定冲突，两种单位混用必出 Bug
+price REAL / DOUBLE PRECISION  -- 绝对禁止，精度丢失
+price MONEY                -- PG 的 money 类型依赖 lc_monetary 区域设置，禁止使用
 ```
 
 **统一用分（整数）的理由**：
@@ -307,237 +288,189 @@ public OrderCreateResult createOrder(OrderCreateRequest req) {
 | 理由 | 说明 |
 |---|---|
 | 无精度问题 | 整数加减乘（不含除）绝对精确 |
-| 运算快 | 比 BigDecimal 快 10 倍以上 |
-| 序列化安全 | JSON 传来传去不会有精度问题（Double 会有） |
-| 数据库友好 | BIGINT 索引效率高，DECIMAL 有额外开销 |
+| 运算快 | 比 `Decimal` 快得多，写法也不容易出错 |
+| 序列化安全 | JSON 传整数分，前端不会出现 `0.1 + 0.2` 问题 |
+| 一致 | DB（`BIGINT`）、Python（`int`）、前端（`number`/`bigint`）用同一个单位 |
 
-**注意**：`BIGINT` 分能表示 `9.2 * 10^18` 分 = 9200 万亿元，远超业务需要。但**除法**（折扣、分摊）必须用整数运算规则，见下。
+**注意**：`BIGINT` 分能表示约 `9.2 × 10^18` 分，远超业务需要。但**除法**（折扣、分摊）必须用整数运算规则，见下。
 
 ### 6.2 除法的三条规则
 
-```java
-// 规则 1：折扣用"乘法 + 整数除法"
-//   折扣率用万分比表示：8500 = 85折
-long discounted = amount * rate / 10000;              // 向下取整
-long discounted = (amount * rate + 5000) / 10000;     // 四舍五入
+```python
+# 规则 1：折扣用"乘法 + 整数除法"
+#   折扣率用万分比表示：8500 = 85 折
+discounted = amount * rate // 10000                # 向下取整
+discounted = (amount * rate + 5000) // 10000       # 四舍五入（amount、rate 非负）
 
-// 规则 2：分摊用最大余数法保证守恒（见 05-promotion-engine §6）
-long[] alloc = allocate(totalDiscount, eligibles);
+# 规则 2：分摊用最大余数法保证守恒（见 05-promotion-engine §6）
+alloc = allocate(total_discount, eligibles)
 
-// 规则 3：比例计算（如积分返还）向下取整 + 最后一次用差额
-long partial = total * part / whole;                  // 向下取整
-long last    = total - alreadyRefunded;               // 最后一次用差额
+# 规则 3：比例计算（如积分返还）向下取整 + 最后一次用差额
+partial = total * part // whole                    # 向下取整
+last = total - already_refunded                    # 最后一次用差额
 ```
+
+**Python 专属陷阱**：
+
+| 写法 | 问题 |
+|---|---|
+| `amount / 100` | `/` 永远返回 `float`，哪怕能整除 |
+| `round(x)` | 银行家舍入，`round(0.5) == 0`、`round(2.5) == 2` |
+| `int(x)` | 向零截断，对负数与 `//` 结果不同 |
+| `Decimal(0.1)` | 用 `float` 构造会带入二进制误差，必须写 `Decimal("0.1")` |
+| Pydantic 字段 `amount: float` | 前端传 `12.5` 会被接受；金额字段一律声明为 `int` 并加 `Field(ge=0)`，并开启 `strict` 拒绝字符串/浮点隐式转换 |
 
 ### 6.3 边界：负数与零
 
-```java
-// 所有金额计算后都必须断言
-assert amount >= 0 : "金额不能为负: " + amount;
+```python
+# 所有金额计算后都必须检查（显式抛异常，不用 assert，python -O 会移除 assert）
+if amount < 0:
+    raise PriceInvariantError(f"金额不能为负: {amount}")
 
-// 应付金额为 0 是合法的（全额用券/积分抵扣）
-if (payableAmount == 0) {
-    // 直接标记订单为已支付（0 元订单，不需要走支付渠道）
-    // ★ 但仍要创建支付单（金额 0），保持流程统一
-}
+# 应付金额为 0 是合法的（全额用券/积分抵扣）
+if payable_amount == 0:
+    # 直接走"支付成功"逻辑（0 元订单，不需要走支付渠道）
+    # ★ 但 payment.amount 有 CHECK (amount > 0)，所以 0 元订单不建支付单，
+    #   改为在下单事务内直接调用与支付成功相同的处理函数（子单推进、库存实扣、积分实扣、用券）
+    ...
 ```
 
-**0 元订单的处理**：不调用渠道，直接触发"支付成功"逻辑。但要小心：**必须走与真实支付相同的幂等和状态流转逻辑**，只是跳过渠道调用。
+**0 元订单的处理**：不调用渠道，直接触发"支付成功"逻辑。但要小心：**必须走与真实支付相同的状态流转逻辑**（[09 §4.3](09-payment.md) 中 `apply_pay_result` 的 ⑤~⑨ 抽成独立函数 `on_order_paid`，两处复用），只是跳过支付单与渠道。
 
 ## 7. 前端算价的实现要点（TypeScript）
 
-```typescript
-// ★ 所有金额都是 number（JS 的 number 是双精度，安全整数上限 2^53-1）
-//    分的最大值 9.2 * 10^18 超出安全范围，但业务金额不会超过 10^15 分（10 万亿元）
-//    实际单订单金额 < 10^9 分（1000 万元），完全安全
-// ★ 计算中避免用浮点除法产生小数
+```ts
+// web-mall/src/utils/price.ts
+//
+// ★ 金额统一用整数分。中间乘法用 BigInt，避免超过 2^53 后丢精度：
+//   total * eligible[i] 在单订单 1000 万元（10^9 分）时可达 10^18 > 2^53 (≈ 9.007 × 10^15)
+// ★ 函数必须与后端 app/modules/promotion/allocation.py 逐行对应，由共享测试用例对齐（§8）
 
-const EPS = 0;   // 金额必须精确，不设容差
-
-interface ItemCalc {
-  skuId: number;
-  num: number;
-  unitPrice: number;      // 分
-  promoPrice: number;     // 分
-  itemDiscount: number;   // 分
-  itemDiscountBy: string; // 优惠来源描述
+/** 折扣：四舍五入到分，对应后端 (amount * rate + 5000) // 10000 */
+export function applyDiscount(amount: number, rate: number): number {
+  return Number((BigInt(amount) * BigInt(rate) + 5000n) / 10000n)
 }
 
-class PriceCalculator {
-  /**
-   * 折扣：四舍五入到分
-   * 与后端保持一致：(amount * rate + 5000) / 10000 的整数除法
-   */
-  static applyDiscount(amount: number, rate: number): number {
-    return Math.floor((amount * rate + 5000) / 10000);
-  }
+/** 最大余数法分摊：余数降序，平局按下标升序（★ 必须与后端一致） */
+export function allocate(total: number, eligibles: number[]): number[] {
+  const n = eligibles.length
+  const totalEligible = eligibles.reduce((a, b) => a + BigInt(b), 0n)
+  if (totalEligible <= 0n) return new Array(n).fill(0)
 
-  /**
-   * 最大余数法分摊（★ 必须与后端字节级一致）
-   */
-  static allocate(total: number, eligibles: number[]): number[] {
-    const n = eligibles.length;
-    const result = new Array(n).fill(0);
-    const totalEligible = eligibles.reduce((a, b) => a + b, 0);
-    if (totalEligible <= 0) return result;
+  const T = BigInt(total)
+  const result: bigint[] = []
+  const rems: { idx: number; rem: bigint }[] = []
+  eligibles.forEach((e, idx) => {
+    const numerator = T * BigInt(e)
+    result.push(numerator / totalEligible)                 // BigInt 除法向零取整（非负即向下取整）
+    rems.push({ idx, rem: numerator % totalEligible })
+  })
 
-    let allocated = 0;
-    const remainders: { idx: number; rem: number }[] = [];
-
-    for (let i = 0; i < n; i++) {
-      const numerator = total * eligibles[i];
-      result[i] = Math.floor(numerator / totalEligible);
-      remainders.push({ idx: i, rem: numerator % totalEligible });
-      allocated += result[i];
-    }
-
-    const gap = total - allocated;
-    // ★ 排序规则必须与后端一致：余数降序，平局时索引升序
-    remainders.sort((a, b) => b.rem - a.rem || a.idx - b.idx);
-    for (let k = 0; k < gap; k++) {
-      result[remainders[k].idx] += 1;
-    }
-    return result;
-  }
-
-  /**
-   * 带上限的分摊（与后端一致）
-   */
-  static allocateWithCap(total: number, eligibles: number[], caps: number[]): number[] {
-    // ... 与 Java 版本逐行对应
-  }
+  const gap = Number(T - result.reduce((a, b) => a + b, 0n))   // 0 <= gap < n
+  rems.sort((a, b) => (a.rem === b.rem ? a.idx - b.idx : a.rem > b.rem ? -1 : 1))
+  for (let k = 0; k < gap; k++) result[rems[k].idx] += 1n
+  return result.map(Number)
 }
 
-/**
- * ★ 浮点陷阱提醒：
- *   JS 的 number * number 在超过 2^53 时丢精度
- *   total * eligible[i] 最大 = 10^9 * 10^9 = 10^18 > 2^53 (9.007 * 10^15)
- *   → 单订单金额超过 900 万元时会丢精度！
- *
- *   解决方案：
- *   1. 用 BigInt 做中间计算（推荐）
- *   2. 或限制单订单金额上限（业务上合理）
- */
-```
+/** 带上限的分摊，对应后端 allocate_with_cap（逐行对应，此处略） */
+export function allocateWithCap(total: number, eligibles: number[], caps: number[]): number[] {
+  /* ... */
+}
 
-```typescript
-// ✅ 用 BigInt 保证一致性（推荐）
-static allocate(total: bigint, eligibles: bigint[]): bigint[] {
-  const n = eligibles.length;
-  const result = new Array(n).fill(0n);
-  const totalEligible = eligibles.reduce((a, b) => a + b, 0n);
-  if (totalEligible <= 0n) return result;
-
-  let allocated = 0n;
-  const remainders: { idx: number; rem: bigint }[] = [];
-
-  for (let i = 0; i < n; i++) {
-    const numerator = total * eligibles[i];        // BigInt 无精度问题
-    result[i] = numerator / totalEligible;          // BigInt 除法自动向下取整
-    remainders.push({ idx: i, rem: numerator % totalEligible });
-    allocated += result[i];
-  }
-
-  const gap = Number(total - allocated);            // gap 一定很小（< n）
-  remainders.sort((a, b) => (b.rem > a.rem ? 1 : b.rem < a.rem ? -1 : a.idx - b.idx));
-  for (let k = 0; k < gap; k++) result[remainders[k].idx] += 1n;
-
-  return result;
+/** 展示用：分 → "12.34"，不参与计算 */
+export function formatYuan(fen: number): string {
+  const sign = fen < 0 ? '-' : ''
+  const abs = Math.abs(fen)
+  return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`
 }
 ```
 
-**JS 的 `number` vs `BigInt` 的选择**：
+**为什么入参/出参仍用 `number`**：业务金额（单订单 < 10^9 分）远小于 `Number.MAX_SAFE_INTEGER`，JSON 传输与 Vue 模板渲染都用 `number` 最方便；只有**中间乘积**可能越界，所以只在函数内部转 `BigInt`。`tsconfig.json` 的 `target` 需 ≥ `ES2020` 才支持 `BigInt` 字面量（`5000n`），Vite 默认目标满足。
 
-| 方案 | 一致性 | 性能 | 建议 |
-|---|---|---|---|
-| `number`（限制金额 < 900 万元） | ✅ | 快 | 单订单金额有上限时可接受 |
-| `BigInt` | ✅ 绝对 | 慢 2-3 倍 | **推荐**，算价不是性能瓶颈 |
+**禁止在前端用 `toFixed` 参与计算**：`(1.005).toFixed(2) === "1.00"`。`toFixed` 只能出现在纯展示且输入已经是整数分换算的场景，推荐统一用上面的 `formatYuan`。
 
 ## 8. 一致性测试：双端对齐测试
 
-**这是保证前后端一致的唯一可靠手段**。
+**这是保证前后端一致的唯一可靠手段**。用例文件放在仓库根目录 `shared/price-testcases.json`，前后端共同读取。
 
-```java
-// 后端：生成测试用例 + 期望结果，导出为 JSON
-@Test
-public void exportTestCases() {
-    List<TestCase> cases = List.of(
-        tc(1, "空优惠", items(100_00, 1), noCoupon(), expect(100_00)),
-        tc(2, "满减券", items(100_00, 3), coupon(10_00, 200_00), expect(290_00)),
-        tc(3, "3件摊1元", items(1_00, 1, 1_00, 1, 1_00, 1), coupon(1_00, 0), expect(2_00)),
-        // ... 100 个用例
-    );
-    Files.writeString(Path.of("shared/testcases.json"),
-        JSON.toJSONString(cases));
-}
+```python
+# backend/tests/price/test_export_cases.py
+# 后端：维护用例与期望结果；运行 pytest 时校验后端算法，并（加 --export 时）重新导出 JSON
+CASES = [
+    case(1, "空优惠", items((10000, 1)), coupons=[], expect_payable=10000),
+    case(2, "满减券", items((10000, 3)), coupons=[full_reduce(1000, 20000)], expect_payable=29000),
+    case(3, "3件摊1元", items((100, 1), (100, 1), (100, 1)), coupons=[no_threshold(100)],
+         expect_payable=200, expect_item_discounts=[34, 33, 33]),
+    # ... 覆盖 05 §10 的全部场景，约 100 个
+]
+
+@pytest.mark.parametrize("c", CASES, ids=lambda c: f"{c.id}-{c.name}")
+def test_backend_matches_expectation(c):
+    result = PriceCalculator.from_case(c).run()
+    assert result.to_case_output() == c.expect
+
+def test_export(request):
+    if request.config.getoption("--export"):
+        Path("../shared/price-testcases.json").write_text(
+            json.dumps([c.to_json() for c in CASES], ensure_ascii=False, indent=2))
 ```
 
-```typescript
-// 前端：读取同一份用例，跑自己的算法，比对
-describe('PriceCalculator 与后端一致性', () => {
-  const cases = JSON.parse(fs.readFileSync('shared/testcases.json', 'utf8'));
+```ts
+// web-mall/src/utils/__tests__/price.consistency.spec.ts（vitest）
+import cases from '../../../../shared/price-testcases.json'
+import { calcLocal } from '../price'
 
-  cases.forEach(tc => {
-    it(`case ${tc.id}: ${tc.name}`, () => {
-      const result = PriceCalculator.calc(tc.input);
-      expect(result.payableAmount).toBe(tc.expect.payableAmount);
-      // ★ 逐项比对，不只有总额
-      expect(result.discountTotal).toBe(tc.expect.discountTotal);
-      expect(result.freight).toBe(tc.expect.freight);
-      result.items.forEach((item, i) => {
-        expect(item.payAmount).toBe(tc.expect.items[i].payAmount);
-      });
-    });
-  });
-});
+describe('前端算价与后端一致性', () => {
+  it.each(cases)('case $id: $name', (tc) => {
+    const result = calcLocal(tc.input)
+    expect(result.payableAmount).toBe(tc.expect.payableAmount)
+    // ★ 逐项比对，不只有总额
+    expect(result.discountTotal).toBe(tc.expect.discountTotal)
+    expect(result.items.map((i) => i.payAmount)).toEqual(tc.expect.items.map((i) => i.payAmount))
+  })
+})
 ```
 
-**CI 集成**：后端代码变更 → 重新生成 testcases.json → 前端 CI 跑比对测试 → 不一致则构建失败。
+> 测试代码中可以使用 `assert`（pytest 依赖它），"不用 `assert`"的约束只针对生产代码。
+
+**CI 集成**：后端算法变更 → `pytest --export` 重新生成 JSON 并提交 → 前端 CI 跑 vitest 比对 → 不一致则构建失败。另加一条 CI 检查：`shared/price-testcases.json` 与后端导出结果必须一致（防止只改了后端忘了导出）。
 
 ## 9. 监控与告警
 
 **线上必须监控"前后端算价不一致"的比例**。
 
-```java
-// 在下单时对比，不一致就上报（即使最终一致也要记录首次不一致）
-if (!diffs.isEmpty()) {
-    metrics.counter("price.mismatch",
-        "field", diffs.get(0).getField(),
-        "reason", diffs.get(0).getReason()
-    ).increment();
+```python
+price_mismatch_counter = Counter("price_mismatch_total", "下单价格校验不一致次数", ["kind"])
 
-    // ★ 区分"正常变化"和"算法 Bug"
-    if (diffs.stream().allMatch(d -> d.getReason() == PriceChangeReason.STOCK_OR_STATUS)) {
-        // 商品下架/库存变化导致的差异，是正常的
-        metrics.counter("price.mismatch.expected").increment();
-    } else {
-        // 金额算不一致，可能是 Bug
-        metrics.counter("price.mismatch.unexpected").increment();
-        log.error("★ 算价不一致（疑似Bug）: userId={}, diffs={}", req.getUserId(), diffs);
-    }
-}
+def classify(diffs: list[PriceDiff]) -> str:
+    # ★ 区分"正常变化"和"算法 Bug"
+    if all(d.reason in EXPECTED_REASONS for d in diffs):   # 改价、下架、库存、券被占用、活动结束
+        return "expected"
+    logger.error("★ 算价不一致（疑似Bug）", diffs=diffs)
+    return "unexpected"
 ```
 
 | 指标 | 阈值 | 处理 |
 |---|---|---|
-| `price.mismatch.unexpected` 比例 | > 0.1% | P1 告警，排查算法 |
-| `price.mismatch.expected` 比例 | > 5% | 检查是否有活动异常或库存问题 |
-| token 验签失败率 | > 0.5% | 检查密钥、时区 |
+| `price_mismatch_total{kind="unexpected"}` 占下单比例 | > 0.1% | 告警，排查算法 |
+| `price_mismatch_total{kind="expected"}` 占下单比例 | > 5% | 检查是否有活动异常或库存问题 |
+| token 验签失败率 | > 0.5% | 检查密钥是否被轮换、服务器时间是否准确 |
 
 ## 10. 边界场景
 
 | 场景 | 处理 |
 |---|---|
-| 用户用旧 token 下单（页面停留 1 小时） | token 过期 → 返回 `PRICE_TOKEN_EXPIRED`，前端刷新页面 |
+| 用户用旧 token 下单（页面停留 1 小时） | token 过期 → 返回 `PRICE_TOKEN_EXPIRED`，前端刷新结算页 |
 | 用户手改 token | 验签失败 → `INVALID_PRICE_TOKEN` |
 | 用户改用另一个账号的 token | `uid` 不匹配 → 拒绝 |
 | token 有效但商品已下架 | 重算时该行移除，diff 提示，返回 409 |
-| token 有效但库存为 0 | 重算时该行数量调整为 0，diff 提示，返回 409 |
-| 前端用错版本（金额单位是元） | 后端对比发现差异巨大（100 倍），拒绝并告警（这是前端 Bug） |
+| token 有效但库存为 0 | 重算时提示缺货，diff 提示，返回 409 |
+| 前端用错单位（金额单位是元） | Pydantic 严格模式下金额字段收到小数直接 422；若是整数元，对比发现差异巨大（100 倍），拒绝并告警（这是前端 Bug） |
 | 0.01 元的差异 | **也拒绝**。不设容差——有容差就永远说不清谁对 |
 | 并发下单（同 token 两次） | 幂等键拦住，只有一次成功 |
 | 优惠券在两次算价之间被用掉 | 重算时券不可用 → 重新计算优惠 → diff 提示 |
 | 积分在两次算价之间被其他订单消耗 | 重算时积分不足 → 调整积分抵扣 → diff 提示 |
+| 运维轮换了 `PRICE_TOKEN_SECRET` | 旧 token 全部验签失败。轮换时同时配置新旧两个密钥，验签依次尝试，30 分钟后移除旧密钥 |
 
 **"不设容差"的说明**：有人会提议"差异小于 1 分就忽略"。**绝对不行**——如果算法有系统性偏差（比如每次差 1 分），容差会掩盖它，直到某天累积成巨额差异。**任何差异都是 Bug，必须暴露**。
 
@@ -545,62 +478,58 @@ if (!diffs.isEmpty()) {
 
 ```
         ┌─────────────────────────────────────────────────┐
-        │  结算页（前端）                                    │
+        │  结算页（Vue 前端）                                │
         │  ① 调后端拿算价明细（含 priceToken）               │
         │  ② 用户调整选择 → 本地重算（无优惠变化时）or 调后端  │
         │  ③ 展示明细，让用户所见即所得                       │
         └────────────────────┬────────────────────────────┘
-                             │ 提交订单（带 priceToken）
+                             │ 提交订单（带 priceToken + Idempotency-Key）
                              ▼
         ┌─────────────────────────────────────────────────┐
-        │  下单接口（后端）                                  │
+        │  下单接口（FastAPI）                               │
         │  ① 幂等检查（Idempotency-Key）                    │
         │  ② 验签 + 验 token 有效期                         │
-        │  ③ 重新算价（同一份算法）                          │
+        │  ③ 重新算价（与结算页同一个函数）                   │
         │  ④ 逐项对比                                       │
-        │     ├─ 一致 → 创建订单                             │
+        │     ├─ 一致 → 创建订单（同一事务内预占库存/锁券）    │
         │     └─ 不一致 → 409 + 差异明细 + 新 token          │
-        │  ⑤ 前置校验（库存、券、积分）                       │
         └────────────────────┬────────────────────────────┘
                              │
                              ▼
         ┌─────────────────────────────────────────────────┐
-        │  支付（后端）                                      │
-        │  ① 从订单读金额（不再重算）★                       │
-        │  ② 与渠道对账时校验金额一致                         │
+        │  支付（payment 模块）                              │
+        │  ① 从订单读金额（不再按实时数据重算）★              │
+        │  ② 发起支付前做"快照自检"                          │
+        │  ③ 回调时校验渠道实付金额 == 支付单金额              │
         └─────────────────────────────────────────────────┘
 ```
 
 **"支付时后端计算后进行对比"的实现位置说明**：
 
-严格说，重算与对比发生在**下单时**（因为订单金额在此时冻结）。支付时**不再重算**（订单金额已是事实），而是：
-1. 支付单金额 = 订单 `payable_amount`（不重算）；
-2. 支付回调时校验"渠道实付金额 == 支付单金额"（见 [09-payment §4.3](09-payment.md)）。
+严格说，**按实时数据**重算与对比发生在**下单时**（因为订单金额在此时冻结）。支付时**不再按实时数据重算**（订单金额已是事实，商品此后改价不应影响已下单的订单），而是：
+1. 支付单金额 = 订单 `payable_amount`；
+2. 发起支付前，**用订单快照重算并对比**（自检，见下）；
+3. 支付回调时校验"渠道实付金额 == 支付单金额"（见 [09 §4.3](09-payment.md)）。
 
-**如果一定要求在支付时重算**（比如为了配合某些渠道的价格校验），则：
+```python
+async def prepay(session: AsyncSession, user_id: int, order_main_no: str) -> PrepayResult:
+    main = await order_service.get_main_owned(session, order_main_no, user_id)
+    items = await order_service.list_items(session, order_main_no)
+    snaps = await order_service.list_discount_snapshots(session, order_main_no)
 
-```java
-// 支付前重算（可选，谨慎使用）
-public PrepayResult prepay(String mainOrderNo) {
-    OrderMain main = mainMapper.selectByNo(mainOrderNo);
-    Payment pay = payMapper.selectByMain(mainOrderNo);
+    # ★ 从快照重算：只用 order_item 的 _snap 字段 + order_discount_snapshot，不查实时商品数据
+    recheck = recalc_from_snapshot(main, items, snaps)
+    if recheck.payable_amount != main.payable_amount:
+        # 从快照重算应该永远等于订单金额（用的是同一份快照），不等说明有严重 Bug
+        logger.error("★ 订单金额与快照重算不一致", order_main_no=order_main_no,
+                     order=main.payable_amount, recalc=recheck.payable_amount)
+        raise SystemError_("订单金额校验失败，请联系客服")
 
-    // 重算（防御性校验：订单金额是否被异常修改）
-    CalcPriceResponse recheck = promotionEngine.recalcFromSnapshot(main);
-    if (!recheck.getPayableAmount().equals(main.getPayableAmount())) {
-        // 从快照重算应该永远等于订单金额（因为用的是同一份快照）
-        // 不等 → 说明有严重 Bug
-        log.error("★ 订单金额与快照重算不一致: mainNo={}, order={}, recalc={}",
-            mainOrderNo, main.getPayableAmount(), recheck.getPayableAmount());
-        throw new SystemException("订单金额校验失败，请联系客服");
-    }
-
-    return channel.prepay(...);
-}
+    return await pay_service.create_and_prepay(session, main)
 ```
 
-**`recalcFromSnapshot`**：用订单里存的快照（`order_item` 的 `_snap` 字段 + `order_discount_snapshot`）重算，而不是查实时数据。这样：
+**`recalc_from_snapshot`**：用订单里存的快照重算，而不是查实时数据。这样：
 - 不依赖实时商品数据（商品可能已改价）；
-- 是一个**自检**：检查订单数据是否自洽（金额字段之间是否满足恒等式）。
+- 是一个**自检**：检查订单数据是否自洽（各行实付之和、分摊之和、母子单金额是否满足恒等式）。
 
-这种自检很有价值，建议每次支付前都做（成本 < 1ms）。
+这种自检成本很低（纯内存计算），每次发起支付前都做。表上的 `CHECK` 约束（[07 §3](07-order-and-split.md)）保证单行内的恒等式，这里补上跨行、跨表的校验。

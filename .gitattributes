@@ -1,0 +1,22 @@
+# 行尾统一为 LF。
+#
+# 原因：项目最终部署在 Linux 容器里，而开发在 Windows。如果 shell 脚本
+# 被 Git 检出成 CRLF，容器中 bind-mount 进去的脚本 shebang 会失效
+# （deploy/postgres/init/01-init.sh 就是这种用法）。
+* text=auto eol=lf
+
+# Windows 专用脚本保留 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件不做任何行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

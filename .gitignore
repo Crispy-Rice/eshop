@@ -1,0 +1,41 @@
+# ===== 密钥与环境（务必忽略）=====
+.env
+.env.*
+!.env.example
+deploy/secrets/
+*.pem
+*.key
+*.p12
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# ===== Node =====
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+coverage/
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# ===== 运行数据（本地/演示环境的库数据、上传文件、备份）=====
+data/
+/opt/
+*.log
+*.dump

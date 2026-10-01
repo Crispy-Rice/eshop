@@ -34,52 +34,56 @@ category（类目）
 ### 2.2 SPU 表
 
 ```sql
-CREATE TABLE `spu` (
-  `id`            BIGINT       NOT NULL COMMENT 'SPU ID',
-  `shop_id`       BIGINT       NOT NULL COMMENT '店铺 ID',
-  `category_id`   BIGINT       NOT NULL COMMENT '末级类目 ID',
-  `brand_id`      BIGINT       DEFAULT NULL,
-  `title`         VARCHAR(120) NOT NULL COMMENT '商品标题',
-  `sub_title`     VARCHAR(255) DEFAULT NULL COMMENT '副标题/卖点',
-  `main_image`    VARCHAR(255) NOT NULL COMMENT '主图（列表页用）',
-  `price_min`     BIGINT       NOT NULL DEFAULT 0 COMMENT '展示最低价（分，冗余，由SKU算）',
-  `price_max`     BIGINT       NOT NULL DEFAULT 0 COMMENT '展示最高价（分）',
-  `total_sold`    INT          NOT NULL DEFAULT 0 COMMENT '累计销量（冗余）',
-  `review_count`  INT          NOT NULL DEFAULT 0 COMMENT '评价数（冗余）',
-  `avg_score`     DECIMAL(3,2) NOT NULL DEFAULT 5.00 COMMENT '平均评分',
-  `status`        TINYINT      NOT NULL DEFAULT 1 COMMENT '1草稿 2上架 3下架 4违规下架',
-  `sort_weight`   INT          NOT NULL DEFAULT 0 COMMENT '排序权重',
-  `created_at`    DATETIME(3)  NOT NULL,
-  `updated_at`    DATETIME(3)  NOT NULL,
-  `deleted`       TINYINT      NOT NULL DEFAULT 0,
-  PRIMARY KEY (`id`),
-  KEY `idx_shop_status` (`shop_id`, `status`),
-  KEY `idx_category_status` (`category_id`, `status`)
-) ENGINE=InnoDB COMMENT='标准产品单元（抽象商品）';
+CREATE TABLE product.spu (
+  id            BIGINT        PRIMARY KEY,                 -- 雪花 ID
+  shop_id       BIGINT        NOT NULL,                    -- 店铺 ID
+  category_id   BIGINT        NOT NULL,                    -- 末级类目 ID
+  brand_id      BIGINT,
+  title         VARCHAR(120)  NOT NULL,
+  sub_title     VARCHAR(255),                              -- 副标题/卖点
+  main_image    VARCHAR(255)  NOT NULL,                    -- 主图（列表页用）
+  price_min     BIGINT        NOT NULL DEFAULT 0,          -- 展示最低价（分，冗余，由 SKU 算）
+  price_max     BIGINT        NOT NULL DEFAULT 0,          -- 展示最高价（分）
+  total_sold    INT           NOT NULL DEFAULT 0,          -- 累计销量（冗余）
+  review_count  INT           NOT NULL DEFAULT 0,
+  avg_score     NUMERIC(3,2)  NOT NULL DEFAULT 5.00,
+  status        SMALLINT      NOT NULL DEFAULT 1,          -- 1草稿 2上架 3下架 4违规下架
+  sort_weight   INT           NOT NULL DEFAULT 0,
+  created_at    TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  deleted       BOOLEAN       NOT NULL DEFAULT false
+);
+CREATE INDEX idx_spu_shop_status     ON product.spu (shop_id, status);
+CREATE INDEX idx_spu_category_status ON product.spu (category_id, status);
+-- 标题模糊搜索（见 §7）
+CREATE INDEX idx_spu_title_trgm ON product.spu USING gin (title gin_trgm_ops);
+COMMENT ON TABLE product.spu IS '标准产品单元（抽象商品）';
 ```
+
+> PostgreSQL 没有 `TINYINT`，状态类字段统一用 `SMALLINT`；`COMMENT` 不能写在列定义里，示例中用行尾注释说明，实际迁移脚本里用 `COMMENT ON COLUMN`。DDL 约定详见 [13-schema](13-schema.md) §0。
 
 ### 2.3 SKU 表——交易核心
 
 ```sql
-CREATE TABLE `sku` (
-  `id`             BIGINT       NOT NULL COMMENT 'SKU ID',
-  `spu_id`         BIGINT       NOT NULL,
-  `shop_id`        BIGINT       NOT NULL COMMENT '冗余，下单/拆单时免join',
-  `sku_code`       VARCHAR(64)  NOT NULL COMMENT '商家编码',
-  `spec_text`      VARCHAR(255) NOT NULL COMMENT '规格摘要，如"黑色;256G"，用于订单快照',
+CREATE TABLE product.sku (
+  id            BIGINT        PRIMARY KEY,
+  spu_id        BIGINT        NOT NULL,
+  shop_id       BIGINT        NOT NULL,                    -- 冗余，下单/拆单时免 join
+  sku_code      VARCHAR(64)   NOT NULL,                    -- 商家编码
+  spec_text     VARCHAR(255)  NOT NULL,                    -- 规格摘要，如"黑色;256G"，用于订单快照
   -- ★ 最小售卖单元的四要素
-  `price`          BIGINT       NOT NULL COMMENT '★ 单价（分）',
-  `cover_image`    VARCHAR(255) NOT NULL COMMENT '★ 封面图（切换规格时展示）',
-  `weight_g`       INT          NOT NULL COMMENT '★ 物流重量（克）',
-  -- 库存不在这张表（分离到 sku_stock + Redis）
-  `status`         TINYINT      NOT NULL DEFAULT 1 COMMENT '1上架 2下架',
-  `version`        INT          NOT NULL DEFAULT 0,
-  `created_at`     DATETIME(3)  NOT NULL,
-  `updated_at`     DATETIME(3)  NOT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_spu_code` (`spu_id`, `sku_code`),
-  KEY `idx_spu` (`spu_id`, `status`)
-) ENGINE=InnoDB COMMENT='最小售卖单元';
+  price         BIGINT        NOT NULL CHECK (price > 0),  -- ★ 单价（分）
+  cover_image   VARCHAR(255)  NOT NULL,                    -- ★ 封面图（切换规格时展示）
+  weight_g      INT           NOT NULL CHECK (weight_g > 0), -- ★ 物流重量（克）
+  -- 库存不在这张表（分离到 inventory.sku_stock + Redis）
+  status        SMALLINT      NOT NULL DEFAULT 1,          -- 1上架 2下架
+  version       INT           NOT NULL DEFAULT 0,
+  created_at    TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  CONSTRAINT uk_sku_spu_code UNIQUE (spu_id, sku_code)
+);
+CREATE INDEX idx_sku_spu ON product.sku (spu_id, status);
+COMMENT ON TABLE product.sku IS '最小售卖单元';
 ```
 
 > **价格放在 SKU 不在 SPU**：同一个 SPU 下"256G"和"512G"价格不同是常态。
@@ -91,58 +95,62 @@ CREATE TABLE `sku` (
 |---|---|---|
 | 多仓 | 需要加 `warehouse_id` 变成多行，破坏主键语义 | 天然 (sku_id, warehouse_id) 复合主键 |
 | 高频更新 | 商品信息（标题/图）和库存更新争抢同一行锁 | 库存行独立，商品信息可缓存 |
-| 分库 | 商品库和库存库可以物理分离 | 各自独立扩容 |
+| 模块边界 | 商品模块和库存模块共用一张表，边界模糊 | 各自独立 schema，日后拆服务无需迁表 |
 
 ### 2.4 库存表（对应的 DB 侧）
 
 ```sql
-CREATE TABLE `sku_stock` (
-  `sku_id`        BIGINT      NOT NULL,
-  `warehouse_id`  BIGINT      NOT NULL COMMENT '仓库 ID',
-  `total`         INT         NOT NULL DEFAULT 0 COMMENT '总库存 = 可用 + 预占 + 锁定',
-  `available`     INT         NOT NULL DEFAULT 0 COMMENT '可售',
-  `locked`        INT         NOT NULL DEFAULT 0 COMMENT '已下单未支付（预占）',
-  `frozen`        INT         NOT NULL DEFAULT 0 COMMENT '已支付待发货（实扣）',
-  `version`       INT         NOT NULL DEFAULT 0,
-  `updated_at`    DATETIME(3) NOT NULL,
-  PRIMARY KEY (`sku_id`, `warehouse_id`),
-  KEY `idx_warehouse` (`warehouse_id`)
-) ENGINE=InnoDB COMMENT='SKU 分仓库存';
+CREATE TABLE inventory.sku_stock (
+  sku_id        BIGINT      NOT NULL,
+  warehouse_id  BIGINT      NOT NULL,
+  total         INT         NOT NULL DEFAULT 0,   -- 总库存 = 可售 + 预占 + 实扣
+  available     INT         NOT NULL DEFAULT 0,   -- 可售
+  locked        INT         NOT NULL DEFAULT 0,   -- 已下单未支付（预占）
+  frozen        INT         NOT NULL DEFAULT 0,   -- 已支付待发货（实扣）
+  version       INT         NOT NULL DEFAULT 0,
+  updated_at    TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  PRIMARY KEY (sku_id, warehouse_id),
+  -- ★ 数据库层面的硬约束：任何 Bug 导致负库存或恒等式被破坏，事务直接失败
+  CONSTRAINT ck_stock_non_negative CHECK (available >= 0 AND locked >= 0 AND frozen >= 0),
+  CONSTRAINT ck_stock_identity     CHECK (total = available + locked + frozen)
+);
+CREATE INDEX idx_sku_stock_warehouse ON inventory.sku_stock (warehouse_id);
+COMMENT ON TABLE inventory.sku_stock IS 'SKU 分仓库存';
 ```
 
-**恒等式（用于对账校验）**：`total = available + locked + frozen`。任何时刻这个等式不成立，就是 Bug，对账任务会告警。
+**恒等式**：`total = available + locked + frozen`。PostgreSQL 的 `CHECK` 约束会在每次写入时校验它，等式被破坏的写入会直接报错回滚；对账任务仍保留这项检查作为监控（见 [13](13-schema.md) §10）。
 
 ### 2.5 规格建模
 
 ```sql
-CREATE TABLE `spec_group` (
-  `id`      BIGINT       NOT NULL,
-  `spu_id`  BIGINT       NOT NULL,
-  `name`    VARCHAR(32)  NOT NULL COMMENT '如"颜色"',
-  `sort`    INT          NOT NULL DEFAULT 0,
-  PRIMARY KEY (`id`),
-  KEY `idx_spu` (`spu_id`)
+CREATE TABLE product.spec_group (
+  id      BIGINT       PRIMARY KEY,
+  spu_id  BIGINT       NOT NULL,
+  name    VARCHAR(32)  NOT NULL,           -- 如"颜色"
+  sort    INT          NOT NULL DEFAULT 0
 );
+CREATE INDEX idx_spec_group_spu ON product.spec_group (spu_id);
 
-CREATE TABLE `spec_value` (
-  `id`       BIGINT      NOT NULL,
-  `group_id` BIGINT      NOT NULL,
-  `value`    VARCHAR(32) NOT NULL COMMENT '如"暗夜黑"',
-  `image`    VARCHAR(255) DEFAULT NULL COMMENT '色块图，前端渲染规格选择器',
-  `sort`     INT         NOT NULL DEFAULT 0,
-  PRIMARY KEY (`id`),
-  KEY `idx_group` (`group_id`)
+CREATE TABLE product.spec_value (
+  id       BIGINT       PRIMARY KEY,
+  group_id BIGINT       NOT NULL REFERENCES product.spec_group (id),
+  value    VARCHAR(32)  NOT NULL,          -- 如"暗夜黑"
+  image    VARCHAR(255),                   -- 色块图，前端渲染规格选择器
+  sort     INT          NOT NULL DEFAULT 0
 );
+CREATE INDEX idx_spec_value_group ON product.spec_value (group_id);
 
 -- SKU 与规格值的多对多关联
-CREATE TABLE `sku_spec` (
-  `sku_id`        BIGINT NOT NULL,
-  `spec_group_id` BIGINT NOT NULL,
-  `spec_value_id` BIGINT NOT NULL,
-  PRIMARY KEY (`sku_id`, `spec_group_id`),
-  KEY `idx_value` (`spec_value_id`)
+CREATE TABLE product.sku_spec (
+  sku_id        BIGINT NOT NULL REFERENCES product.sku (id),
+  spec_group_id BIGINT NOT NULL REFERENCES product.spec_group (id),
+  spec_value_id BIGINT NOT NULL REFERENCES product.spec_value (id),
+  PRIMARY KEY (sku_id, spec_group_id)
 );
+CREATE INDEX idx_sku_spec_value ON product.sku_spec (spec_value_id);
 ```
+
+> 同一模块（schema）内部可以用外键保证引用完整性；**跨模块不建外键**（如 `order_item.sku_id` 不引用 `product.sku`），保持模块可拆分。
 
 `PRIMARY KEY (sku_id, spec_group_id)` 保证**一个 SKU 在每个规格组下只能有一个取值**——这个约束能在数据库层面挡住"一个 SKU 同时是黑色和白色"这类脏数据。
 
@@ -194,28 +202,39 @@ CREATE TABLE `sku_spec` (
 ## 4. 购物车走 SKU
 
 ```sql
-CREATE TABLE `cart_item` (
-  `id`           BIGINT      NOT NULL,
-  `user_id`      BIGINT      NOT NULL,
-  `shop_id`      BIGINT      NOT NULL,
-  `sku_id`       BIGINT      NOT NULL,
-  `spu_id`       BIGINT      NOT NULL,
+CREATE TABLE cart.cart_item (
+  id             BIGINT      PRIMARY KEY,
+  user_id        BIGINT      NOT NULL,
+  shop_id        BIGINT      NOT NULL,
+  sku_id         BIGINT      NOT NULL,
+  spu_id         BIGINT      NOT NULL,
   -- 加购时的价格快照，仅用于展示"降价提醒"，不参与结算
-  `price_snapshot` BIGINT    NOT NULL COMMENT '加购时价格（分）',
-  `num`          INT         NOT NULL,
-  `selected`     TINYINT     NOT NULL DEFAULT 1 COMMENT '是否勾选',
-  `source`       TINYINT     NOT NULL DEFAULT 1 COMMENT '1详情页 2列表页 3活动页',
-  `created_at`   DATETIME(3) NOT NULL,
-  `updated_at`   DATETIME(3) NOT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_user_sku` (`user_id`, `sku_id`) COMMENT '同一SKU只能有一条，加购是累加num',
-  KEY `idx_user_shop` (`user_id`, `shop_id`)
-) ENGINE=InnoDB COMMENT='购物车项，粒度=SKU';
+  price_snapshot BIGINT      NOT NULL,                 -- 加购时价格（分）
+  num            INT         NOT NULL CHECK (num BETWEEN 1 AND 200),
+  selected       BOOLEAN     NOT NULL DEFAULT true,
+  source         SMALLINT    NOT NULL DEFAULT 1,       -- 1详情页 2列表页 3活动页
+  created_at     TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  -- 同一 SKU 只能有一条，加购是累加 num
+  CONSTRAINT uk_cart_user_sku UNIQUE (user_id, sku_id)
+);
+CREATE INDEX idx_cart_user_shop ON cart.cart_item (user_id, shop_id);
+COMMENT ON TABLE cart.cart_item IS '购物车项，粒度=SKU';
 ```
 
 **设计要点**：
 
-1. **唯一索引 `(user_id, sku_id)`**：同一 SKU 重复加购走 `num = num + N`，避免购物车出现两行一样的商品。用 `INSERT ... ON DUPLICATE KEY UPDATE num = num + VALUES(num)` 实现原子加购。
+1. **唯一约束 `(user_id, sku_id)`**：同一 SKU 重复加购走 `num = num + N`，避免购物车出现两行一样的商品。用 PG 的 upsert 实现原子加购：
+
+   ```sql
+   INSERT INTO cart.cart_item (id, user_id, shop_id, sku_id, spu_id, price_snapshot, num)
+   VALUES (:id, :user_id, :shop_id, :sku_id, :spu_id, :price, :num)
+   ON CONFLICT (user_id, sku_id)
+   DO UPDATE SET num = LEAST(cart.cart_item.num + EXCLUDED.num, 200),
+                 updated_at = now();
+   ```
+
+   SQLAlchemy 中对应 `sqlalchemy.dialects.postgresql.insert(...).on_conflict_do_update(...)`。
 2. **购物车粒度是 SKU，不是 SPU**：用户在详情页切换规格后加购，加的是当前选中的 SKU。
 3. **购物车数量上限**：单 SKU 最多 200 件，整车最多 100 个 SKU（防刷）。写入前先校验。
 4. **不存库存可售量**：购物车只存用户意图，库存校验在结算页做。购物车列表返回 `status`（有效/失效/无货/下架）由实时查询填充。
@@ -227,48 +246,52 @@ CREATE TABLE `cart_item` (
 
 ```
 1. 批量查 cart_item（1次）
-2. 收集 skuIds → 批量查 sku + spu（1次，或走本地缓存）
-3. 收集 skuIds → 批量查 Redis 库存（1次 mget / pipeline）
+2. 收集 skuIds → 批量查 sku + spu（1次，WHERE id = ANY(:ids)，或走缓存）
+3. 收集 skuIds → 批量查 Redis 库存（1次 MGET / pipeline）
 4. 按 shop_id 分组返回（前端按店铺分块展示）
 ```
 
-商品信息用**多级缓存**：Caffeine（本地 5s）→ Redis（60s）→ DB。商品改价时通过 MQ 广播失效。
+商品信息用**两级缓存**：进程内 TTL 缓存（`cachetools.TTLCache`，5s）→ Redis（60s）→ DB。商品改价时发布 `product.changed` 事件到 Redis Streams，各 api 进程订阅后清理本地缓存并删除 Redis 缓存键。
 
 ## 5. 下单时的商品快照
 
 订单一旦创建，**必须冻结当时的商品信息**。原因：商家三天后改了标题/图/价格，历史订单不能跟着变（否则退款金额算不清，用户看到的和买到的不一样）。
 
 ```sql
-CREATE TABLE `order_item` (
-  `id`                BIGINT       NOT NULL,
-  `order_sub_no`      VARCHAR(32)  NOT NULL COMMENT '子单号',
-  `order_main_no`     VARCHAR(32)  NOT NULL COMMENT '母单号',
-  `spu_id`            BIGINT       NOT NULL,
-  `sku_id`            BIGINT       NOT NULL,
+CREATE TABLE trade.order_item (
+  id                BIGINT       PRIMARY KEY,
+  order_sub_no      VARCHAR(32)  NOT NULL,          -- 子单号
+  order_main_no     VARCHAR(32)  NOT NULL,          -- 母单号
+  spu_id            BIGINT       NOT NULL,
+  sku_id            BIGINT       NOT NULL,
   -- ★★★ 快照字段：写入后永不变更 ★★★
-  `spu_title_snap`    VARCHAR(120) NOT NULL COMMENT '下单时商品标题',
-  `sku_spec_snap`     VARCHAR(255) NOT NULL COMMENT '下单时规格，如"暗夜黑;256G"',
-  `cover_image_snap`  VARCHAR(255) NOT NULL COMMENT '下单时封面图',
-  `unit_price_snap`   BIGINT       NOT NULL COMMENT '下单时单价（分）',
-  `weight_g_snap`     INT          NOT NULL COMMENT '下单时重量（克），退款运费计算用',
-  `num`               INT          NOT NULL,
-  `item_amount`       BIGINT       NOT NULL COMMENT '= unit_price_snap * num，行小计',
+  spu_title_snap    VARCHAR(120) NOT NULL,          -- 下单时商品标题
+  sku_spec_snap     VARCHAR(255) NOT NULL,          -- 下单时规格，如"暗夜黑;256G"
+  cover_image_snap  VARCHAR(255) NOT NULL,          -- 下单时封面图
+  unit_price_snap   BIGINT       NOT NULL,          -- 下单时单价（分）
+  weight_g_snap     INT          NOT NULL,          -- 下单时重量（克），退款运费计算用
+  num               INT          NOT NULL CHECK (num > 0),
+  item_amount       BIGINT       NOT NULL,          -- = unit_price_snap * num，行小计
   -- 优惠分摊（见 05-promotion-engine）
-  `discount_amount`   BIGINT       NOT NULL DEFAULT 0 COMMENT '本行承担的总优惠（分）',
-  `coupon_amount`     BIGINT       NOT NULL DEFAULT 0 COMMENT '其中券优惠',
-  `promo_amount`      BIGINT       NOT NULL DEFAULT 0 COMMENT '其中活动优惠',
-  `point_amount`      BIGINT       NOT NULL DEFAULT 0 COMMENT '其中积分抵扣',
-  `pay_amount`        BIGINT       NOT NULL COMMENT '= item_amount - discount_amount',
+  discount_amount   BIGINT       NOT NULL DEFAULT 0, -- 本行承担的总优惠（分）
+  coupon_amount     BIGINT       NOT NULL DEFAULT 0, -- 其中券优惠
+  promo_amount      BIGINT       NOT NULL DEFAULT 0, -- 其中活动优惠
+  point_amount      BIGINT       NOT NULL DEFAULT 0, -- 其中积分抵扣
+  pay_amount        BIGINT       NOT NULL,           -- = item_amount - discount_amount
   -- 退款进度（用于部分退计算）
-  `refunded_num`      INT          NOT NULL DEFAULT 0 COMMENT '已退数量',
-  `refunded_amount`   BIGINT       NOT NULL DEFAULT 0 COMMENT '已退金额（含优惠还原）',
-  `item_status`       TINYINT      NOT NULL DEFAULT 1 COMMENT '1正常 2退款中 3已退款 4换货中',
-  `warehouse_id`      BIGINT       NOT NULL COMMENT '发货仓，下单时定，运费计算用',
-  PRIMARY KEY (`id`),
-  KEY `idx_sub` (`order_sub_no`),
-  KEY `idx_main` (`order_main_no`),
-  KEY `idx_sku` (`sku_id`)
-) ENGINE=InnoDB COMMENT='订单商品项（快照）';
+  refunded_num      INT          NOT NULL DEFAULT 0,
+  refunded_amount   BIGINT       NOT NULL DEFAULT 0, -- 已退金额（含优惠还原）
+  item_status       SMALLINT     NOT NULL DEFAULT 1, -- 1正常 2退款中 3已退款 4换货中
+  warehouse_id      BIGINT       NOT NULL,           -- 发货仓，下单时定，运费计算用
+  -- ★ 金额守恒与退款上限由数据库兜底
+  CONSTRAINT ck_item_amount  CHECK (item_amount = unit_price_snap * num),
+  CONSTRAINT ck_item_pay     CHECK (pay_amount = item_amount - discount_amount),
+  CONSTRAINT ck_item_refund  CHECK (refunded_num <= num AND refunded_amount <= pay_amount)
+);
+CREATE INDEX idx_order_item_sub  ON trade.order_item (order_sub_no);
+CREATE INDEX idx_order_item_main ON trade.order_item (order_main_no);
+CREATE INDEX idx_order_item_sku  ON trade.order_item (sku_id);
+COMMENT ON TABLE trade.order_item IS '订单商品项（快照）';
 ```
 
 **快照字段命名统一加 `_snap` 后缀**，代码规范里强制：所有读 `order_item` 的地方禁止 join `spu`/`sku` 取实时数据。这条规则的价值：订单详情页、退款计算、对账报表全部依赖快照，一旦混用实时数据，历史数据会漂移。
@@ -283,29 +306,35 @@ CREATE TABLE `order_item` (
 | 改规格 | 已下单订单保存 `sku_spec_snap` | 历史订单展示旧规格文案 |
 | 拆库存仓 | 新订单按新规则 | 老订单保留 `warehouse_id` |
 
-## 7. 商品搜索（ES 映射要点）
+## 7. 商品搜索（PostgreSQL）
 
-ES 里以 **SPU 为文档**，SKU 作为 `nested` 字段：
+第一期不引入 Elasticsearch，用 PG 自带能力实现。以 **SPU 为搜索单元**，维护一个冗余的搜索文本列，把标题、品牌、类目路径和所有在售 SKU 的规格值拼进去：
 
-```json
-{
-  "spuId": 9001,
-  "title": "iPhone 16 Pro",
-  "categoryPath": ["数码","手机","手机"],
-  "priceMin": 799900,
-  "priceMax": 899900,
-  "totalSold": 12034,
-  "attrs": {"品牌":"Apple","屏幕尺寸":"6.3英寸"},
-  "skus": [
-    {"skuId":1001,"specs":{"颜色":"暗夜黑","容量":"256G"},"price":799900},
-    {"skuId":1002,"specs":{"颜色":"暗夜黑","容量":"512G"},"price":899900}
-  ]
-}
+```sql
+ALTER TABLE product.spu ADD COLUMN search_text TEXT NOT NULL DEFAULT '';
+-- 例："iPhone 16 Pro Apple 数码 手机 暗夜黑 原色钛 256G 512G"
+CREATE INDEX idx_spu_search_trgm ON product.spu USING gin (search_text gin_trgm_ops);
 ```
 
-- 用户搜索"256G 黑色 iPhone"时，用 `nested` 查询匹配 SKU 规格，但**返回 SPU 卡片**。
-- 筛选价格区间用 `priceMin/priceMax` 与区间做交叉判断。
-- `totalSold` 排序字段用 `_function_score` 或直接累加，避免每次搜索都实时聚合。
+`search_text` 在 SPU/SKU 保存时由 product 模块重算写入（同一事务），不依赖触发器。
+
+```sql
+-- 用户搜索 "黑色 256G iPhone"：按空格拆词，每个词都要命中（AND）
+SELECT id, title, main_image, price_min, price_max, total_sold
+FROM product.spu
+WHERE status = 2 AND NOT deleted
+  AND search_text ILIKE '%黑色%'
+  AND search_text ILIKE '%256G%'
+  AND search_text ILIKE '%iPhone%'
+  AND price_max >= :price_from AND price_min <= :price_to   -- 价格区间交叉判断
+ORDER BY total_sold DESC, id DESC
+LIMIT 20 OFFSET :offset;
+```
+
+- `pg_trgm` 的 GIN 索引能加速 `ILIKE '%xx%'`，对中文同样生效（按字符三元组），**无需分词**即可做子串匹配。
+- 召回之后**返回 SPU 卡片**，SKU 级别的规格匹配在详情页处理。
+- 排序字段 `total_sold` 是冗余计数，支付成功事件中异步累加，避免搜索时实时聚合。
+- 二期若需要相关度排序与同义词，可装 `zhparser` 扩展做中文分词 + `tsvector`，或再引入专门的搜索引擎；接口层不变。
 
 ## 8. 类目与属性
 
@@ -328,7 +357,7 @@ ES 里以 **SPU 为文档**，SKU 作为 `nested` 字段：
    - 主图/封面图必填
    - 标题违禁词过滤
 6. 保存为草稿 → 提交审核 → 平台通过 → 上架（status=2）
-7. 上架时：写 sku_stock 初始化库存 + 同步库存到 Redis + 写 ES 索引
+7. 上架时：写 sku_stock 初始化库存 + 更新 spu.search_text（同一事务）→ 提交后同步库存到 Redis
 ```
 
-**第 7 步的三写必须幂等**：重复上架不能造成库存翻倍。做法是以 `(sku_id, warehouse_id)` 为主键做 `INSERT ... ON DUPLICATE KEY UPDATE`，Redis 库存用 `SET`（覆盖，不是 INCR）。
+**第 7 步必须幂等**：重复上架不能造成库存翻倍。做法是以 `(sku_id, warehouse_id)` 为主键做 `INSERT ... ON CONFLICT (sku_id, warehouse_id) DO UPDATE`，Redis 库存用 `SET`（覆盖，不是 `INCR`）。Redis 同步失败不影响上架结果，由库存对账任务补齐（见 [03](03-inventory.md) §7）。

@@ -41,22 +41,30 @@
    │
    └─ 返回前端："排队中，前方还有 137 人"（前端轮询/WebSocket 推送结果）
 
-消费者（独立线程池，按活动分片消费）：
-   while (true) {
-       item = RPOP seckill:queue:{activityId}
-       if (item == null) continue;
-       // 此时才真正进入扣减逻辑
-       result = tryDeduct(item.skuId, item.num)
-       // 写结果到 Redis，用户轮询可查
-       SET seckill:result:{activityId}:{userId} = SUCCESS/FAILED EX 300
-       if (result == SUCCESS) {
-           创建订单（或发 MQ 让交易服务创建）
-       } else {
-           // 库存已耗尽：批量给队列剩余元素返回失败，清空队列
-           drainAndFail(activityId)
-           break;
-       }
-   }
+消费者（worker 容器中的 asyncio 任务，每个活动一个协程）：
+```
+
+```python
+async def consume_seckill(activity_id: int, redis: Redis) -> None:
+    queue = f"seckill:queue:{activity_id}"
+    while True:
+        # BRPOP 阻塞等待，避免空转；超时返回 None
+        popped = await redis.brpop(queue, timeout=1)
+        if popped is None:
+            if await activity_ended(activity_id):
+                break
+            continue
+        item = SeckillItem.model_validate_json(popped[1])
+        # 此时才真正进入扣减逻辑
+        result = await try_deduct(item.sku_id, item.num, biz_key=item.request_id)
+        # 写结果到 Redis，用户轮询可查
+        await redis.set(f"seckill:result:{activity_id}:{item.user_id}", result.value, ex=300)
+        if result is DeductResult.SUCCESS:
+            await trade_service.create_seckill_order(item)   # 同进程调用 trade 模块
+        else:
+            # 库存已耗尽：批量给队列剩余元素返回失败，清空队列
+            await drain_and_fail(activity_id)
+            break
 ```
 
 **关键设计点**：
@@ -65,7 +73,7 @@
 2. **同一用户去重**：用 `HSETNX seckill:uid_set:{activityId} {userId} 1` 保证一人一单（或限购 N 单）。在入队前做，避免刷子把队列塞满。
 3. **队列有界**：`LLEN` 超过阈值（如库存 × 10）时，`Lua` 内直接返回"排队已满"。防止队列无限增长把 Redis 内存打爆。
 4. **令牌与库存的配比**：发放的令牌数 > 库存数（打余量给未支付回补的），但队列长度上限受上面第 3 点控制。
-5. **消费者多实例**：同一活动只能被一个消费者消费（否则顺序失效）→ 用 Redis 分布式锁选主，或按 `activityId % N` 分片（同一活动固定落到一个消费者）。
+5. **消费者单实例**：同一活动只能被一个消费者消费（否则顺序失效）→ 消费协程启动前先抢 `SET seckill:consumer:{activityId} {workerId} NX EX 30` 并定期续期，抢不到的 worker 不启动该活动的消费。
 6. **结果回传**：用户轮询 `seckill:result:{activityId}:{userId}`，或长连接推送。轮询间隔建议 1s，最多 30 次。
 
 #### 方案 B：Redis 令牌桶 + 信号量（用于常态限流下单）
@@ -133,7 +141,7 @@ seckill:result:{activityId}:{userId}
 
 ### 3.3 分片设计
 
-单 SKU 热点是 Redis Cluster 的经典痛点——同一个 key 永远落在一个节点上。做法：
+第一期是单实例 Redis，分片的意义不是分散到多个节点，而是**降低单 key 上的冲突**：所有请求挤在一个 key 上时，一个分片售罄的判断、对账、展示都集中在热点上。分片设计同时为将来切 Redis Cluster 预留（届时不同分片自然落到不同节点）。做法：
 
 ```
 分片数 N = 8（可配）
@@ -196,74 +204,84 @@ return {1, stock - qty}
 
 ## 5. DB 侧兜底扣减
 
-Redis 无论多可靠，都要假设它会出错（主从切换丢写、内存淘汰、脚本 Bug）。所以 DB 必须二次校验：
+Redis 无论多可靠，都要假设它会出错（AOF 丢最后一秒写入、内存淘汰、脚本 Bug）。所以 DB 必须二次校验（SQL 中 `:name` 为 SQLAlchemy `text()` 绑定参数）：
 
 ```sql
--- 预占（下单时）
-UPDATE sku_stock
-SET available = available - #{num},
-    locked    = locked + #{num},
-    version   = version + 1,
-    updated_at = NOW(3)
-WHERE sku_id = #{skuId}
-  AND warehouse_id = #{whId}
-  AND available >= #{num};
--- RowsAffected == 0 → 预占失败 → 触发 Redis 回补 + 订单创建失败
+-- 预占（下单时，与订单写入同一事务）
+UPDATE inventory.sku_stock
+SET available  = available - :num,
+    locked     = locked + :num,
+    version    = version + 1,
+    updated_at = now()
+WHERE sku_id = :sku_id
+  AND warehouse_id = :wh_id
+  AND available >= :num;
+-- rowcount == 0 → 预占失败 → 事务回滚 + Redis 回补 + 订单创建失败
 ```
 
 ```sql
 -- 实扣（支付成功时）
-UPDATE sku_stock
-SET locked = locked - #{num},
-    frozen = frozen + #{num},
-    version = version + 1
-WHERE sku_id = #{skuId} AND warehouse_id = #{whId}
-  AND locked >= #{num};
+UPDATE inventory.sku_stock
+SET locked = locked - :num,
+    frozen = frozen + :num,
+    version = version + 1, updated_at = now()
+WHERE sku_id = :sku_id AND warehouse_id = :wh_id
+  AND locked >= :num;
 ```
 
 ```sql
--- 发货（WMS 回传时）
-UPDATE sku_stock
-SET frozen = frozen - #{num},
-    total  = total - #{num},
-    version = version + 1
-WHERE sku_id = #{skuId} AND warehouse_id = #{whId}
-  AND frozen >= #{num};
+-- 发货（商家后台确认发货时）
+UPDATE inventory.sku_stock
+SET frozen = frozen - :num,
+    total  = total - :num,
+    version = version + 1, updated_at = now()
+WHERE sku_id = :sku_id AND warehouse_id = :wh_id
+  AND frozen >= :num;
 ```
 
 ```sql
 -- 取消/超时回补（从未支付）
-UPDATE sku_stock
-SET available = available + #{num},
-    locked    = locked - #{num},
-    version = version + 1
-WHERE sku_id = #{skuId} AND warehouse_id = #{whId}
-  AND locked >= #{num};
+UPDATE inventory.sku_stock
+SET available = available + :num,
+    locked    = locked - :num,
+    version = version + 1, updated_at = now()
+WHERE sku_id = :sku_id AND warehouse_id = :wh_id
+  AND locked >= :num;
 ```
 
-**每条 SQL 都带业务条件**（`available >= n`、`locked >= n`），这不是装饰——它是防止"重复回补导致库存虚高"的最后防线。即使 MQ 投递了两次取消消息，第二次 `locked >= n` 也会失败。
+**每条 SQL 都带业务条件**（`available >= n`、`locked >= n`），这不是装饰——它是防止"重复回补导致库存虚高"的最后防线。即使超时任务和用户取消同时触发，第二次 `locked >= n` 也会失败。表上的 `CHECK` 约束（见 [02](02-domain-model.md) §2.4）是再下一层的保险。
 
 ### 5.1 防死锁：加锁顺序
 
 批量预占多个 SKU 时，**必须按 `(warehouse_id, sku_id)` 升序排列**后再依次更新。否则两个订单以相反顺序锁同一组 SKU 会死锁。
 
-```java
-items.sort(comparing(Item::getWarehouseId).thenComparing(Item::getSkuId));
-for (Item it : items) {
-    int rows = stockMapper.lock(it);       // 每行独立 UPDATE，短事务
-    if (rows == 0) { throw new StockShortageException(it); }
-}
+```python
+LOCK_SQL = text("""
+    UPDATE inventory.sku_stock
+    SET available = available - :num, locked = locked + :num,
+        version = version + 1, updated_at = now()
+    WHERE sku_id = :sku_id AND warehouse_id = :wh_id AND available >= :num
+""")
+
+async def lock_stock_in_db(session: AsyncSession, items: list[LockItem]) -> None:
+    """在调用方的事务内执行；任何一行失败抛异常，由调用方回滚整个事务。"""
+    for it in sorted(items, key=lambda x: (x.warehouse_id, x.sku_id)):
+        result = await session.execute(
+            LOCK_SQL, {"num": it.num, "sku_id": it.sku_id, "wh_id": it.warehouse_id}
+        )
+        if result.rowcount == 0:
+            raise StockShortageError(it.sku_id)
 ```
 
-事务保持**尽可能短**：预占操作不加任何远程调用，不写日志表，只更新库存行。审计流水走异步。
+事务保持**尽可能短**：事务内不做任何 HTTP 调用、不等待 Redis 以外的外部资源。审计流水写在同一事务内（只是 INSERT，成本低）或写 outbox 异步落库。
 
 ## 6. 回补的触发点
 
 | 触发点 | 回补量 | 幂等键 | 备注 |
 |---|---|---|---|
-| 订单超时未支付（30min） | locked → available | `cancel:{orderSubNo}` | 延迟消息 + 定时扫描双保险 |
+| 订单超时未支付（30min） | locked → available | `cancel:{orderSubNo}` | ARQ 延迟任务 + 定时扫描双保险 |
 | 用户主动取消 | locked → available | `cancel:{orderSubNo}` | 立即回补 |
-| 支付失败 | locked → available | `payfail:{payNo}` | 由支付服务发事件 |
+| 支付失败 | locked → available | `payfail:{payNo}` | 由 payment 模块发事件 |
 | 预占成功但订单写库失败 | Redis 侧回补 | `rollback:{requestId}` | 补偿事务 |
 | 退货入库 | total += n（质检合格） | `return:{refundNo}` | **这是退货的唯一回补点**，详见 [08](08-aftersale.md) |
 | 退货质检不合格 | 不回补 | - | 商品报废，库存不恢复 |
@@ -272,7 +290,7 @@ for (Item it : items) {
 
 ## 7. 定时对账：修正漂移
 
-每 5 分钟跑一次（大促期间 1 分钟）：
+ARQ cron 任务，每 5 分钟跑一次（活动期间 1 分钟）：
 
 ```
 1. 从 DB 读一批 sku_stock（version 变化过的，或全量抽样）
@@ -289,31 +307,49 @@ for (Item it : items) {
 
 ## 8. 库存流水分表
 
+流水表不分区（PG 分区表的唯一约束必须包含分区键，会破坏 `biz_key` 的全局唯一性）。改为**幂等表与流水表分离**：
+
 ```sql
-CREATE TABLE `stock_flow` (
-  `id`             BIGINT      NOT NULL AUTO_INCREMENT,
-  `sku_id`         BIGINT      NOT NULL,
-  `warehouse_id`   BIGINT      NOT NULL,
-  `order_no`       VARCHAR(32) DEFAULT NULL,
-  `change_type`    TINYINT     NOT NULL COMMENT '1预占 2实扣 3回补 4发货扣减 5退货入库 6手工调整 7初始化',
-  `num`            INT         NOT NULL COMMENT '正数增加，负数减少',
-  `before_qty`     INT         NOT NULL COMMENT '变更前可售量',
-  `after_qty`      INT         NOT NULL COMMENT '变更后可售量',
-  `biz_key`        VARCHAR(64) NOT NULL COMMENT '幂等键',
-  `operator`       VARCHAR(64) DEFAULT NULL COMMENT '操作人/系统',
-  `remark`         VARCHAR(255) DEFAULT NULL,
-  `created_at`     DATETIME(3) NOT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_biz_key` (`biz_key`) COMMENT '★ 幂等的最终保证',
-  KEY `idx_sku_time` (`sku_id`, `created_at`)
-) ENGINE=InnoDB COMMENT='库存流水'
-PARTITION BY RANGE (TO_DAYS(`created_at`)) (
-  PARTITION p202609 VALUES LESS THAN (TO_DAYS('2026-10-01')),
-  PARTITION p202610 VALUES LESS THAN (TO_DAYS('2026-11-01'))
+-- 幂等键表：小、全局唯一，按 created_at 定期清理 90 天前的记录
+CREATE TABLE inventory.stock_biz_key (
+  biz_key     VARCHAR(64) PRIMARY KEY,      -- ★ 幂等的最终保证
+  created_at  TIMESTAMPTZ(3) NOT NULL DEFAULT now()
 );
+
+-- 流水表：按月分区，只追加
+CREATE TABLE inventory.stock_flow (
+  id            BIGINT GENERATED ALWAYS AS IDENTITY,
+  sku_id        BIGINT      NOT NULL,
+  warehouse_id  BIGINT      NOT NULL,
+  order_no      VARCHAR(32),
+  change_type   SMALLINT    NOT NULL,   -- 1预占 2实扣 3回补 4发货扣减 5退货入库 6手工调整 7初始化
+  num           INT         NOT NULL,   -- 正数增加，负数减少
+  before_qty    INT         NOT NULL,   -- 变更前可售量
+  after_qty     INT         NOT NULL,   -- 变更后可售量
+  biz_key       VARCHAR(64) NOT NULL,
+  operator      VARCHAR(64),            -- 操作人/系统
+  remark        VARCHAR(255),
+  created_at    TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE inventory.stock_flow_202610 PARTITION OF inventory.stock_flow
+  FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+CREATE TABLE inventory.stock_flow_202611 PARTITION OF inventory.stock_flow
+  FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+CREATE INDEX idx_stock_flow_sku_time ON inventory.stock_flow (sku_id, created_at);
 ```
 
-**`uk_biz_key` 是防重复回补的终极武器**：`biz_key` 形如 `RETURN:{refundNo}:{skuId}`，即使所有上游幂等都失效，唯一索引也会拦住第二次写入。
+未来月份的分区由 ARQ cron 任务每月 25 日提前创建（`CREATE TABLE IF NOT EXISTS ... PARTITION OF`）。
+
+**`stock_biz_key` 是防重复回补的终极武器**：每次库存变更在同一事务里先执行
+
+```sql
+INSERT INTO inventory.stock_biz_key (biz_key) VALUES (:biz_key)
+ON CONFLICT DO NOTHING;
+```
+
+`rowcount == 0` 说明已处理过，直接返回成功、不再更新库存。`biz_key` 形如 `RETURN:{refundNo}:{skuId}`，即使所有上游幂等都失效，主键也会拦住第二次写入。
 
 ## 9. 库存展示与"少卖"的取舍
 
@@ -333,21 +369,23 @@ PARTITION BY RANGE (TO_DAYS(`created_at`)) (
 | 用户下单 10 件，Redis 只有 7 件 | 整单失败（不支持部分成功），返回 `STOCK_INSUFFICIENT` 带可用量提示 |
 | 用户下单 10 件，Redis 分片 A 有 3、分片 B 有 8 | 从 B 扣 7 + 从 A 扣 3？→ **不允许跨分片凑**。整单落到 B（按 userId 散列的片），失败则回落到其他片整片扣；都用整片，不拆分 |
 | 预占成功，但订单落库失败 | 补偿：删除 Redis 预占记录 + `INCRBY` 恢复 + DB 回滚（本地事务已回滚）。由 requestId 幂等 |
-| Redis 主从切换丢失预占 | DB 仍有 `locked`，对账任务按 DB 重建 Redis。**DB 是账本** |
+| Redis 重启丢失最后一秒写入 | DB 仍有 `locked`，对账任务按 DB 重建 Redis。**DB 是账本** |
 | 商家突发下架 SKU 但有 5 个 locked | 允许已预占的订单继续支付（不强制取消），只影响新订单 |
 | 退货入库，但该 SKU 已下架 | 库存照常回补（`available += n`），但不下发到 Redis 前端展示（下架商品不展示库存） |
 | 负数库存告警 | 任何 SQL 执行后 `available < 0` → 立即触发告警 + 冻结该 SKU 下单 |
 
 ## 11. 与其它模块的接口
 
-| 调用方 | 接口 | 语义 |
-|---|---|---|
-| 交易服务 | `POST /inventory/lock` | 批量预占，`bizKey` 幂等，返回逐项结果 |
-| 交易服务 | `POST /inventory/release` | 释放预占（取消/超时） |
-| 支付服务 | `POST /inventory/confirm` | 预占转实扣（`locked→frozen`） |
-| WMS | `POST /inventory/deliver` | 发货，`frozen→` 扣 `total` |
-| 售后 | `POST /inventory/return-in` | 退货入库回补（**唯一**退货回补入口） |
-| 商品 | `POST /inventory/init` | 初始化/覆盖库存（幂等 SET） |
-| 商家后台 | `POST /inventory/adjust` | 手工调整，需审批流 |
+模块化单体中，这些是 `app/modules/inventory/service.py` 暴露给其他模块的 **Python 函数**，不是 HTTP 接口（只有商家后台的手工调整对外暴露 HTTP）。凡是需要与调用方同事务的函数，都接收调用方的 `AsyncSession`。
 
-**所有接口都必须接受 `bizKey` 参数**，没有例外。这是把幂等责任放在最底层的设计选择——底层可靠，上层就可以简化。
+| 调用方 | 函数 | 语义 |
+|---|---|---|
+| trade | `lock(session, items, biz_key)` | 批量预占（Redis 预扣在事务外，DB 预占在调用方事务内），返回逐项结果 |
+| trade | `release(session, items, biz_key)` | 释放预占（取消/超时） |
+| payment | `confirm(session, items, biz_key)` | 预占转实扣（`locked→frozen`） |
+| trade（发货） | `deliver(session, items, biz_key)` | 发货，`frozen→` 扣 `total` |
+| aftersale | `return_in(session, items, biz_key)` | 退货入库回补（**唯一**退货回补入口） |
+| product | `init(session, sku_id, wh_id, qty, biz_key)` | 初始化/覆盖库存（幂等 SET） |
+| 商家后台 | `POST /api/admin/inventory/adjust` | 手工调整，需审批 |
+
+**所有函数都必须接受 `biz_key` 参数**，没有例外。这是把幂等责任放在最底层的设计选择——底层可靠，上层就可以简化。

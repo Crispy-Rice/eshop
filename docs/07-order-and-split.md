@@ -2,7 +2,7 @@
 
 ## 1. 拆单的必然性
 
-**跨店购买一个订单可能包含多个商家的货**，这带来四个必须解决的问题：
+**跨店购买一个订单可能包含多个商家的货**，这带来几个必须解决的问题：
 
 | 问题 | 不拆单的后果 |
 |---|---|
@@ -67,7 +67,7 @@
   └── 发货单 A-2（仓 WH-2）→ 物流单号 YT456
 ```
 
-**发货单不进主订单表**，是子单内部的履约明细（`delivery_order` 表）。这样对用户展示友好（一个订单两件包裹），对商家操作清晰。
+**发货单不进主订单表**，是子单内部的履约明细（`delivery_order` 表）。这样对用户展示友好（一个订单两件包裹），对商家操作清晰。第一期不对接 WMS 和快递接口，商家在后台手工填写快递公司和单号即视为发货。
 
 ### 2.2 拆单触发时机
 
@@ -77,7 +77,7 @@
 2. 库存预占按 SKU 做，与拆单无关，但**子单是库存预占的幂等粒度**；
 3. 支付成功后直接推进各子单状态，无需二次拆单逻辑。
 
-**副作用**：用户下单未支付就取消，会产生大量作废的母子单记录。解决：订单表按 `user_id` 分片，作废记录由归档任务处理（超过 3 个月的已关闭订单归档到冷库）。
+**副作用**：用户下单未支付就取消，会产生大量作废的母子单记录。解决：作废记录由归档任务处理（超过 3 个月的已关闭订单移入归档表，见 [13](13-schema.md) §7）。
 
 ### 2.3 拆单的字段分摊
 
@@ -93,200 +93,217 @@
 | `freight_amount` | Σ 子单 | 见 [06 §6](06-freight.md) 的运费分摊 |
 | `payable_amount` | Σ 子单 | 计算得出 |
 
-**分摊守恒断言**（下单时必须校验，失败则拒绝创建订单）：
+**分摊守恒检查**（下单时必须校验，失败则拒绝创建订单。不用 `assert`，因为 `python -O` 会移除它）：
 
-```java
-assert main.getTotalAmount()       == sum(sub.getTotalAmount());
-assert main.getItemDiscount()      == sum(sub.getItemDiscount());
-assert main.getShopDiscount()      == sum(sub.getShopDiscount());
-assert main.getPlatformDiscount()  == sum(sub.getPlatformDiscount());
-assert main.getPointDeduction()    == sum(sub.getPointDeduction());
-assert main.getFreightAmount()     == sum(sub.getFreightAmount());
-assert main.getPayableAmount()     == sum(sub.getPayableAmount());
+```python
+CONSERVED_FIELDS = (
+    "total_amount", "item_discount", "shop_discount", "platform_discount",
+    "point_deduction", "freight_amount", "payable_amount",
+)
+
+def assert_conservation(main: OrderMainDraft, subs: list[OrderSubDraft]) -> None:
+    for field in CONSERVED_FIELDS:
+        if getattr(main, field) != sum(getattr(s, field) for s in subs):
+            raise PriceInvariantError(f"母子单 {field} 不守恒")
 ```
 
 **平台优惠为什么要分摊到子单**：因为退款要按子单退。如果平台券 30 元不分摊，用户退掉子单 A（200 元）时，无法确定该退他多少钱。
 
 ### 2.4 拆单算法
 
-```java
-public SplitResult split(CalcPriceResponse calc, Long userId) {
-    // ① 按店铺分组
-    Map<Long, List<ItemResult>> byShop = calc.getItems().stream()
-        .collect(groupingBy(ItemResult::getShopId, LinkedHashMap::new, toList()));
+```python
+def split(calc: CalcResult) -> list[OrderSubDraft]:
+    # ① 按店铺分组（dict 保持插入顺序，按商品在结算页的顺序出子单）
+    by_shop: dict[int, list[ItemResult]] = defaultdict(list)
+    for item in calc.items:
+        by_shop[item.shop_id].append(item)
 
-    List<OrderSub> subs = new ArrayList<>();
-    for (var entry : byShop.entrySet()) {
-        OrderSub sub = new OrderSub();
-        sub.setShopId(entry.getKey());
-        sub.setItems(entry.getValue());
+    # ② 该子单自身的优惠（天然归属，无需分摊）
+    subs = [
+        OrderSubDraft(
+            shop_id=shop_id,
+            items=items,
+            total_amount=sum(i.unit_price * i.num for i in items),
+            item_discount=sum(i.item_discount for i in items),
+            shop_discount=sum(i.shop_discount for i in items),
+        )
+        for shop_id, items in by_shop.items()
+    ]
 
-        // ② 该子单自身的优惠（天然归属，无需分摊）
-        sub.setTotalAmount(entry.getValue().stream().mapToLong(i -> i.getUnitPrice() * i.getNum()).sum());
-        sub.setItemDiscount(entry.getValue().stream().mapToLong(ItemResult::getItemDiscount).sum());
-        sub.setShopDiscount(entry.getValue().stream().mapToLong(ItemResult::getShopDiscount).sum());
+    # ③ 平台级优惠/积分/平台券按金额占比分摊到子单（最大余数法，见 05 §6）
+    #    运费已按包裹算好并归属到店铺（见 06 §6），直接取 calc 中的店铺运费
+    base = [s.total_amount for s in subs]
+    platform_alloc = allocate(calc.platform_discount, base)
+    point_alloc = allocate(calc.point_deduction, base)
+    platform_coupon_alloc = allocate(calc.platform_coupon_amount, base)
 
-        subs.add(sub);
-    }
+    for sub, plat, point, pcoupon in zip(subs, platform_alloc, point_alloc, platform_coupon_alloc):
+        sub.platform_discount = plat
+        sub.point_deduction = point
+        sub.freight_amount = calc.freight_by_shop[sub.shop_id]
+        sub.coupon_amount = calc.shop_coupon_by_shop.get(sub.shop_id, 0) + pcoupon
+        sub.payable_amount = (sub.total_amount - sub.item_discount - sub.shop_discount
+                              - sub.platform_discount - sub.point_deduction + sub.freight_amount)
 
-    // ③ 平台级优惠按金额占比分摊到子单（最大余数法）
-    long[] baseAmounts = subs.stream().mapToLong(OrderSub::getTotalAmount).toArray();
-    long[] platformAlloc = allocate(calc.getPlatformDiscount(), baseAmounts);
-    long[] pointAlloc    = allocate(calc.getPointDeduction(),    baseAmounts);
-    long[] freightAlloc  = allocate(calc.getFreight(),           baseAmounts);  // 见 06 §6 说明
-    long[] couponAlloc   = allocate(calc.getCouponTotal(),       baseAmounts);
-
-    for (int i = 0; i < subs.size(); i++) {
-        OrderSub sub = subs.get(i);
-        sub.setPlatformDiscount(platformAlloc[i]);
-        sub.setPointDeduction(pointAlloc[i]);
-        sub.setFreightAmount(freightAlloc[i]);
-        sub.setCouponAmount(couponAlloc[i]);
-        sub.setPayableAmount(
-            sub.getTotalAmount()
-          - sub.getItemDiscount()
-          - sub.getShopDiscount()
-          - sub.getPlatformDiscount()
-          - sub.getPointDeduction()
-          + sub.getFreightAmount());
-    }
-
-    // ④ 守恒校验（失败直接抛异常，绝不写入不平的订单）
-    assertConservation(calc, subs);
-
-    return new SplitResult(subs);
-}
+    # ④ 守恒校验（失败直接抛异常，绝不写入不平的订单）
+    assert_conservation(calc.as_main_draft(), subs)
+    return subs
 ```
 
+> 原方案中运费也按商品金额重新分摊到子单，这与 [06 §6](06-freight.md) "运费按包裹计算、同包裹多店铺时再分摊" 的规则冲突。这里统一以 06 为准：运费在 freight 模块中已归属到店铺，拆单时直接取用。
+
 ## 3. 表结构
+
+DDL 约定见 [13-schema](13-schema.md) §0：`SMALLINT` 状态、`TIMESTAMPTZ(3)` 时间、行尾注释说明字段含义。
 
 ### 3.1 母单
 
 ```sql
-CREATE TABLE `order_main` (
-  `id`                BIGINT       NOT NULL,
-  `order_main_no`     VARCHAR(32)  NOT NULL COMMENT '母单号，如 M202609301234567890',
-  `user_id`           BIGINT       NOT NULL COMMENT '分片键',
-  `shop_count`        INT          NOT NULL DEFAULT 1 COMMENT '包含的子单数',
+CREATE TABLE trade.order_main (
+  id                BIGINT       PRIMARY KEY,
+  order_main_no     VARCHAR(32)  NOT NULL,          -- 母单号，见 §6
+  user_id           BIGINT       NOT NULL,
+  request_id        VARCHAR(160) NOT NULL,          -- 下单请求的幂等键（见 10 §5）
+  shop_count        INT          NOT NULL DEFAULT 1, -- 包含的子单数
   -- 金额（含分摊汇总）
-  `total_amount`      BIGINT       NOT NULL COMMENT '商品原价总额',
-  `item_discount`     BIGINT       NOT NULL DEFAULT 0,
-  `shop_discount`     BIGINT       NOT NULL DEFAULT 0,
-  `platform_discount` BIGINT       NOT NULL DEFAULT 0,
-  `coupon_amount`     BIGINT       NOT NULL DEFAULT 0 COMMENT '券优惠总额（含店铺券+平台券）',
-  `point_deduction`   BIGINT       NOT NULL DEFAULT 0,
-  `point_used`        INT          NOT NULL DEFAULT 0 COMMENT '消耗积分',
-  `freight_amount`    BIGINT       NOT NULL DEFAULT 0,
-  `payable_amount`    BIGINT       NOT NULL COMMENT '应付 = total - 各优惠 + freight',
-  `paid_amount`       BIGINT       NOT NULL DEFAULT 0 COMMENT '实付（支付回调写入）',
-  `refunded_amount`   BIGINT       NOT NULL DEFAULT 0 COMMENT '累计已退',
+  total_amount      BIGINT       NOT NULL,          -- 商品原价总额
+  item_discount     BIGINT       NOT NULL DEFAULT 0,
+  shop_discount     BIGINT       NOT NULL DEFAULT 0,
+  platform_discount BIGINT       NOT NULL DEFAULT 0,
+  coupon_amount     BIGINT       NOT NULL DEFAULT 0, -- 券优惠总额（含店铺券+平台券），是上面各项的子集
+  point_deduction   BIGINT       NOT NULL DEFAULT 0,
+  point_used        INT          NOT NULL DEFAULT 0, -- 消耗积分
+  freight_amount    BIGINT       NOT NULL DEFAULT 0,
+  discount_amount   BIGINT GENERATED ALWAYS AS
+      (item_discount + shop_discount + platform_discount + point_deduction) STORED,
+  payable_amount    BIGINT       NOT NULL,          -- 应付 = total - 各优惠 + freight
+  paid_amount       BIGINT       NOT NULL DEFAULT 0, -- 实付（支付回调写入）
+  refunded_amount   BIGINT       NOT NULL DEFAULT 0, -- 累计已退
   -- 状态
-  `status`            TINYINT      NOT NULL DEFAULT 1 COMMENT '见 §5 母单状态',
-  `pay_status`        TINYINT      NOT NULL DEFAULT 0 COMMENT '0未付 1已付 2部分退款 3全额退款',
+  status            SMALLINT     NOT NULL DEFAULT 10, -- 见 §5 母单状态（与子单同一套编码）
+  pay_status        SMALLINT     NOT NULL DEFAULT 0, -- 0未付 1已付 2部分退款 3全额退款
   -- 收货信息快照
-  `receiver_name`     VARCHAR(64)  NOT NULL,
-  `receiver_phone`    VARCHAR(20)  NOT NULL,
-  `receiver_province` VARCHAR(32)  NOT NULL,
-  `receiver_city`     VARCHAR(32)  NOT NULL,
-  `receiver_district` VARCHAR(32)  NOT NULL,
-  `receiver_detail`   VARCHAR(255) NOT NULL,
-  `region_code`       VARCHAR(16)  NOT NULL COMMENT '用于运费计算与统计',
+  receiver_name     VARCHAR(64)  NOT NULL,
+  receiver_phone    VARCHAR(20)  NOT NULL,
+  receiver_province VARCHAR(32)  NOT NULL,
+  receiver_city     VARCHAR(32)  NOT NULL,
+  receiver_district VARCHAR(32)  NOT NULL,
+  receiver_detail   VARCHAR(255) NOT NULL,
+  region_code       VARCHAR(16)  NOT NULL,          -- 用于运费计算与统计
+  freight_detail    JSONB        NOT NULL,          -- 运费计算明细快照（见 06 §12）
   -- 来源
-  `order_source`      TINYINT      NOT NULL DEFAULT 1 COMMENT '1APP 2小程序 3H5 4PC',
-  `buyer_remark`      VARCHAR(255) DEFAULT NULL,
+  order_source      SMALLINT     NOT NULL DEFAULT 4, -- 第一期只有 4=PC
+  buyer_remark      VARCHAR(255),
   -- 时间
-  `create_time`       DATETIME(3)  NOT NULL,
-  `pay_deadline`      DATETIME(3)  NOT NULL COMMENT '支付截止（创建+30min）',
-  `pay_time`          DATETIME(3)  DEFAULT NULL,
-  `finish_time`       DATETIME(3)  DEFAULT NULL,
-  `close_time`        DATETIME(3)  DEFAULT NULL,
-  `updated_at`        DATETIME(3)  NOT NULL,
-  `version`           INT          NOT NULL DEFAULT 0,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_main_no` (`order_main_no`),
-  KEY `idx_user_status_time` (`user_id`, `status`, `create_time`),
-  KEY `idx_pay_deadline` (`status`, `pay_deadline`) COMMENT '★ 超时关单扫描用'
-) ENGINE=InnoDB COMMENT='母单（支付与用户视角）';
+  create_time       TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  pay_deadline      TIMESTAMPTZ(3) NOT NULL,        -- 支付截止（创建 + 30min）
+  pay_time          TIMESTAMPTZ(3),
+  finish_time       TIMESTAMPTZ(3),
+  close_time        TIMESTAMPTZ(3),
+  updated_at        TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  version           INT          NOT NULL DEFAULT 0,
+  CONSTRAINT uk_order_main_no UNIQUE (order_main_no),
+  -- ★ 金额守恒与退款上限由数据库兜底
+  CONSTRAINT ck_main_payable CHECK (
+    payable_amount = total_amount - item_discount - shop_discount
+                   - platform_discount - point_deduction + freight_amount
+    AND payable_amount >= 0),
+  CONSTRAINT ck_main_refund CHECK (refunded_amount <= paid_amount)
+);
+CREATE INDEX idx_order_main_user ON trade.order_main (user_id, status, create_time DESC);
+-- ★ 下单幂等的持久化兜底：Redis 幂等键丢失时仍能挡住重复下单
+CREATE UNIQUE INDEX uk_order_main_request ON trade.order_main (user_id, request_id);
+-- ★ 超时关单扫描：部分索引，只包含待付款订单，体积极小
+CREATE INDEX idx_order_main_pay_deadline ON trade.order_main (pay_deadline) WHERE status = 10;
+COMMENT ON TABLE trade.order_main IS '母单（支付与用户视角）';
 ```
 
 ### 3.2 子单
 
 ```sql
-CREATE TABLE `order_sub` (
-  `id`                BIGINT       NOT NULL,
-  `order_sub_no`      VARCHAR(32)  NOT NULL COMMENT '子单号，如 S202609301234567890-1',
-  `order_main_no`     VARCHAR(32)  NOT NULL,
-  `user_id`           BIGINT       NOT NULL COMMENT '冗余，便于按用户查询',
-  `shop_id`           BIGINT       NOT NULL,
-  `shop_name_snap`    VARCHAR(64)  NOT NULL COMMENT '店铺名快照',
+CREATE TABLE trade.order_sub (
+  id                BIGINT       PRIMARY KEY,
+  order_sub_no      VARCHAR(32)  NOT NULL,          -- 子单号，母单号 + "-" + 序号
+  order_main_no     VARCHAR(32)  NOT NULL REFERENCES trade.order_main (order_main_no),
+  user_id           BIGINT       NOT NULL,          -- 冗余，便于按用户查询
+  shop_id           BIGINT       NOT NULL,
+  shop_name_snap    VARCHAR(64)  NOT NULL,          -- 店铺名快照
   -- 金额（母单分摊后）
-  `total_amount`      BIGINT       NOT NULL,
-  `item_discount`     BIGINT       NOT NULL DEFAULT 0,
-  `shop_discount`     BIGINT       NOT NULL DEFAULT 0,
-  `platform_discount` BIGINT       NOT NULL DEFAULT 0,
-  `coupon_amount`     BIGINT       NOT NULL DEFAULT 0,
-  `point_deduction`   BIGINT       NOT NULL DEFAULT 0,
-  `freight_amount`    BIGINT       NOT NULL DEFAULT 0,
-  `payable_amount`    BIGINT       NOT NULL,
-  `refunded_amount`   BIGINT       NOT NULL DEFAULT 0,
+  total_amount      BIGINT       NOT NULL,
+  item_discount     BIGINT       NOT NULL DEFAULT 0,
+  shop_discount     BIGINT       NOT NULL DEFAULT 0,
+  platform_discount BIGINT       NOT NULL DEFAULT 0,
+  coupon_amount     BIGINT       NOT NULL DEFAULT 0,
+  point_deduction   BIGINT       NOT NULL DEFAULT 0,
+  freight_amount    BIGINT       NOT NULL DEFAULT 0,
+  payable_amount    BIGINT       NOT NULL,
+  refunded_amount   BIGINT       NOT NULL DEFAULT 0,
   -- ★ 状态机（见 §4）
-  `status`            TINYINT      NOT NULL DEFAULT 10 COMMENT '10待付款 20待发货 30待收货 40已完成 50已关闭 60退款中 70已退款',
+  status            SMALLINT     NOT NULL DEFAULT 10, -- 10待付款 20待发货 30待收货 40已完成 50已关闭 60退款中 70已退款
   -- 履约
-  `delivery_status`   TINYINT      NOT NULL DEFAULT 0 COMMENT '0未发货 1部分发货 2全部发货 3已签收',
-  `delivery_count`    INT          NOT NULL DEFAULT 0,
+  delivery_status   SMALLINT     NOT NULL DEFAULT 0, -- 0未发货 1部分发货 2全部发货 3已签收
+  delivery_count    INT          NOT NULL DEFAULT 0,
   -- 售后
-  `has_aftersale`     TINYINT      NOT NULL DEFAULT 0 COMMENT '是否有进行中的售后',
-  `can_aftersale`     TINYINT      NOT NULL DEFAULT 1 COMMENT '是否可申请售后',
+  has_aftersale     BOOLEAN      NOT NULL DEFAULT false, -- 是否有进行中的售后
+  can_aftersale     BOOLEAN      NOT NULL DEFAULT true,  -- 是否可申请售后
   -- 评价
-  `is_reviewed`       TINYINT      NOT NULL DEFAULT 0,
+  is_reviewed       BOOLEAN      NOT NULL DEFAULT false,
   -- 时间
-  `create_time`       DATETIME(3)  NOT NULL,
-  `deliver_time`      DATETIME(3)  DEFAULT NULL,
-  `receive_time`      DATETIME(3)  DEFAULT NULL,
-  `finish_time`       DATETIME(3)  DEFAULT NULL,
-  `close_time`        DATETIME(3)  DEFAULT NULL,
-  `auto_finish_time`  DATETIME(3)  DEFAULT NULL COMMENT '自动确认收货时间',
-  `updated_at`        DATETIME(3)  NOT NULL,
-  `version`           INT          NOT NULL DEFAULT 0,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_sub_no` (`order_sub_no`),
-  KEY `idx_main` (`order_main_no`),
-  KEY `idx_user` (`user_id`, `status`, `create_time`),
-  KEY `idx_shop_status` (`shop_id`, `status`, `create_time`) COMMENT '商家后台主查询',
-  KEY `idx_auto_finish` (`status`, `auto_finish_time`) COMMENT '自动收货扫描'
-) ENGINE=InnoDB COMMENT='子单（商家履约视角）';
+  create_time       TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  deliver_time      TIMESTAMPTZ(3),
+  receive_time      TIMESTAMPTZ(3),
+  finish_time       TIMESTAMPTZ(3),
+  close_time        TIMESTAMPTZ(3),
+  auto_finish_time  TIMESTAMPTZ(3),                 -- 自动确认收货时间
+  updated_at        TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  version           INT          NOT NULL DEFAULT 0,
+  CONSTRAINT uk_order_sub_no UNIQUE (order_sub_no),
+  CONSTRAINT ck_sub_payable CHECK (
+    payable_amount = total_amount - item_discount - shop_discount
+                   - platform_discount - point_deduction + freight_amount
+    AND payable_amount >= 0),
+  CONSTRAINT ck_sub_refund CHECK (refunded_amount <= payable_amount)
+);
+CREATE INDEX idx_order_sub_main ON trade.order_sub (order_main_no);
+CREATE INDEX idx_order_sub_user ON trade.order_sub (user_id, status, create_time DESC);
+-- 商家后台主查询（单库下直接走索引，不需要 ES）
+CREATE INDEX idx_order_sub_shop ON trade.order_sub (shop_id, status, create_time DESC);
+-- 自动收货扫描：部分索引
+CREATE INDEX idx_order_sub_auto_finish ON trade.order_sub (auto_finish_time) WHERE status = 30;
+COMMENT ON TABLE trade.order_sub IS '子单（商家履约视角）';
 ```
+
+> 母单、子单、订单项同属 `trade` schema，可以建外键；跨模块（如 `payment.payment.order_main_no`）不建外键，见 [13](13-schema.md) §0。
 
 ### 3.3 发货单（子单内按仓库拆）
 
 ```sql
-CREATE TABLE `delivery_order` (
-  `id`               BIGINT      NOT NULL,
-  `delivery_no`      VARCHAR(32) NOT NULL,
-  `order_sub_no`     VARCHAR(32) NOT NULL,
-  `order_main_no`    VARCHAR(32) NOT NULL,
-  `shop_id`          BIGINT      NOT NULL,
-  `warehouse_id`     BIGINT      NOT NULL,
-  `express_company`  VARCHAR(32) NOT NULL COMMENT '快递公司编码',
-  `express_no`       VARCHAR(64) NOT NULL COMMENT '物流单号',
-  `status`           TINYINT     NOT NULL DEFAULT 1 COMMENT '1待发货 2已发货 3已签收',
-  `deliver_time`     DATETIME(3) DEFAULT NULL,
-  `receive_time`     DATETIME(3) DEFAULT NULL,
-  `created_at`       DATETIME(3) NOT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_delivery_no` (`delivery_no`),
-  UNIQUE KEY `uk_express` (`express_company`, `express_no`),
-  KEY `idx_sub` (`order_sub_no`)
-) ENGINE=InnoDB COMMENT='发货单';
+CREATE TABLE trade.delivery_order (
+  id               BIGINT      PRIMARY KEY,
+  delivery_no      VARCHAR(32) NOT NULL,
+  order_sub_no     VARCHAR(32) NOT NULL REFERENCES trade.order_sub (order_sub_no),
+  order_main_no    VARCHAR(32) NOT NULL,
+  shop_id          BIGINT      NOT NULL,
+  warehouse_id     BIGINT      NOT NULL,
+  express_company  VARCHAR(32) NOT NULL,     -- 快递公司编码
+  express_no       VARCHAR(64) NOT NULL,     -- 物流单号
+  status           SMALLINT    NOT NULL DEFAULT 1, -- 1待发货 2已发货 3已签收
+  deliver_time     TIMESTAMPTZ(3),
+  receive_time     TIMESTAMPTZ(3),
+  created_at       TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  CONSTRAINT uk_delivery_no UNIQUE (delivery_no),
+  CONSTRAINT uk_delivery_express UNIQUE (express_company, express_no)
+);
+CREATE INDEX idx_delivery_sub ON trade.delivery_order (order_sub_no);
+COMMENT ON TABLE trade.delivery_order IS '发货单';
 
 -- 发货单与订单项的多对多（一个订单项可能分多次发货）
-CREATE TABLE `delivery_item` (
-  `id`            BIGINT NOT NULL AUTO_INCREMENT,
-  `delivery_no`   VARCHAR(32) NOT NULL,
-  `order_item_id` BIGINT NOT NULL,
-  `num`           INT NOT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_delivery_item` (`delivery_no`, `order_item_id`)
+CREATE TABLE trade.delivery_item (
+  id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  delivery_no   VARCHAR(32) NOT NULL REFERENCES trade.delivery_order (delivery_no),
+  order_item_id BIGINT      NOT NULL REFERENCES trade.order_item (id),
+  num           INT         NOT NULL CHECK (num > 0),
+  CONSTRAINT uk_delivery_item UNIQUE (delivery_no, order_item_id)
 );
 ```
 
@@ -328,146 +345,170 @@ stateDiagram-v2
 
 ### 4.3 状态机实现：表驱动而非 if-else
 
-```java
-public enum SubOrderStatus {
-    WAIT_PAY(10), WAIT_DELIVER(20), WAIT_RECEIVE(30),
-    FINISHED(40), CLOSED(50), REFUNDING(60), REFUNDED(70);
-}
+```python
+# app/modules/trade/state_machine.py
+class SubOrderStatus(IntEnum):
+    WAIT_PAY = 10
+    WAIT_DELIVER = 20
+    WAIT_RECEIVE = 30
+    FINISHED = 40
+    CLOSED = 50
+    REFUNDING = 60
+    REFUNDED = 70
 
-// ★ 状态机定义：当前状态 → 允许的事件 → 目标状态
-public static final Map<SubOrderStatus, Map<OrderEvent, SubOrderStatus>> TRANSITIONS =
-    Map.of(
-        WAIT_PAY, Map.of(
-            PAY_SUCCESS,      WAIT_DELIVER,
-            USER_CANCEL,      CLOSED,
-            TIMEOUT_CANCEL,   CLOSED
-        ),
-        WAIT_DELIVER, Map.of(
-            SHIP,             WAIT_RECEIVE,
-            APPLY_REFUND,     REFUNDING,
-            PARTIAL_SHIP,     WAIT_DELIVER
-        ),
-        WAIT_RECEIVE, Map.of(
-            CONFIRM_RECEIVE,  FINISHED,
-            AUTO_RECEIVE,     FINISHED,
-            APPLY_REFUND,     REFUNDING
-        ),
-        FINISHED, Map.of(
-            APPLY_AFTERSALE,  REFUNDING
-        ),
-        REFUNDING, Map.of(
-            REFUND_SUCCESS,   REFUNDED,
-            REFUND_REJECT,    WAIT_DELIVER,     // 拒绝后退回原状态（见下方说明）
-            USER_REVOKE,      WAIT_DELIVER
-        )
-    );
+
+class OrderEvent(StrEnum):
+    PAY_SUCCESS = "PAY_SUCCESS"
+    USER_CANCEL = "USER_CANCEL"
+    TIMEOUT_CANCEL = "TIMEOUT_CANCEL"
+    SHIP = "SHIP"
+    PARTIAL_SHIP = "PARTIAL_SHIP"
+    CONFIRM_RECEIVE = "CONFIRM_RECEIVE"
+    AUTO_RECEIVE = "AUTO_RECEIVE"
+    APPLY_REFUND = "APPLY_REFUND"
+    APPLY_AFTERSALE = "APPLY_AFTERSALE"
+    REFUND_SUCCESS = "REFUND_SUCCESS"
+    REFUND_REJECT = "REFUND_REJECT"
+    USER_REVOKE = "USER_REVOKE"
+
+
+S, E = SubOrderStatus, OrderEvent
+
+# ★ 状态机定义：当前状态 → 允许的事件 → 目标状态
+# 目标为 None 表示"恢复到售后单记录的 source_status"（见下方说明）
+TRANSITIONS: dict[SubOrderStatus, dict[OrderEvent, SubOrderStatus | None]] = {
+    S.WAIT_PAY: {
+        E.PAY_SUCCESS: S.WAIT_DELIVER,
+        E.USER_CANCEL: S.CLOSED,
+        E.TIMEOUT_CANCEL: S.CLOSED,
+    },
+    S.WAIT_DELIVER: {
+        E.SHIP: S.WAIT_RECEIVE,
+        E.PARTIAL_SHIP: S.WAIT_DELIVER,
+        E.APPLY_REFUND: S.REFUNDING,
+    },
+    S.WAIT_RECEIVE: {
+        E.CONFIRM_RECEIVE: S.FINISHED,
+        E.AUTO_RECEIVE: S.FINISHED,
+        E.APPLY_REFUND: S.REFUNDING,
+    },
+    S.FINISHED: {
+        E.APPLY_AFTERSALE: S.REFUNDING,
+    },
+    S.REFUNDING: {
+        E.REFUND_SUCCESS: S.REFUNDED,
+        E.REFUND_REJECT: None,      # 拒绝后退回原状态
+        E.USER_REVOKE: None,        # 撤销后退回原状态
+    },
+}
 ```
 
-**问题：`REFUND_REJECT` 的目标状态取决于"从哪来的"**。10→60 和 30→60 拒绝后应该回到各自的原状态。解决方案：**在退款单上记录 `source_status`**，拒绝时恢复。
+**`REFUND_REJECT` 的目标状态取决于"从哪来的"**。20→60 和 30→60 拒绝后应该回到各自的原状态。解决方案：**在售后单上记录 `source_status`**（见 [13](13-schema.md) §3），拒绝/撤销时由调用方通过 `ctx.restore_to` 传入。
 
-```java
-class RefundOrder {
-    SubOrderStatus sourceStatus;   // 申请退款时的子单状态
-}
-
-// 拒绝时
-SubOrderStatus target = refundOrder.getSourceStatus();
-updateStatus(subOrderNo, REFUNDING, target, REFUND_REJECT);
+```python
+# aftersale 模块，商家拒绝时
+await trade_service.transit(
+    session, refund.order_sub_no, OrderEvent.REFUND_REJECT,
+    TransitContext(operator=merchant, restore_to=SubOrderStatus(refund.source_status)),
+)
 ```
 
 ### 4.4 状态变更的统一入口（关键设计）
 
-**所有状态变更必须走同一个方法**，禁止任何地方直接 `UPDATE order_sub SET status = ?`。
+**所有状态变更必须走同一个函数**，禁止任何地方直接 `UPDATE trade.order_sub SET status = ...`（code review 与 `grep` 检查）。
 
-```java
-@Transactional
-public void transit(String orderSubNo, OrderEvent event, OrderContext ctx) {
-    // ① 加行锁读取当前状态（悲观锁，防止并发状态变更）
-    OrderSub sub = subMapper.selectForUpdate(orderSubNo);
-    SubOrderStatus from = sub.getStatus();
+```python
+async def transit(session: AsyncSession, order_sub_no: str, event: OrderEvent,
+                  ctx: TransitContext) -> SubOrderStatus:
+    """在调用方的事务内执行状态流转。"""
+    # ① 加行锁读取当前状态（悲观锁，防止并发状态变更）
+    sub = await session.scalar(
+        select(OrderSub).where(OrderSub.order_sub_no == order_sub_no).with_for_update()
+    )
+    if sub is None:
+        raise BizError(ErrorCode.ORDER_NOT_FOUND)
+    from_status = SubOrderStatus(sub.status)
 
-    // ② 状态机校验：非法流转直接拒绝
-    SubOrderStatus to = TRANSITIONS.getOrDefault(from, Map.of()).get(event);
-    if (to == null) {
-        throw new IllegalStateException(String.format(
-            "非法状态流转: orderSubNo=%s, from=%s, event=%s", orderSubNo, from, event));
-    }
+    # ② 状态机校验：非法流转直接拒绝
+    allowed = TRANSITIONS.get(from_status, {})
+    if event not in allowed:
+        raise IllegalTransitionError(order_sub_no, from_status, event)
+    to_status = allowed[event] or ctx.restore_to
+    if to_status is None:
+        raise IllegalTransitionError(order_sub_no, from_status, event, "缺少 restore_to")
 
-    // ③ CAS 更新（double check，防并发）
-    int rows = subMapper.updateStatus(orderSubNo, from.getCode(), to.getCode(),
-                                      ctx.getOperator(), ctx.getRemark());
-    if (rows == 0) {
-        throw new ConcurrentStateChangeException(orderSubNo);
-    }
+    # ③ CAS 更新（double check，防并发）
+    result = await session.execute(
+        update(OrderSub)
+        .where(OrderSub.order_sub_no == order_sub_no, OrderSub.status == from_status)
+        .values(status=to_status, updated_at=func.now(), version=OrderSub.version + 1)
+    )
+    if result.rowcount == 0:
+        raise ConcurrentStateChangeError(order_sub_no)
 
-    // ④ 写状态流水（审计）
-    stateFlowMapper.insert(new OrderStateFlow(orderSubNo, from, to, event, ctx));
+    # ④ 写状态流水（审计）
+    session.add(OrderStateFlow(order_type=2, order_no=order_sub_no, from_status=from_status,
+                               to_status=to_status, event=event, **ctx.audit_fields()))
 
-    // ⑤ 发领域事件（异步处理副作用：通知、积分、ES 同步）
-    eventPublisher.publish(new SubOrderStatusChanged(orderSubNo, from, to, event));
+    # ⑤ 写 outbox 事件（与状态变更同一事务提交，异步处理副作用：通知、积分、销量统计）
+    await outbox.add(session, topic="trade.sub_status_changed", biz_key=f"{order_sub_no}:{sub.version + 1}",
+                     payload={"orderSubNo": order_sub_no, "from": from_status, "to": to_status, "event": event})
 
-    // ⑥ 聚合母单状态
-    aggregateMainOrder(sub.getOrderMainNo());
-}
+    # ⑥ 聚合母单状态
+    await aggregate_main_order(session, sub.order_main_no)
+    return to_status
 ```
+
+对应 SQL：
 
 ```sql
 -- CAS 更新：只有当前状态等于预期值才更新
-UPDATE order_sub
-SET status = #{to}, updated_at = NOW(3), version = version + 1
-WHERE order_sub_no = #{subNo} AND status = #{from};
+UPDATE trade.order_sub
+SET status = :to, updated_at = now(), version = version + 1
+WHERE order_sub_no = :sub_no AND status = :from;
 ```
 
-**三重保护**：`selectForUpdate`（行锁）→ 状态机查表（业务校验）→ `WHERE status = from`（CAS）。任一层失效，其他层仍能拦住。
+**三重保护**：`SELECT ... FOR UPDATE`（行锁）→ 状态机查表（业务校验）→ `WHERE status = :from`（CAS）。任一层失效，其他层仍能拦住。
+
+> 事务边界由路由层统一管理：每个写接口通过依赖 `get_session()` 拿到会话，在 `async with session.begin():` 内调用 service，service 函数本身不 `commit`。这样多个 service 调用能组合在同一事务里。
 
 ### 4.5 状态流水表
 
 ```sql
-CREATE TABLE `order_state_flow` (
-  `id`            BIGINT      NOT NULL AUTO_INCREMENT,
-  `order_type`    TINYINT     NOT NULL COMMENT '1母单 2子单 3退款单',
-  `order_no`      VARCHAR(32) NOT NULL,
-  `from_status`   INT         NOT NULL,
-  `to_status`     INT         NOT NULL,
-  `event`         VARCHAR(32) NOT NULL,
-  `operator_type` TINYINT     NOT NULL COMMENT '1用户 2商家 3系统 4平台客服',
-  `operator_id`   VARCHAR(64) DEFAULT NULL,
-  `remark`        VARCHAR(255) DEFAULT NULL,
-  `extra`         JSON        DEFAULT NULL COMMENT '上下文快照',
-  `created_at`    DATETIME(3) NOT NULL,
-  PRIMARY KEY (`id`),
-  KEY `idx_order` (`order_no`, `created_at`)
-) ENGINE=InnoDB COMMENT='订单状态流转流水（审计）';
+CREATE TABLE trade.order_state_flow (
+  id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_type    SMALLINT    NOT NULL,      -- 1母单 2子单 3售后单
+  order_no      VARCHAR(32) NOT NULL,
+  from_status   SMALLINT    NOT NULL,
+  to_status     SMALLINT    NOT NULL,
+  event         VARCHAR(32) NOT NULL,
+  operator_type SMALLINT    NOT NULL,      -- 1用户 2商家 3系统 4平台客服
+  operator_id   VARCHAR(64),
+  remark        VARCHAR(255),
+  extra         JSONB,                     -- 上下文快照
+  created_at    TIMESTAMPTZ(3) NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_state_flow_order ON trade.order_state_flow (order_no, created_at);
+COMMENT ON TABLE trade.order_state_flow IS '订单状态流转流水（审计）';
 ```
 
-**这张表是不可变的审计日志**。纠纷时可以直接还原订单的完整生命历史。
+**这张表是不可变的审计日志**。纠纷时可以直接还原订单的完整生命历史。应用使用的数据库账号对这张表只授予 `INSERT, SELECT` 权限（见 [16](16-deployment.md) §4），从权限层面保证不可改。
 
 ## 5. 母单状态的聚合
 
 母单状态由子单聚合得出，规则：
 
-```java
-SubOrderStatus aggregate(List<OrderSub> subs) {
-    Set<SubOrderStatus> statuses = subs.stream().map(OrderSub::getStatus).collect(toSet());
+```python
+def aggregate(statuses: set[SubOrderStatus]) -> SubOrderStatus:
+    if len(statuses) == 1:
+        return next(iter(statuses))          # 全部同状态（含全完成/全关闭/全退款）
 
-    if (statuses.size() == 1) return statuses.iterator().next();   // 全部同状态
-
-    // 全部终态且都已完成
-    if (statuses.stream().allMatch(s -> s == FINISHED)) return FINISHED;
-    // 全部已关闭
-    if (statuses.stream().allMatch(s -> s == CLOSED))   return CLOSED;
-    // 全部已退款
-    if (statuses.stream().allMatch(s -> s == REFUNDED)) return REFUNDED;
-
-    // 混合情况：按"最落后"的状态展示（用户视角：还有事情没做完）
-    if (statuses.contains(WAIT_PAY))     return WAIT_PAY;
-    if (statuses.contains(WAIT_DELIVER)) return WAIT_DELIVER;
-    if (statuses.contains(WAIT_RECEIVE)) return WAIT_RECEIVE;
-    if (statuses.contains(REFUNDING))    return REFUNDING;
-    if (statuses.contains(FINISHED))     return FINISHED;   // 部分完成部分关闭
-
-    return CLOSED;
-}
+    # 混合情况：按"最落后"的状态展示（用户视角：还有事情没做完）
+    for s in (S.WAIT_PAY, S.WAIT_DELIVER, S.WAIT_RECEIVE, S.REFUNDING, S.FINISHED):
+        if s in statuses:
+            return s                          # FINISHED 对应"部分完成、其余关闭/已退款"
+    # 只剩 CLOSED 与 REFUNDED 的组合
+    return S.REFUNDED if S.REFUNDED in statuses else S.CLOSED
 ```
 
 **"部分退款"的展示**：子单 A 已退款、子单 B 待收货时，母单显示"待收货"，并在订单卡片上标注"1 件商品已退款"。这是**展示层的组合**，不改变母单的单一状态字段。
@@ -477,23 +518,24 @@ SubOrderStatus aggregate(List<OrderSub> subs) {
 | pay_status | 含义 |
 |---|---|
 | 0 | 未支付 |
-| 1 | 已支付（含部分退款） |
-| 2 | 全部退款 |
+| 1 | 已支付 |
+| 2 | 部分退款 |
+| 3 | 全额退款 |
 
 ## 6. 订单号设计
 
 ```
-母单号：M + yyyyMMdd + 分片号(2位) + 雪花后8位 + 校验位(1位)
-        M 20260930 03 84719263 7
-        总长 1+8+2+8+1 = 20 位
+母单号：M + yyyyMMdd + 雪花 ID 后 10 位 + 校验位(1位)
+        M 20260930 3847192637 7
+        总长 1+8+10+1 = 20 位
 
 子单号：母单号 + "-" + 序号
-        M2026093003847192637-1
+        M2026093038471926377-1
 ```
 
-**为什么带分片号**：排查问题时，从订单号就能知道数据在哪个库哪张表，不用查路由表。
+**日期前缀**：排查问题时从订单号就能知道下单日期，按时间分区或归档时可以直接路由。原方案中的"分片号"位因为第一期不分库分表而去掉；若日后分片，可在日期后插入 2 位分片号，号段长度预留到 32 位（字段为 `VARCHAR(32)`）。
 
-**校验位**：防止用户手输错订单号查出别人的订单（配合手机号后四位二次验证）。
+**校验位**：Luhn 算法，防止用户手输错订单号查出别人的订单（配合登录态校验归属）。
 
 **不能用自增 ID 暴露给前端**：自增 ID 会泄露业务量（竞争对手下两单就能估算日单量）。用雪花或带日期的自定义号。
 
@@ -501,124 +543,117 @@ SubOrderStatus aggregate(List<OrderSub> subs) {
 
 **双重机制**：
 
-### 7.1 延迟消息（主）
+### 7.1 ARQ 延迟任务（主）
 
-```java
-// 下单时
-rocketMQTemplate.syncSendDelay(
-    "order-timeout-topic",
-    MessageBuilder.withPayload(new OrderTimeoutMsg(mainOrderNo, payDeadline)).build(),
-    5,                                    // 等级 5 = 30 分钟（RocketMQ 固定等级）
-    TimeUnit.MINUTES);
+```python
+# 下单事务提交之后投递（事务内投递会导致"事务回滚了任务还在"）
+await arq_pool.enqueue_job(
+    "close_order_if_unpaid",
+    order_main_no,
+    _job_id=f"close:{order_main_no}",        # ★ 同一订单只会有一个任务（ARQ 按 job_id 去重）
+    _defer_until=pay_deadline,               # 到期时间执行
+)
 ```
 
-消费端：
+Worker 中的任务：
 
-```java
-@RocketMQMessageListener(topic = "order-timeout-topic")
-public void onMessage(OrderTimeoutMsg msg) {
-    // ★ 幂等 + 状态检查：只有还是"待付款"才关闭
-    orderTimeoutService.closeIfUnpaid(msg.mainOrderNo());
-}
+```python
+# app/worker/tasks.py
+async def close_order_if_unpaid(ctx: dict, order_main_no: str) -> None:
+    async with ctx["session_factory"]() as session, session.begin():
+        # ★ 幂等 + 状态检查：只有还是"待付款"才关闭
+        await order_service.close_order(session, order_main_no, CloseReason.TIMEOUT)
 ```
 
 ```sql
 -- 关闭（CAS，天然幂等）
-UPDATE order_main SET status = 50, close_time = NOW(3)
-WHERE order_main_no = ? AND status = 10;
--- rows = 0 → 说明已支付或已关闭，直接返回（这就是幂等）
+UPDATE trade.order_main SET status = 50, close_time = now(), updated_at = now()
+WHERE order_main_no = :no AND status = 10;
+-- rowcount = 0 → 说明已支付或已关闭，直接返回（这就是幂等）
 ```
 
 ### 7.2 定时扫描（兜底）
 
-延迟消息可能丢失（MQ 重启、消费失败）。兜底扫描：
+ARQ 任务存在 Redis 中，Redis 数据丢失或 worker 长时间宕机都可能导致任务丢失。兜底扫描：
 
-```java
-@Scheduled(cron = "0 */2 * * * ?")   // 每 2 分钟
-public void scanTimeoutOrders() {
-    // 用 idx_pay_deadline 索引，每次扫 500 条
-    List<String> overdue = mainMapper.selectOverdue(
-        SubOrderStatus.WAIT_PAY.code(), now(), 500);
+```python
+# ARQ cron：每 2 分钟
+async def scan_timeout_orders(ctx: dict) -> None:
+    async with ctx["session_factory"]() as session:
+        # 命中部分索引 idx_order_main_pay_deadline，每次扫 500 条
+        overdue = (await session.scalars(
+            select(OrderMain.order_main_no)
+            .where(OrderMain.status == 10, OrderMain.pay_deadline < func.now())
+            .order_by(OrderMain.pay_deadline)
+            .limit(500)
+        )).all()
 
-    for (String mainNo : overdue) {
-        try {
-            orderTimeoutService.closeIfUnpaid(mainNo);   // 同一个幂等方法
-        } catch (Exception e) {
-            log.error("超时关单失败: {}", mainNo, e);
-        }
-    }
-}
+    for no in overdue:
+        try:
+            async with ctx["session_factory"]() as session, session.begin():
+                await order_service.close_order(session, no, CloseReason.TIMEOUT)  # 同一个幂等函数
+        except Exception:
+            logger.exception("超时关单失败", order_main_no=no)
+
+# WorkerSettings.cron_jobs = [cron(scan_timeout_orders, minute=set(range(0, 60, 2)), unique=True)]
 ```
 
-**两个路径调用同一个幂等方法**，所以重复执行无副作用。这是"幂等设计让容错变简单"的典型例子。
+**两个路径调用同一个幂等函数**，所以重复执行无副作用。这是"幂等设计让容错变简单"的典型例子。
 
 ### 7.3 关单的完整动作
 
-```java
-@Transactional
-public void closeOrder(String mainOrderNo, CloseReason reason) {
-    // ① CAS 关母单
-    if (mainMapper.close(mainOrderNo, reason) == 0) return;   // 已被处理
+模块化单体中，大部分关单动作可以放进**同一个本地事务**，只有 Redis 侧的回补和通知需要异步：
 
-    // ② 关闭所有子单
-    List<OrderSub> subs = subMapper.listByMain(mainOrderNo);
-    for (OrderSub sub : subs) {
-        subService.transit(sub.getOrderSubNo(), TIMEOUT_CANCEL, ctx);
-    }
+```python
+async def close_order(session: AsyncSession, order_main_no: str, reason: CloseReason) -> None:
+    # ① CAS 关母单
+    main = await order_repo.close_main_if_unpaid(session, order_main_no, reason)
+    if main is None:
+        return                                                    # 已被处理
 
-    // ③ 释放库存（幂等，bizKey = "CANCEL:" + mainOrderNo）
-    inventoryClient.release(mainOrderNo, buildReleaseItems(subs));
+    # ② 关闭所有子单（走统一状态机入口）
+    subs = await order_repo.list_subs(session, order_main_no)
+    event = OrderEvent.TIMEOUT_CANCEL if reason is CloseReason.TIMEOUT else OrderEvent.USER_CANCEL
+    for sub in subs:
+        await transit(session, sub.order_sub_no, event, TransitContext.system())
 
-    // ④ 退回优惠券（幂等）
-    couponClient.unlock(mainOrderNo);
+    # ③ 释放 DB 库存预占（同一事务，biz_key 幂等）
+    await inventory_service.release(session, build_release_items(subs), biz_key=f"CANCEL:{order_main_no}")
 
-    // ⑤ 退回积分（幂等）
-    pointsClient.refund(mainOrderNo, main.getPointUsed());
+    # ④ 解锁优惠券、⑤ 退回积分（同一事务，条件更新天然幂等）
+    await coupon_service.unlock_by_order(session, order_main_no)
+    await points_service.refund_frozen(session, main.user_id, order_main_no, main.point_used)
 
-    // ⑥ 归还运费券
-    freightCouponClient.unlock(mainOrderNo);
-
-    // ⑦ 发通知
-    notifyService.sendOrderClosed(main.getUserId(), mainOrderNo);
-}
+    # ⑥ 需要异步的副作用写 outbox：Redis 库存回补、站内信通知
+    await outbox.add(session, topic="inventory.redis_release", biz_key=f"CANCEL:{order_main_no}",
+                     payload={"orderMainNo": order_main_no})
+    await outbox.add(session, topic="notify.order_closed", biz_key=f"CLOSED:{order_main_no}",
+                     payload={"userId": main.user_id, "orderMainNo": order_main_no})
 ```
 
-**第 ③~⑥ 步都可能失败**（下游服务不可用）。必须**独立重试 + 幂等**，不能因为库存释放失败就让整个关单回滚——订单必须关掉（否则用户一直能看到待付款订单）。
+**为什么 Redis 回补不放事务里**：Redis 操作无法随 PG 事务回滚。如果先回补 Redis 再提交事务，事务失败时 Redis 已经多出库存（超卖风险）。写 outbox 能保证"事务提交 ⇔ 回补消息存在"，由投递任务异步执行，失败重试，Lua 脚本按 `biz_key` 幂等（见 [14](14-redis-keys.md)）。
 
-```java
-// 用本地消息表保证最终一致
-@Transactional
-public void closeOrder(...) {
-    // ... ① ② ③(写本地消息，不发实际调用)
-    localMessageMapper.insert(new LocalMessage("RELEASE_STOCK", mainOrderNo, payload));
-    localMessageMapper.insert(new LocalMessage("UNLOCK_COUPON", mainOrderNo, payload));
-    localMessageMapper.insert(new LocalMessage("REFUND_POINT",  mainOrderNo, payload));
-}
-
-// 独立的重试任务
-@Scheduled(fixedDelay = 5000)
-public void retryLocalMessages() {
-    // 捞取未发送的消息，发送到 MQ
-    // 消费端幂等：bizKey 保证重复消费无副作用
-}
-```
+本地消息表（outbox）的结构与投递机制见 [13 §4](13-schema.md)。
 
 ## 8. 自动确认收货
 
-```java
-@Scheduled(cron = "0 0/10 * * * ?")
-public void autoReceive() {
-    // 发货后 15 天自动确认（用 idx_auto_finish 索引）
-    List<OrderSub> list = subMapper.selectAutoFinish(
-        SubOrderStatus.WAIT_RECEIVE.code(), now(), 500);
+```python
+# ARQ cron：每 10 分钟
+async def auto_receive(ctx: dict) -> None:
+    async with ctx["session_factory"]() as session:
+        # 发货后 15 天自动确认（命中部分索引 idx_order_sub_auto_finish）
+        due = (await session.scalars(
+            select(OrderSub.order_sub_no)
+            .where(OrderSub.status == 30, OrderSub.auto_finish_time < func.now())
+            .limit(500)
+        )).all()
 
-    for (OrderSub sub : list) {
-        subService.transit(sub.getOrderSubNo(), AUTO_RECEIVE, SystemContext.auto());
-    }
-}
+    for no in due:
+        async with ctx["session_factory"]() as session, session.begin():
+            await transit(session, no, OrderEvent.AUTO_RECEIVE, TransitContext.system())
 ```
 
-**自动收货后的副作用**（全部幂等）：
+**自动收货后的副作用**（通过 outbox 事件触发，全部幂等）：
 - 触发结算（`settlement`）：货款解冻，进入可提现余额
 - 开启售后窗口（签收后 7 天）
 - 开启评价入口
@@ -638,11 +673,11 @@ public void autoReceive() {
 
 ```
 1. 校验子单状态 ∈ {待发货}
-2. 校验新地址是否在配送范围（运费服务）
+2. 校验新地址是否在配送范围（freight 模块）
 3. 重算运费
    - 运费不变 → 直接更新
-   - 运费变高 → 提示用户需补差价（生成补款单）或拒绝
-   - 运费变低 → 直接更新并退差价（罕见）
+   - 运费变高 → 第一期直接拒绝，提示"新地址运费更高，请取消后重新下单"
+   - 运费变低 → 直接更新，差价不退（第一期简化）
 4. 更新收货快照 + 记录状态流水
 ```
 
@@ -650,30 +685,18 @@ public void autoReceive() {
 
 ## 10. 订单查询的多维度问题
 
+第一期单库，所有维度都直接走 PG 索引：
+
 | 查询方 | 维度 | 方案 |
 |---|---|---|
-| 用户 | `user_id` | 分片键，直接路由 |
-| 商家 | `shop_id` | **ES 异构索引**（因为分片键是 user_id） |
-| 平台运营 | 任意维度 | ES + 数仓 |
-| 客服 | 订单号 | 订单号含分片号，直接路由 |
+| 用户 | `user_id` | `idx_order_sub_user (user_id, status, create_time DESC)` |
+| 商家 | `shop_id` | `idx_order_sub_shop (shop_id, status, create_time DESC)` |
+| 平台运营 | 任意维度 | 后台报表查询；数据量大后加只读从库或导出到分析库 |
+| 客服 | 订单号 | 唯一索引直接定位 |
 
-**ES 索引结构**：
+**分页**：订单列表用**游标分页**（`WHERE (create_time, id) < (:last_time, :last_id) ORDER BY create_time DESC, id DESC LIMIT 20`），避免深分页 `OFFSET` 越翻越慢。
 
-```json
-{
-  "orderMainNo": "M2026093003847192637",
-  "orderSubNo": "M2026093003847192637-1",
-  "userId": 88001,
-  "shopId": 100,
-  "status": 20,
-  "payableAmount": 20000,
-  "payTime": "2026-09-30T17:00:00.000Z",
-  "items": [{"skuId": 1001, "spuTitle": "iPhone 16 Pro", "num": 1}],
-  "receiverPhone": "138****8888"
-}
-```
-
-**同步方式**：订单状态变更时发 MQ 消息，消费者写入 ES。使用 `_version` 或 `orderSubNo + updated_at` 做乐观并发控制，防止乱序覆盖。
+**收货手机号查询**（客服场景）：手机号脱敏存储，按 `phone_hash` 精确匹配，见 [13 §2](13-schema.md)。
 
 ## 11. 边界场景清单
 
@@ -681,42 +704,43 @@ public void autoReceive() {
 |---|---|
 | 母单只有 1 个子单 | 仍然创建母子单（统一模型，避免两套逻辑）。展示层直接展开子单内容 |
 | 支付时某个子单的商品下架 | 不影响，已下单订单读快照 |
-| 用户只对子单 A 申请退款，子单 B 正常 | 子单独立处理，母单 `pay_status` 变更为"部分退款" |
-| 所有子单都退款了 | 母单 `pay_status = 2`，`status = 70` |
-| 商家超时未发货（承诺 48h） | 定时任务告警 + 自动赔付（可选策略） |
+| 用户只对子单 A 申请退款，子单 B 正常 | 子单独立处理，母单 `pay_status` 变更为 2（部分退款） |
+| 所有子单都退款了 | 母单 `pay_status = 3`，`status = 70` |
+| 商家超时未发货（承诺 48h） | 定时任务生成站内信提醒 + 运营后台告警列表 |
 | 用户取消订单时已发货 | 拒绝，提示"已发货，请申请退货退款" |
 | 同一母单下某子单退款导致母单金额变小 | 母单 `payable_amount` **不变**（它是历史事实），只有 `refunded_amount` 累加 |
-| 关单时库存释放失败 | 本地消息重试，最终一致。用户看到订单已关闭 |
+| 关单时 Redis 回补失败 | outbox 重试，最终一致。用户看到订单已关闭 |
 | 用户支付后立刻申请退款（未发货） | 允许，走"仅退款"流程，全额退子单金额 |
-| 订单已完成后 8 天申请售后 | 拒绝，超过 7 天窗口（`can_aftersale = 0`） |
+| 订单已完成后 8 天申请售后 | 拒绝，超过 7 天窗口（`can_aftersale = false`） |
 
 ## 12. 订单状态与售后的耦合
 
-**`order_sub.status` 与退款单状态是两套状态机**，通过规则关联：
+**`order_sub.status` 与售后单状态是两套状态机**，通过规则关联（售后单状态码见 [08 §3.1](08-aftersale.md)）：
 
 ```
-order_sub.status = 60 (退款中)  ←→  refund_order.status ∈ {处理中, 待退货, 待收货}
-order_sub.status = 70 (已退款)  ←→  refund_order.status = 退款成功
-order_sub.status = 20/30/40     ←→  refund_order.status ∈ {已撤销, 商家拒绝}
+order_sub.status = 60 (退款中)  ←→  refund_order.status ∈ 处理中的状态（10/20/30/40/50/60/90）
+order_sub.status = 70 (已退款)  ←→  refund_order.status = 70 退款成功
+order_sub.status = 20/30/40     ←→  refund_order.status ∈ {11 商家拒绝, 80 已关闭, 81 用户撤销}
 ```
 
-**必须保证两者同步**。做法：退款单的状态变更**由退款服务发起，通过事件驱动子单状态变更**，而不是两处各改各的。
+**必须保证两者同步**。模块化单体中，售后单状态变更与子单状态变更**在同一个事务里完成**：aftersale 模块在更新售后单的同一事务中调用 `trade_service.transit(...)`，任何一步失败整体回滚，不存在"一边改了另一边没改"的窗口。
 
-```java
-// 退款服务
-refundService.approve(refundNo);     // 退款单 → 退款成功
-// → 发事件 RefundSucceeded
-// → 订单服务消费事件 → subService.transit(subNo, REFUND_SUCCESS, ctx)
-// → 子单状态 60 → 70
+```python
+# aftersale 模块：退款成功（由 payment 模块的退款回调触发）
+async with session.begin():
+    await refund_repo.mark_success(session, refund_no)                 # 售后单 → 70
+    await trade_service.transit(session, refund.order_sub_no,
+                                OrderEvent.REFUND_SUCCESS, ctx)         # 子单 60 → 70
 ```
 
-**异常处理**：如果退款单已成功但子单状态没更新（事件丢失），由定时对账任务修正：
+**对账兜底**：即便如此，仍保留每日对账 SQL，用来发现代码 Bug 导致的不一致：
 
 ```sql
--- 每天扫描：退款单已成功但子单还是退款中
+-- 每天扫描：售后单已成功但子单还是退款中
 SELECT r.refund_no, r.order_sub_no
-FROM refund_order r JOIN order_sub s ON r.order_sub_no = s.order_sub_no
-WHERE r.status = 30 /*成功*/ AND s.status = 60 /*退款中*/
-  AND r.finish_time < NOW() - INTERVAL 10 MINUTE;
--- → 补齐子单状态
+FROM aftersale.refund_order r
+JOIN trade.order_sub s ON r.order_sub_no = s.order_sub_no
+WHERE r.status = 70 /*退款成功*/ AND s.status = 60 /*退款中*/
+  AND r.refund_time < now() - INTERVAL '10 minutes';
+-- 必须为空；有结果则告警并人工处理
 ```

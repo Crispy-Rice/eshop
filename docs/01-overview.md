@@ -1,4 +1,4 @@
-# 01 总体架构与领域划分
+# 01 总体架构与模块划分
 
 ## 1. 业务范围
 
@@ -13,26 +13,33 @@
 **角色**：买家、商家（店铺）、平台运营、平台财务。
 **核心实体**：SPU/SKU、购物车、订单（母单/子单）、支付单、退款单、优惠券、促销活动、运费模板、库存、积分、评价。
 
-## 2. 服务划分
+**前端应用**（第一期）：
 
-按**领域边界**拆服务，不按技术分层拆。每个服务独占自己的库，跨服务只通过接口或事件通信。
+| 应用 | 使用者 | 技术 |
+|---|---|---|
+| `web-mall` 买家 PC 商城 | 买家 | Vue 3 + Vite + TS + Element Plus + Pinia |
+| `web-admin` 商家/运营后台 | 商家、平台运营、平台财务（按角色区分菜单与接口权限） | 同上 |
 
-| 服务 | 职责 | 存储 | 关键难点 |
+## 2. 模块划分
+
+采用**模块化单体**：一个 FastAPI 应用，按**领域边界**分包，不按技术分层拆。每个模块独占自己的 PostgreSQL schema，模块之间只通过**模块的 service 接口**或**领域事件**通信，禁止跨模块直接读写对方的表。这样第一期只需部署一个应用，日后按模块拆服务时边界是现成的。
+
+| 模块 | 职责 | 存储 | 关键难点 |
 |---|---|---|---|
-| **商品服务** product | SPU/SKU、类目、属性、上下架、商品搜索 | MySQL + ES | SPU/SKU 建模、规格组合生成 |
-| **库存服务** inventory | 可售库存、预占、扣减、回补、分仓 | Redis + MySQL | 防超发、排队削峰 |
-| **购物车服务** cart | 加购、选中、失效清理 | Redis + MySQL | 价格快照、失效商品提示 |
-| **营销服务** promotion | 优惠券模板、发券、核销、促销活动、算价 | MySQL + Redis | 券超发、复杂叠加、分摊 |
-| **交易服务** trade | 结算页、订单创建、拆单、状态机 | MySQL（分库分表） | 拆单、状态一致性 |
-| **运费服务** freight | 运费模板、区域、仓库、计费 | MySQL | 首重续重、冲突裁决 |
-| **支付服务** payment | 支付单、渠道对接、回调、对账 | MySQL | 回调幂等、对账补偿 |
-| **售后服务** aftersale | 退款单、退货单、逆向状态机 | MySQL | 部分退、券与积分回退 |
-| **用户服务** user | 账号、地址、积分账户 | MySQL | 积分流水 |
-| **评论服务** review | 评价、追评、图片、审核 | MySQL + ES | 购后限制、唯一性 |
-| **结算/分账** settlement | 商家账单、平台佣金、提现 | MySQL | 对账准确性 |
-| **通知服务** notify | 短信/推送/站内信 | - | 幂等、去重 |
+| **product** | SPU/SKU、类目、属性、上下架、商品搜索 | PG（`pg_trgm` 搜索） | SPU/SKU 建模、规格组合生成 |
+| **inventory** | 可售库存、预占、扣减、回补、分仓 | Redis + PG | 防超发、排队削峰 |
+| **cart** | 加购、选中、失效清理 | PG + Redis 缓存 | 价格快照、失效商品提示 |
+| **promotion** | 优惠券模板、发券、核销、促销活动、算价 | PG + Redis | 券超发、复杂叠加、分摊 |
+| **trade** | 结算页、订单创建、拆单、状态机 | PG | 拆单、状态一致性 |
+| **freight** | 运费模板、区域、仓库、计费 | PG | 首重续重、冲突裁决 |
+| **payment** | 支付单、渠道适配（第一期模拟渠道）、回调、对账 | PG | 回调幂等、对账补偿 |
+| **aftersale** | 退款单、退货单、逆向状态机 | PG | 部分退、券与积分回退 |
+| **user** | 账号、地址、积分账户、角色权限 | PG | 积分流水 |
+| **review** | 评价、追评、图片、审核 | PG | 购后限制、唯一性 |
+| **settlement** | 商家账单、平台佣金 | PG | 对账准确性 |
+| **notify** | 站内信（第一期不接短信） | PG | 幂等、去重 |
 
-**服务依赖方向**（禁止反向依赖）：
+**模块依赖方向**（禁止反向依赖，用 `import-linter` 在 CI 中检查）：
 
 ```
 trade ─┬─> inventory
@@ -48,21 +55,53 @@ aftersale ─┬─> trade
            └─> user(积分)
 ```
 
+反向通知（如 payment 成功后 trade 改状态以外的副作用、inventory 回补后通知 product 刷新缓存）一律走领域事件。
+
+### 2.1 后端代码结构
+
+```
+backend/
+├── app/
+│   ├── main.py                # FastAPI 实例、中间件、路由注册
+│   ├── core/                  # 配置、数据库会话、Redis、雪花 ID、异常、鉴权
+│   │   ├── config.py          # pydantic-settings，读环境变量
+│   │   ├── db.py              # async engine / AsyncSession 工厂
+│   │   ├── redis.py           # redis.asyncio 连接池 + Lua 脚本注册
+│   │   ├── idempotency.py     # Idempotency-Key 依赖
+│   │   └── outbox.py          # 本地消息表写入与投递
+│   ├── modules/
+│   │   ├── product/
+│   │   │   ├── models.py      # SQLAlchemy ORM 模型
+│   │   │   ├── schemas.py     # Pydantic 请求/响应模型
+│   │   │   ├── repository.py  # 数据访问
+│   │   │   ├── service.py     # 领域逻辑（对其他模块暴露的唯一入口）
+│   │   │   └── router.py      # HTTP 路由
+│   │   ├── inventory/ ...
+│   │   └── trade/ ...
+│   └── worker/
+│       ├── main.py            # ARQ WorkerSettings：延迟任务 + cron
+│       └── consumers.py       # Redis Streams 消费组
+├── migrations/                # Alembic
+├── lua/                       # Redis Lua 脚本
+└── tests/
+```
+
 ## 3. 分层与技术选型
 
 ```
-接入层   Nginx / API 网关（Spring Cloud Gateway）
-          ├─ 鉴权（JWT）
-          ├─ 限流（令牌桶 + 热点参数限流）
-          ├─ 幂等键拦截器（Idempotency-Key 请求头）
-          └─ 灰度路由
-应用层   业务服务（Spring Boot 3 / Java 21）
-领域层   聚合根 + 领域事件（订单、库存、券都是聚合根）
-基础设施  MyBatis-Plus、Redis、RocketMQ、ES、Seata（仅少量场景）
+接入层   Nginx（静态资源、反向代理、连接数/请求速率限制）
+应用层   FastAPI + Uvicorn（多 worker）
+          ├─ 鉴权（JWT，依赖注入 get_current_user）
+          ├─ 限流（Redis 令牌桶，按用户/IP/接口）
+          ├─ 幂等（Idempotency-Key 请求头依赖）
+          └─ 统一异常 → 错误码响应
+领域层   modules/*/service.py（订单、库存、券是聚合根）
+基础设施  SQLAlchemy 2.0 async + asyncpg、redis-py asyncio、ARQ、Redis Streams
 ```
 
-- **不需要 Seata AT 全场覆盖**。绝大多数跨服务操作设计成"本地事务 + 事件 + 补偿"，只有"创建订单同时预占库存"这类需要立即反馈的场景，用本地消息表 + 库存服务的幂等预占接口实现最终一致。
-- **读写分离**：订单、库存读走从库，但**下单前的库存校验与扣减必须走主库或 Redis**，不能读从库（延迟会导致超卖）。
+- **不需要分布式事务**。因为所有模块在同一个 PG 库，"创建订单 + DB 库存预占 + 锁券 + 写 outbox 消息"可以放在**一个本地事务**里。Redis 侧的预扣在事务前执行，事务失败则按幂等键补偿回滚。
+- **读写分离（二期）**：第一期单实例 PG。上主从后，订单列表等读接口可走从库，但**下单前的库存校验与扣减必须走主库或 Redis**，不能读从库（复制延迟会导致超卖）。
+- **async 纪律**：路由与 service 全部 `async def`，禁止在事件循环里调用阻塞 IO（`requests`、同步 `redis`、`time.sleep`）。CPU 密集的算价逻辑是纯内存计算，耗时在毫秒级，可直接执行。
 
 ## 4. 一致性策略总纲
 
@@ -70,28 +109,30 @@ aftersale ─┬─> trade
 
 | 层 | 手段 | 作用 |
 |---|---|---|
-| 拦截层 | Redis Lua 原子脚本 | 挡住 99% 的无效请求，返回"已售罄" |
-| 兜底层 | MySQL 条件更新 + 唯一索引 | 保证绝对不超发，即使 Redis 异常 |
-| 修正层 | 定时对账任务 | 修正 Redis 与 DB 的漂移 |
+| 拦截层 | Redis Lua 原子脚本 | 挡住绝大多数无效请求，返回"已售罄" |
+| 兜底层 | PG 条件更新 + `CHECK` 约束 + 唯一索引 | 保证绝对不超发，即使 Redis 异常 |
+| 修正层 | 定时对账任务（ARQ cron） | 修正 Redis 与 DB 的漂移 |
 
 ### 4.2 库存超卖的三重保证
 
 ```sql
--- DB 侧：条件更新即乐观锁，RowsAffected=0 就是扣减失败
-UPDATE sku_stock
-SET available = available - #{num}, version = version + 1
-WHERE sku_id = #{skuId} AND warehouse_id = #{whId} AND available >= #{num};
+-- DB 侧：条件更新即乐观锁，rowcount = 0 就是扣减失败
+UPDATE inventory.sku_stock
+SET available = available - :num, version = version + 1
+WHERE sku_id = :sku_id AND warehouse_id = :wh_id AND available >= :num;
 ```
 
-Redis 侧对应 `Lua` 脚本（见 [14-redis-keys](14-redis-keys.md)）。**两者都必须做**，因为：
-- 只有 Redis：Redis 宕机/主从切换丢数据 → 超卖。
+再加一道表级约束 `CHECK (available >= 0 AND locked >= 0 AND frozen >= 0)`，任何代码 Bug 导致负库存都会让事务直接失败。
+
+Redis 侧对应 Lua 脚本（见 [14-redis-keys](14-redis-keys.md)）。**两者都必须做**，因为：
+- 只有 Redis：Redis 宕机或 AOF 丢最后一秒写入 → 超卖。
 - 只有 DB：热点 SKU 单行锁打满，QPS 上不去。
 
 ### 4.3 幂等的三层保证
 
-1. **网关/接口层**：`Idempotency-Key` + Redis `SETNX`，5 分钟窗口。
+1. **接口层**：`Idempotency-Key` + Redis `SET NX`，5 分钟窗口。
 2. **业务层**：状态机前置守卫（`status = 待支付` 才允许支付）。
-3. **存储层**：唯一索引（`uk_order_no`、`uk_out_trade_no`、`uk_user_sku_review`）。
+3. **存储层**：唯一索引（`uk_order_no`、`uk_out_trade_no`、`uk_user_sku_review`），配合 `INSERT ... ON CONFLICT DO NOTHING`。
 
 任何"写"接口必须至少有一层，资金类接口三层齐全。
 
@@ -99,33 +140,35 @@ Redis 侧对应 `Lua` 脚本（见 [14-redis-keys](14-redis-keys.md)）。**两�
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户端
-    participant G as 网关
-    participant T as 交易服务
-    participant P as 营销服务
-    participant F as 运费服务
-    participant I as 库存服务
-    participant MQ as RocketMQ
-    participant Pay as 支付服务
+    participant U as 浏览器
+    participant N as Nginx
+    participant T as trade 模块
+    participant P as promotion 模块
+    participant F as freight 模块
+    participant I as inventory 模块
+    participant R as Redis
+    participant DB as PostgreSQL
+    participant W as Worker(ARQ)
 
-    U->>G: 提交订单(带 priceToken + Idempotency-Key)
-    G->>T: 校验幂等键，透传
-    T->>T: 幂等键查重，命中直接返回上次结果
-    T->>P: 校验券可用性 + 锁定券
+    U->>N: 提交订单(带 priceToken + Idempotency-Key)
+    N->>T: 反向代理
+    T->>R: 幂等键查重，命中直接返回上次结果
+    T->>P: 校验券可用性
     T->>F: 计算运费（按仓库/店铺分组）
     T->>T: 后端重算全单金额，与前端比对
     alt 金额不一致
         T-->>U: 409 PRICE_CHANGED（返回明细差异）
     end
-    T->>T: 本地事务：写母单 + 子单 + 订单项
-    T->>I: 批量预占库存（幂等，按 skuId 排序防死锁）
-    alt 预占失败
-        T->>T: 标记订单为"创建失败"，返回缺货明细
+    T->>I: Redis Lua 预扣库存（幂等，按 skuId 排序）
+    alt 预扣失败
+        T-->>U: 返回缺货明细
     end
-    T->>P: 核销券 + 扣减券码状态（异步，失败由对账补偿）
-    T->>MQ: 发送延迟消息（30min 未支付则关闭）
+    T->>DB: 本地事务：写母单+子单+订单项 / DB 库存预占 / 锁券 / 写 outbox
+    alt 事务失败
+        T->>I: 按 requestId 回补 Redis 预扣
+    end
+    T->>W: 投递延迟任务（30min 未支付则关闭）
     T-->>U: 订单创建成功，跳转支付
-    U->>Pay: 发起支付
 ```
 
 ## 6. 关键字段透传：priceToken
@@ -148,58 +191,66 @@ priceToken = Base64(
 
 详见 [11-价格一致性](11-price-consistency.md)。
 
-## 7. 大促流量治理
+## 7. 流量治理
+
+第一期部署在单台（或两台）CVM 上，容量目标比原方案小一个数量级，但治理手段保持一致，便于后续扩容。
 
 | 手段 | 说明 |
 |---|---|
-| CDN + 静态化 | 商品详情页静态化到 CDN，只有价格/库存走动态接口 |
-| 前端限流 | 按钮点击后立即置灰 3s，倒计时结束才可再点（第一道防连点） |
-| 网关限流 | 用户维度 10 QPS、IP 维度 50 QPS、接口维度全局阈值 |
-| 排队令牌 | 秒杀/抢券走令牌桶排队，拿到令牌才进入下单逻辑（[03](03-inventory.md)） |
-| 库存分片 | 单 SKU 库存拆成 N 份，散列到不同 Redis 分片，降低单 key 热点 |
-| 异步化 | 下单后的非关键路径（发券通知、积分、日志）全部走 MQ |
-| 降级开关 | Redis 异常 → 关闭排队直接 DB 扣减（限流后）；DB 压力过大 → 关闭库存实时查询，展示"先到先得" |
+| 静态资源 | 前端构建产物由 Nginx 直接提供，设置长缓存（文件名带 hash）；二期接 CDN |
+| 前端防连点 | 按钮点击后立即置灰，请求结束再恢复（第一道防连点） |
+| Nginx 限流 | `limit_req` 按 IP 限速，`limit_conn` 限连接数 |
+| 应用限流 | Redis 令牌桶：用户维度 10 QPS、接口维度全局阈值 |
+| 排队令牌 | 秒杀/抢券走 Redis 队列排队，拿到令牌才进入下单逻辑（[03](03-inventory.md)） |
+| 库存分片 | 单 SKU 库存拆成 N 份 key，降低单 key 热点与 Lua 冲突 |
+| 异步化 | 下单后的非关键路径（通知、积分、统计）全部走 outbox → Redis Streams |
+| 降级开关 | 配置在 Redis 的 `switch:*` 键，运行时可切换（见 §10） |
 
-## 8. 数据分片规划
+## 8. 数据规模与分区规划
 
-| 表 | 分片键 | 预估量级 | 策略 |
-|---|---|---|---|
-| `order_main` / `order_sub` | `user_id` | 亿级 | 按 user_id 取模 64 库 × 16 表 |
-| `order_item` | `order_sub_no`（同子单同库） | 十亿级 | 随子单 |
-| `payment` | `order_main_no` | 亿级 | 随母单 |
-| `refund_order` | `user_id` | 亿级 | 随母单 |
-| `stock_flow` | `sku_id` + 月分区 | 百亿级 | 按时间月分区，归档到冷存储 |
-| `coupon_code` | `coupon_template_id` | 十亿级 | 按模板分片 |
-| `review` | `spu_id` | 亿级 | 按 spu_id 分片 |
+第一期**不分库分表**。PostgreSQL 单表在合理索引下支撑千万到亿级行没有问题，等真正遇到瓶颈再按 `user_id` 引入分片（Citus 或应用层路由）。为将来分片保留的约定：
 
-**跨分片查询**：商家后台必须能按 `shop_id` 查订单（和 `user_id` 分片键冲突）→ 引入 **ES 异构索引**，订单变更时同步写入 ES，商家查询走 ES 拿 `order_no` 再回表。
+- 订单、支付、售后表都带 `user_id` 字段，查询尽量带上它；
+- 订单号内含时间位，可按时间路由。
+
+大流水表用 **PG 声明式分区**（按月）控制单表体积，过期分区直接 `DETACH` + `DROP`：
+
+| 表 | 分区方式 | 在线保留 |
+|---|---|---|
+| `inventory.stock_flow` | `created_at` 按月 RANGE 分区 | 6 个月 |
+| `user.points_flow` | `created_at` 按月 RANGE 分区 | 2 年 |
+| `payment.pay_notify_log` | `created_at` 按月 RANGE 分区 | 3 个月 |
+
+**商家按店铺查订单**：单库下直接走 `order_sub (shop_id, status, created_at)` 索引，不需要原方案的 ES 异构索引。
 
 ## 9. 部署与容量
 
-- 无状态服务：K8s 部署，HPA 按 CPU + QPS 弹性伸缩。
-- Redis：Cluster 模式，6 主 6 从；库存 key 与券 key 单独放在同一集群的不同分片组，避免互相影响。
-- MySQL：一主两从，主库只写；大促前预热连接池。
-- MQ：至少 3 副本，延迟消息用独立的 topic。
+部署细节见 [16-deployment](16-deployment.md)。概要：
+
+- 一台腾讯云 CVM（建议 4 核 8G 起，SSD 云硬盘），Docker Compose 运行 `nginx`、`api`、`worker`、`postgres`、`redis` 五个容器。
+- `api` 无状态，可通过 `docker compose up --scale api=N` 水平扩展；`worker` 中 ARQ cron 任务需保证单实例或使用 ARQ 的任务唯一性。
+- PostgreSQL、Redis 数据挂载到宿主机目录（云硬盘），每日 `pg_dump` 备份到另一块盘，并定期做云硬盘快照。
+- Redis 开启 AOF（`appendfsync everysec`），重启后数据可恢复；即使丢失最后一秒，DB 对账会重建库存。
 
 ## 10. 容灾与降级矩阵
 
 | 故障 | 影响 | 降级策略 |
 |---|---|---|
-| Redis 集群不可用 | 无法下单/领券 | 排队降级为 DB 直接扣减（限流到 1/10 流量），非核心接口直接返回缓存 |
-| 库存服务不可用 | 无法下单 | 订单进入"待确认库存"状态，先落单，异步补占；超时未占成功则自动取消 |
-| 营销服务不可用 | 无法用券 | 允许"不使用优惠券"下单，结算页提示"优惠暂时不可用" |
-| 支付网关不可用 | 无法支付 | 展示"支付维护中"，已下单订单延长超时时间 |
-| MQ 不可用 | 异步链路中断 | 本地消息表落库，MQ 恢复后补偿投递 |
-| 对账服务故障 | 账目可能有偏差 | 对账任务可重跑（幂等），不影响线上交易 |
+| Redis 不可用 | 无法走库存闸门/领券/幂等 | 下单降级为 DB 条件更新直扣（应用层限流到 1/10）；领券暂停；幂等降级为 DB 唯一索引 |
+| PostgreSQL 不可用 | 全站写失败 | 返回维护页；商品详情读 Redis 缓存 |
+| Worker 进程挂掉 | 超时关单/消息投递延迟 | 进程由 Docker `restart: unless-stopped` 拉起；恢复后扫描任务补齐 |
+| 营销模块异常 | 无法用券 | 允许"不使用优惠券"下单，结算页提示"优惠暂时不可用" |
+| 支付渠道不可用 | 无法支付 | 展示"支付维护中"，已下单订单延长超时时间 |
+| 对账任务失败 | 账目可能有偏差 | 对账任务可重跑（幂等），不影响线上交易 |
 
-## 11. 非功能性目标
+## 11. 非功能性目标（第一期，单台 4C8G）
 
 | 指标 | 目标 |
 |---|---|
-| 下单接口 P99 | < 300ms（Redis 路径） |
+| 下单接口 P99 | < 300ms |
 | 结算页算价 P99 | < 200ms |
-| 支付回调处理 P99 | < 100ms（异步化后） |
-| 库存超卖 | 0（硬性指标，有监控告警） |
+| 支付回调处理 P99 | < 100ms |
+| 库存超卖 | 0（硬性指标，有对账告警） |
 | 券超发 | 0（硬性指标） |
-| 支付掉单率 | < 0.01%，由对账兜底到 0 |
-| 大促峰值 | 下单 5000 QPS，领券 20000 QPS |
+| 支付掉单率 | 由对账兜底到 0 |
+| 峰值 | 下单 300 QPS，领券 2000 QPS（压测验证后再调整） |

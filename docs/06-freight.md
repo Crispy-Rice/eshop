@@ -26,64 +26,67 @@ SKU ──(多对多，带优先级)──> 运费模板
 ### 3.1 运费模板
 
 ```sql
-CREATE TABLE `freight_template` (
-  `id`            BIGINT       NOT NULL,
-  `shop_id`       BIGINT       NOT NULL,
-  `name`          VARCHAR(64)  NOT NULL COMMENT '如"默认快递模板"',
-  `charge_type`   TINYINT      NOT NULL DEFAULT 1 COMMENT '1按重量 2按件数 3按体积',
+CREATE TABLE freight.freight_template (
+  id             BIGINT       PRIMARY KEY,
+  shop_id        BIGINT       NOT NULL,
+  name           VARCHAR(64)  NOT NULL,              -- 如"默认快递模板"
+  charge_type    SMALLINT     NOT NULL DEFAULT 1,    -- 1按重量 2按件数 3按体积
   -- 首重/续重（weight 型）
-  `first_unit`    INT          NOT NULL DEFAULT 1000 COMMENT '首重（克），按件数时表示首件数',
-  `first_price`   BIGINT       NOT NULL COMMENT '首重价（分）',
-  `add_unit`      INT          NOT NULL DEFAULT 1000 COMMENT '续重单位（克）',
-  `add_price`     BIGINT       NOT NULL COMMENT '续重价（分/单位）',
+  first_unit     INT          NOT NULL DEFAULT 1000, -- 首重（克），按件数时表示首件数
+  first_price    BIGINT       NOT NULL CHECK (first_price >= 0), -- 首重价（分）
+  add_unit       INT          NOT NULL DEFAULT 1000 CHECK (add_unit > 0), -- 续重单位（克）
+  add_price      BIGINT       NOT NULL CHECK (add_price >= 0),   -- 续重价（分/单位）
   -- 组合选项
-  `free_shipping` TINYINT      NOT NULL DEFAULT 0 COMMENT '1=全场包邮',
-  `free_threshold` BIGINT      NOT NULL DEFAULT 0 COMMENT '满额包邮（分），0=不参与',
-  `free_num`      INT          NOT NULL DEFAULT 0 COMMENT '满件包邮，0=不参与',
-  `merge_type`    TINYINT      NOT NULL DEFAULT 1 COMMENT '多SKU合并方式，见§5',
-  `status`        TINYINT      NOT NULL DEFAULT 1,
-  `created_at`    DATETIME(3)  NOT NULL,
-  `updated_at`    DATETIME(3)  NOT NULL,
-  PRIMARY KEY (`id`),
-  KEY `idx_shop` (`shop_id`, `status`)
-) ENGINE=InnoDB COMMENT='运费模板';
+  free_shipping  BOOLEAN      NOT NULL DEFAULT false, -- 全场包邮
+  free_threshold BIGINT       NOT NULL DEFAULT 0,    -- 满额包邮（分），0=不参与
+  free_num       INT          NOT NULL DEFAULT 0,    -- 满件包邮，0=不参与
+  merge_type     SMALLINT     NOT NULL DEFAULT 1,    -- 多 SKU 合并方式，见 §5
+  status         SMALLINT     NOT NULL DEFAULT 1,
+  created_at     TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ(3) NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_freight_tpl_shop ON freight.freight_template (shop_id, status);
+COMMENT ON TABLE freight.freight_template IS '运费模板';
 ```
 
 ### 3.2 区域规则
 
 ```sql
-CREATE TABLE `freight_region_rule` (
-  `id`            BIGINT      NOT NULL,
-  `template_id`   BIGINT      NOT NULL,
-  `region_code`   VARCHAR(16) NOT NULL COMMENT '行政区划码，"0"=全国默认，"999999"=偏远',
-  `region_level`  TINYINT     NOT NULL COMMENT '1省 2市 3区',
-  `first_unit`    INT         NOT NULL COMMENT '★ 覆盖模板默认值，实现"不同区域不同首重"',
-  `first_price`   BIGINT      NOT NULL,
-  `add_unit`      INT         NOT NULL,
-  `add_price`     BIGINT      NOT NULL,
-  `free_shipping` TINYINT     NOT NULL DEFAULT 0,
-  `enabled`       TINYINT     NOT NULL DEFAULT 1,
-  `priority`      INT         NOT NULL DEFAULT 0 COMMENT '越大越优先（市 > 省 > 全国）',
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_tpl_region` (`template_id`, `region_code`),
-  KEY `idx_tpl` (`template_id`, `enabled`)
-) ENGINE=InnoDB COMMENT='模板-区域运费规则';
+CREATE TABLE freight.freight_region_rule (
+  id             BIGINT      PRIMARY KEY,
+  template_id    BIGINT      NOT NULL REFERENCES freight.freight_template (id),
+  region_code    VARCHAR(16) NOT NULL,     -- 行政区划码，"0"=全国默认，"999999"=偏远
+  region_level   SMALLINT    NOT NULL,     -- 1省 2市 3区
+  first_unit     INT         NOT NULL,     -- ★ 覆盖模板默认值，实现"不同区域不同首重"
+  first_price    BIGINT      NOT NULL,
+  add_unit       INT         NOT NULL CHECK (add_unit > 0),
+  add_price      BIGINT      NOT NULL,
+  free_shipping  BOOLEAN     NOT NULL DEFAULT false,
+  enabled        BOOLEAN     NOT NULL DEFAULT true,
+  priority       INT         NOT NULL DEFAULT 0, -- 越大越优先（市 > 省 > 全国）
+  CONSTRAINT uk_freight_rule_tpl_region UNIQUE (template_id, region_code)
+);
+COMMENT ON TABLE freight.freight_region_rule IS '模板-区域运费规则';
 ```
+
+唯一约束 `(template_id, region_code)` 的首列已覆盖按模板查询，不再单独建 `(template_id, enabled)` 索引。
 
 ### 3.3 SKU ↔ 模板 绑定（多对多）
 
 ```sql
-CREATE TABLE `sku_freight_bind` (
-  `id`            BIGINT      NOT NULL,
-  `sku_id`        BIGINT      NOT NULL,
-  `template_id`   BIGINT      NOT NULL,
-  `warehouse_id`  BIGINT      NOT NULL COMMENT '该绑定的适用仓库',
-  `priority`      INT         NOT NULL DEFAULT 0 COMMENT '同SKU多模板时的优先级，越大越优先',
-  `enabled`       TINYINT     NOT NULL DEFAULT 1,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_sku_tpl_wh` (`sku_id`, `template_id`, `warehouse_id`),
-  KEY `idx_sku_wh` (`sku_id`, `warehouse_id`, `enabled`, `priority`)
-) ENGINE=InnoDB COMMENT='SKU与运费模板绑定（多对多）';
+CREATE TABLE freight.sku_freight_bind (
+  id            BIGINT      PRIMARY KEY,
+  sku_id        BIGINT      NOT NULL,
+  template_id   BIGINT      NOT NULL REFERENCES freight.freight_template (id),
+  warehouse_id  BIGINT      NOT NULL,          -- 该绑定的适用仓库
+  priority      INT         NOT NULL DEFAULT 0, -- 同 SKU 多模板时的优先级，越大越优先
+  enabled       BOOLEAN     NOT NULL DEFAULT true,
+  CONSTRAINT uk_sku_freight_bind UNIQUE (sku_id, template_id, warehouse_id)
+);
+-- 只索引启用的绑定，按优先级倒序取第一条
+CREATE INDEX idx_sku_freight_active ON freight.sku_freight_bind (sku_id, warehouse_id, priority DESC)
+  WHERE enabled;
+COMMENT ON TABLE freight.sku_freight_bind IS 'SKU 与运费模板绑定（多对多）';
 ```
 
 **"每个 SKU 绑定多个运费规则"的落地**：一个 SKU 可以有 3 条绑定记录：
@@ -96,13 +99,12 @@ CREATE TABLE `sku_freight_bind` (
 ### 3.4 不发货区域
 
 ```sql
-CREATE TABLE `freight_exclude_region` (
-  `id`          BIGINT      NOT NULL,
-  `template_id` BIGINT      NOT NULL,
-  `region_code` VARCHAR(16) NOT NULL,
-  `reason`      VARCHAR(64) DEFAULT NULL COMMENT '如"暂不配送"',
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_tpl_region` (`template_id`, `region_code`)
+CREATE TABLE freight.freight_exclude_region (
+  id          BIGINT      PRIMARY KEY,
+  template_id BIGINT      NOT NULL REFERENCES freight.freight_template (id),
+  region_code VARCHAR(16) NOT NULL,
+  reason      VARCHAR(64),                 -- 如"暂不配送"
+  CONSTRAINT uk_freight_exclude_tpl_region UNIQUE (template_id, region_code)
 );
 ```
 
@@ -120,6 +122,19 @@ CREATE TABLE `freight_exclude_region` (
     overWeight  = W - F
     addUnits    = ceil(overWeight / A)          ← ★ 向上取整，不足一个单位按一个计
     freight     = P_f + addUnits * P_a
+```
+
+Python 实现中用整数向上取整，避免 `math.ceil(a / b)` 走浮点：
+
+```python
+def ceil_div(a: int, b: int) -> int:
+    """a >= 0, b > 0 时的整数向上取整。"""
+    return -(-a // b)
+
+def charge_by_weight(total_g: int, rule: RegionRule) -> int:
+    if total_g <= rule.first_unit:
+        return rule.first_price
+    return rule.first_price + ceil_div(total_g - rule.first_unit, rule.add_unit) * rule.add_price
 ```
 
 **例子**：首重 1000g / 10 元，续重 500g / 3 元。商品 200g，买 8 件 = 1600g。
@@ -156,17 +171,15 @@ freight    = 10 + 2 * 3 = 16 元
 
 两个 SKU 在**同一仓库**发货（这是前提——跨仓不算冲突，见 §6），但绑定了不同运费模板，且这两个模板的参数不一致。
 
-```java
-// 冲突判定
-boolean isConflict(Item a, Item b) {
-    return a.warehouseId.equals(b.warehouseId)
-        && !a.templateId.equals(b.templateId)
-        && (a.firstUnit != b.firstUnit
-         || a.firstPrice != b.firstPrice
-         || a.addUnit != b.addUnit
-         || a.addPrice != b.addPrice
-         || a.chargeType != b.chargeType);
-}
+```python
+def is_conflict(a: ItemFreight, b: ItemFreight) -> bool:
+    """同仓、跨模板，且计费参数不一致即为冲突。"""
+    def params(f: ItemFreight) -> tuple[int, int, int, int, int]:
+        return (f.charge_type, f.first_unit, f.first_price, f.add_unit, f.add_price)
+
+    return (a.warehouse_id == b.warehouse_id
+            and a.template_id != b.template_id
+            and params(a) != params(b))
 ```
 
 ### 5.2 裁决规则
@@ -229,54 +242,41 @@ boolean isConflict(Item a, Item b) {
 
 ### 5.5 裁决的伪代码
 
-```java
-public long calcFreight(List<OrderItem> items, String regionCode) {
-    long total = 0;
+```python
+def calc_freight(items: list[FreightItem], region_code: str, tpls: FreightTemplateCache) -> FreightResult:
+    """纯函数：模板数据由调用方预加载到 tpls，计算过程无 IO。"""
+    result = FreightResult()
 
-    // ① 按仓库分组
-    Map<Long, List<OrderItem>> byWarehouse = items.stream()
-        .collect(groupingBy(OrderItem::getWarehouseId));
+    # ① 按仓库分组（按仓库 ID 排序，保证结果确定）
+    by_warehouse: dict[int, list[FreightItem]] = defaultdict(list)
+    for it in items:
+        by_warehouse[it.warehouse_id].append(it)
 
-    for (var entry : byWarehouse.entrySet()) {
-        Long whId = entry.getKey();
-        List<OrderItem> whItems = entry.getValue();
+    for wh_id in sorted(by_warehouse):
+        # ② 每个 item 解析出生效模板（含区域规则覆盖）
+        resolved: list[ItemFreight] = []
+        for it in by_warehouse[wh_id]:
+            tpl = tpls.resolve_template(it.sku_id, wh_id)            # 按 priority 选
+            rule = tpls.resolve_region_rule(tpl.id, region_code)     # 市 > 省 > 全国
+            if rule is None or rule.excluded:
+                raise BizError(ErrorCode.NOT_DELIVERABLE,
+                               f"商品 {it.title} 不支持配送至该地区")
+            resolved.append(ItemFreight(item=it, tpl=tpl, rule=rule))
 
-        // ② 每个 item 解析出生效模板（含区域规则覆盖）
-        List<ItemFreight> resolved = new ArrayList<>();
-        for (OrderItem it : whItems) {
-            FreightTemplate tpl = resolveTemplate(it.getSkuId(), whId);   // 按 priority 选
-            RegionRule rule = resolveRegionRule(tpl.getId(), regionCode); // 市>省>全国
-            if (rule == null || rule.isExcluded()) {
-                throw new BusinessException(NOT_DELIVERABLE,
-                    "商品 " + it.getSpuTitleSnap() + " 不支持配送至该地区");
-            }
-            resolved.add(new ItemFreight(it, tpl, rule));
-        }
+        # ③ 冲突裁决：取首重最高者；平局按 sku_id 升序（取负数后求 max）
+        winner = max(resolved, key=lambda f: (f.first_unit, f.first_price, f.add_price, -f.item.sku_id))
 
-        // ③ 冲突裁决：取首重最高者
-        ItemFreight winner = resolved.stream()
-            .max(Comparator.comparing((ItemFreight f) -> f.effectiveFirstUnit())
-                           .thenComparing(f -> f.effectiveFirstPrice())
-                           .thenComparing(f -> f.effectiveAddPrice())
-                           .thenComparing(f -> -f.item.getSkuId()))   // 平局按 skuId 升序
-            .orElseThrow();
+        # ④ 包邮判定（按胜出模板的口径，统计该模板"覆盖"的金额/件数）
+        if is_free_shipping(winner, resolved):
+            result.add_package(wh_id, freight=0, winner=winner)
+            continue
 
-        // ④ 包邮判定（按胜出模板的口径，统计该模板"覆盖"的金额/件数）
-        if (isFreeShipping(winner, resolved)) {
-            continue;   // 该仓包邮，total 不加
-        }
+        # ⑤ 合并计费：只收一次首重
+        total_weight = sum(f.item.weight_g * f.item.num for f in resolved)
+        total_qty = sum(f.item.num for f in resolved)
+        result.add_package(wh_id, freight=compute_charge(winner, total_weight, total_qty), winner=winner)
 
-        // ⑤ 合并计费：只收一次首重
-        long totalWeight = resolved.stream().mapToLong(ItemFreight::weightGram).sum();
-        long totalQty    = resolved.stream().mapToLong(f -> f.item.getNum()).sum();
-        long totalAmount = resolved.stream().mapToLong(f -> f.item.getItemAmount()).sum();
-
-        long freight = computeCharge(winner, totalWeight, totalQty, totalAmount);
-        total += freight;
-    }
-
-    return total;
-}
+    return result   # result.total 为各包裹运费之和，result.packages 写入 freight_detail 快照
 ```
 
 ## 6. 跨仓:多包裹分别计费
@@ -316,10 +316,9 @@ public long calcFreight(List<OrderItem> items, String regionCode) {
 
 分摊用 [05 §6](05-promotion-engine.md) 的最大余数法，保证子单运费之和 == 母单运费。
 
-```java
-// 运费分摊到子单
-long[] subFreights = allocate(totalFreight,
-    bySubOrder.stream().mapToLong(OrderSub::getTotalAmount).toArray());
+```python
+# 运费分摊到子单（同一包裹内的多个店铺子单）
+sub_freights = allocate(package_freight, [sub.total_amount for sub in subs_in_package])
 ```
 
 ## 7. 运费券
@@ -328,7 +327,7 @@ long[] subFreights = allocate(totalFreight,
 
 ```
 ① 促销引擎算完商品优惠 → payableBeforeFreight
-② 运费服务算出 freight
+② freight 模块算出 freight
 ③ 若用户有运费券且可用：
      deductible = min(运费券面额, freight)
      freight = freight - deductible
@@ -356,9 +355,9 @@ long[] subFreights = allocate(totalFreight,
 
 ```sql
 -- 母单的运费
-SELECT freight_amount FROM order_main WHERE order_main_no = ?;
+SELECT freight_amount FROM trade.order_main WHERE order_main_no = :no;
 -- 子单的分摊运费（拆单时写入）
-SELECT freight_amount FROM order_sub WHERE order_sub_no = ?;
+SELECT freight_amount FROM trade.order_sub WHERE order_sub_no = :no;
 ```
 
 **关键设计**：运费**必须分摊到子单并持久化**。如果退款时用"按比例重算"，因为商品可能部分退款过，重算的基数变了，结果会和用户当时付的不一致。
@@ -368,8 +367,8 @@ SELECT freight_amount FROM order_sub WHERE order_sub_no = ?;
 运费也是**价格一致性**的一部分（见 [11](11-price-consistency.md)）：
 
 ```
-结算页：调 /freight/calc → 返回 freight = 16.00 → 计入 priceToken
-下单时：调 /freight/calc 重新算 → 16.00 → 与 priceToken 中的对比
+结算页：POST /api/checkout/calc 内部调 freight_service.calc → freight = 16.00 → 计入 priceToken
+下单时：POST /api/orders 内部重新调 freight_service.calc → 16.00 → 与 priceToken 中的对比
   一致 → 继续
   不一致 → 409 PRICE_CHANGED，提示"运费已变化，请确认"
 ```
@@ -393,12 +392,12 @@ SELECT freight_amount FROM order_sub WHERE order_sub_no = ?;
 
 | 优化 | 说明 |
 |---|---|
-| 模板缓存 | 模板 + 区域规则整体缓存到 Redis（JSON），TTL 10 分钟，变更时 MQ 失效 |
+| 模板缓存 | 模板 + 区域规则整体缓存到 Redis（JSON），TTL 10 分钟；商家修改模板时同事务写 outbox，提交后删除缓存键 |
 | 区域码解析 | 收货地址 → 区域码，一次性解析出省/市/区三级，避免逐级查询 |
-| 批量计算 | 结算页一次算整单运费，不逐 SKU 调接口 |
-| 纯内存计算 | 模板从缓存拿到后，计算过程无 IO |
+| 批量计算 | 结算页一次算整单运费，不逐 SKU 查询 |
+| 纯内存计算 | 模板从缓存拿到后，`calc_freight` 是纯函数，过程无 IO |
 
-**运费服务与促销引擎一样，计算阶段必须无远程调用。**
+**freight 模块与促销引擎一样，计算阶段不允许 `await`。**
 
 ## 12. 商家后台的配置界面要点
 
@@ -413,4 +412,4 @@ SELECT freight_amount FROM order_sub WHERE order_sub_no = ?;
 6. 修改模板时提示"已绑定 N 个 SKU，修改后立即对新建订单生效，已下单订单不受影响"
 ```
 
-第 6 点的实现：订单创建时把运费的**计算明细快照**写入订单（`freight_detail` JSON 字段），这样即使模板改了，历史订单的运费依据仍可追溯。
+第 6 点的实现：订单创建时把运费的**计算明细快照**写入订单（`freight_detail` JSONB 字段），这样即使模板改了，历史订单的运费依据仍可追溯。

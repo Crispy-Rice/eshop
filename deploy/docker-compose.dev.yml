@@ -1,0 +1,82 @@
+# 本地开发环境：只起 PostgreSQL 与 Redis。
+# 后端和前端直接在 Windows 上跑（热重载快、便于断点调试）。
+#
+#   docker compose -f deploy/docker-compose.dev.yml up -d
+#   docker compose -f deploy/docker-compose.dev.yml logs -f postgres
+#   docker compose -f deploy/docker-compose.dev.yml down          # 保留数据
+#   docker compose -f deploy/docker-compose.dev.yml down -v       # 连数据一起删
+#
+# 端口只绑定 127.0.0.1，不对局域网暴露。
+
+name: eshop-dev
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: eshop-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-eshop}
+      POSTGRES_USER: ${POSTGRES_OWNER_USER:-eshop_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-dev-only-owner-password}
+      # 下面几个不是 postgres 镜像的标准变量，只是传给 init 脚本用来建角色
+      APP_USER: ${POSTGRES_APP_USER:-eshop_app}
+      APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-dev-only-app-password}
+      READONLY_USER: ${POSTGRES_READONLY_USER:-eshop_readonly}
+      READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD:-dev-only-readonly-password}
+      # 统一 UTC，与应用和文档约定一致
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - eshop_pgdata:/var/lib/postgresql/data
+      # 只在数据目录为空时执行一次（建角色、schema、扩展）
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - max_connections=100
+      - -c
+      - timezone=UTC
+      - -c
+      - log_min_duration_statement=200
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_OWNER_USER:-eshop_owner} -d ${POSTGRES_DB:-eshop}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: eshop-redis
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - eshop_redis:/data
+    # 本地不设密码（只监听回环地址）；生产必须 requirepass，见 deploy/redis/redis.conf
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      # 绝不淘汰库存/券 key：内存满时写入报错，让应用走降级
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  eshop_pgdata:
+    name: eshop_pgdata
+  eshop_redis:
+    name: eshop_redis

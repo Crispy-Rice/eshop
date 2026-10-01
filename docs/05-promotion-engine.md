@@ -84,19 +84,19 @@ Level 1 候选：[店铺满200减30, 店铺9折券(最高减50)]
 ### 4.1 叠加矩阵（数据化，不写死在代码里）
 
 ```sql
-CREATE TABLE `promo_stack_rule` (
-  `id`            BIGINT      NOT NULL,
-  `rule_name`     VARCHAR(64) NOT NULL,
-  `type_a`        VARCHAR(32) NOT NULL COMMENT '优惠类型A，如 COUPON_PLATFORM',
-  `type_b`        VARCHAR(32) NOT NULL COMMENT '优惠类型B',
-  `stackable`     TINYINT     NOT NULL COMMENT '1可叠加 0互斥',
-  `priority`      INT         NOT NULL DEFAULT 0 COMMENT '优先级，用于冲突裁决',
-  `shop_id`       BIGINT      NOT NULL DEFAULT 0 COMMENT '0=全局规则',
-  `effective_from` DATETIME(3) DEFAULT NULL,
-  `effective_to`   DATETIME(3) DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_pair` (`type_a`, `type_b`, `shop_id`)
-) ENGINE=InnoDB COMMENT='优惠叠加规则矩阵';
+CREATE TABLE promotion.promo_stack_rule (
+  id             BIGINT      PRIMARY KEY,
+  rule_name      VARCHAR(64) NOT NULL,
+  type_a         VARCHAR(32) NOT NULL,          -- 优惠类型A，如 COUPON_PLATFORM
+  type_b         VARCHAR(32) NOT NULL,          -- 优惠类型B
+  stackable      BOOLEAN     NOT NULL,          -- true可叠加 false互斥
+  priority       INT         NOT NULL DEFAULT 0, -- 优先级，用于冲突裁决
+  shop_id        BIGINT      NOT NULL DEFAULT 0, -- 0=全局规则
+  effective_from TIMESTAMPTZ(3),
+  effective_to   TIMESTAMPTZ(3),
+  CONSTRAINT uk_stack_rule_pair UNIQUE (type_a, type_b, shop_id)
+);
+COMMENT ON TABLE promotion.promo_stack_rule IS '优惠叠加规则矩阵';
 ```
 
 初始化数据：
@@ -119,16 +119,22 @@ CREATE TABLE `promo_stack_rule` (
 
 更精确的表述：把所有的优惠放入"冲突组"，同组内只能选一定数量。
 
-```java
-// 每个优惠声明自己属于哪个冲突组，以及组内可用的数量上限
-record Discount(long id, String group, int groupMaxSelect, long amount, int priority) {}
+```python
+# 每个优惠声明自己属于哪个冲突组，以及组内可用的数量上限
+@dataclass(frozen=True, slots=True)
+class Discount:
+    id: int
+    group: str
+    group_max_select: int
+    amount: int          # 分
+    priority: int
 
-// 组定义示例
-// group = "PLATFORM_COUPON"    maxSelect = 1   ← 平台券只能 1 张
-// group = "SHOP_COUPON:{shopId}" maxSelect = 1 ← 每个店铺的券只能 1 张
-// group = "ITEM_PROMO:{skuId}" maxSelect = 1   ← 每个 SKU 只能命中 1 个单品活动
-// group = "PLATFORM_PROMO"     maxSelect = 1   ← 平台活动只能 1 个
-// group = "POINT"              maxSelect = 1
+# 组定义示例
+# group = "PLATFORM_COUPON"       max_select = 1   ← 平台券只能 1 张
+# group = "SHOP_COUPON:{shop_id}" max_select = 1   ← 每个店铺的券只能 1 张
+# group = "ITEM_PROMO:{sku_id}"   max_select = 1   ← 每个 SKU 只能命中 1 个单品活动
+# group = "PLATFORM_PROMO"        max_select = 1   ← 平台活动只能 1 个
+# group = "POINT"                 max_select = 1
 ```
 
 **组间是否可叠**由 `promo_stack_rule` 决定。计算时：
@@ -146,18 +152,17 @@ record Discount(long id, String group, int groupMaxSelect, long amount, int prio
 
 **每个优惠不是作用在"订单总额"上，而是作用在"它能作用的那部分金额"上**。
 
-```java
-class ItemCalc {
-    long skuId;
-    int  num;
-    long unitPrice;        // 原价（分）
-    long promoPrice;       // Level0 后的价格
-    long promoAmount;      // Level0 的优惠额（原价 - promo价）* num
-
-    long shopEligible;     // 参与店铺级优惠的金额
-    long platformEligible; // 参与平台级优惠的金额
-    // 每层计算后递减
-}
+```python
+@dataclass(slots=True)
+class ItemCalc:
+    sku_id: int
+    num: int
+    unit_price: int              # 原价（分）
+    promo_price: int = 0         # Level 0 后的价格
+    promo_amount: int = 0        # Level 0 的优惠额 = (原价 - 促销价) * num
+    current_amount: int = 0      # 当前剩余金额，每层计算后递减
+    shop_eligible: int = 0       # 参与店铺级优惠的金额
+    platform_eligible: int = 0   # 参与平台级优惠的金额
 ```
 
 ### 5.2 逐层计算
@@ -207,20 +212,24 @@ Level 3（积分/余额）：
 折扣后金额 = floor(amount * rate)   // 用 floor，对平台有利还是对用户有利？
 ```
 
-规则：**折扣向下取整（用户多得 1 分）或四舍五入？** 选择**四舍五入到分**（`Math.round(amount * rate / 10000.0)` 的整数实现），理由：
+规则：**折扣向下取整（用户多得 1 分）或四舍五入？** 选择**四舍五入到分**（整数实现，见下），理由：
 - 向下取整在部分退款时容易出现"退的比付的多"（因为多次向下取整的累积误差）；
 - 四舍五入在数学期望上中立，配合分摊算法能保证守恒。
 
 **所有金额运算的绝对规则**：
 
-```java
-// ✅ 正确：全整数运算
-long discounted = amount * rate / 10000;                  // rate = 8500 表示 85 折
-long rounded    = (amount * rate + 5000) / 10000;         // 四舍五入
+```python
+# ✅ 正确：全整数运算（Python int 无溢出）
+discounted = amount * rate // 10000                 # rate = 8500 表示 85 折，向下取整
+rounded    = (amount * rate + 5000) // 10000        # 四舍五入（amount、rate 均为非负）
 
-// ❌ 错误：浮点
-double d = amount * 0.85;   // 0.1 + 0.2 != 0.3 的经典问题
+# ❌ 错误：浮点
+d = amount * 0.85            # 0.1 + 0.2 != 0.3 的经典问题
+# ❌ 错误：内置 round() 是"银行家舍入"，round(2.5) == 2
+r = round(amount * rate / 10000)
 ```
+
+> Python 的 `//` 对负数是向负无穷取整（`-7 // 2 == -4`），金额计算的被除数必须保证非负；需要处理负数时显式用 `Decimal.quantize(..., ROUND_HALF_UP)`。Pydantic 模型中金额字段声明为 `int`（`Field(ge=0)`），前端传入小数会直接校验失败。
 
 ## 6. 分摊算法（核心）
 
@@ -254,44 +263,38 @@ C: 33 * 70/100 = 23.10
 
 **严谨性说明**：用整数运算实现，避免浮点误差。
 
-```java
-/**
- * 最大余数法分摊
- * @param totalDiscount 总优惠（分）
- * @param items 分摊对象，含 eligible（分）
- * @return 每个 item 分到的金额（分），和为 totalDiscount
- */
-public static long[] allocate(long totalDiscount, long[] eligible) {
-    int n = eligible.length;
-    long[] result = new long[n];
-    long totalEligible = 0;
-    for (long e : eligible) totalEligible += e;
+```python
+def allocate(total_discount: int, eligible: list[int]) -> list[int]:
+    """最大余数法分摊。
 
-    if (totalEligible <= 0) return result;  // 无可分摊基数，全为 0
+    :param total_discount: 总优惠（分），>= 0
+    :param eligible: 每个分摊对象的基数（分），>= 0，顺序即平局时的裁决顺序
+    :return: 每个对象分到的金额（分），和恰好为 total_discount
+    """
+    n = len(eligible)
+    total_eligible = sum(eligible)
+    if total_eligible <= 0:
+        return [0] * n                      # 无可分摊基数，全为 0
 
-    // ① 精确值（用 long 保存分子，避免浮点）
-    long allocated = 0;
-    long[] remainder = new long[n];
-    for (int i = 0; i < n; i++) {
-        long numerator = totalDiscount * eligible[i];     // 可能溢出？见下方说明
-        result[i] = numerator / totalEligible;            // floor
-        remainder[i] = numerator % totalEligible;         // 余数
-        allocated += result[i];
-    }
+    # ① 整数部分与余数（全整数，无浮点）
+    result: list[int] = []
+    remainders: list[int] = []
+    for e in eligible:
+        q, r = divmod(total_discount * e, total_eligible)
+        result.append(q)
+        remainders.append(r)
 
-    // ② 补足缺口：按余数降序，平局按 id 升序
-    long gap = totalDiscount - allocated;                 // 0 <= gap < n
-    Integer[] idx = ...;  // 0..n-1 按 (remainder desc, index asc) 排序
-    for (int k = 0; k < gap; k++) {
-        result[idx[k]] += 1;
-    }
-    return result;
-}
+    # ② 补足缺口：按余数降序，平局按下标升序（确定性）
+    gap = total_discount - sum(result)      # 0 <= gap < n
+    order = sorted(range(n), key=lambda i: (-remainders[i], i))
+    for i in order[:gap]:
+        result[i] += 1
+    return result
 ```
 
-**溢出防护**：`totalDiscount * eligible[i]` 最大是 `10^8 * 10^8 = 10^16`，`long` 上限约 `9.2 * 10^18`，安全。但如果订单金额超过 1 亿元（`10^10` 分），乘积会到 `10^20` → 溢出。**加断言**：`Math.multiplyExact` 或限制单订单金额上限（业务上单订单不超过 1000 万元，完全够用）。
+**溢出**：Python 的 `int` 是任意精度，不存在 Java `long` 的乘法溢出问题。但 PG 的 `BIGINT` 上限约 `9.2 × 10^18` 分，所以仍需在下单校验中**限制单订单金额上限**（业务上单订单不超过 1000 万元），防止写库时溢出。
 
-**另一种实现（BigDecimal）**：如果团队更信任 `BigDecimal`，用 `BigDecimal` + `RoundingMode.DOWN` + 同样的余数排序逻辑，结果等价。但性能差 10 倍以上，结算页算价是高频操作，推荐整数实现。
+**为什么不用 `Decimal`**：`Decimal` + `ROUND_DOWN` + 同样的余数排序逻辑结果等价，但整数实现更快、更不容易写错舍入模式。`Decimal` 只用在需要表达比例的地方（如积分兑换比例），并且在进入分摊前就转换成整数分。
 
 ### 6.3 分摊的三个约束
 
@@ -324,57 +327,48 @@ public static long[] allocate(long totalDiscount, long[] eligible) {
    - 最后一轮用最大余数法补齐分差
 ```
 
-```java
-public static long[] allocateWithCap(long total, long[] eligible, long[] cap) {
-    int n = eligible.length;
-    long[] result = new long[n];
-    long remaining = total;
-    boolean[] done = new boolean[n];   // 已达上限的行
+```python
+def allocate_with_cap(total: int, eligible: list[int], cap: list[int]) -> list[int]:
+    """带行上限的最大余数法分摊。
 
-    while (remaining > 0) {
-        // 收集未达上限的行
-        long activeEligible = 0;
-        int activeCount = 0;
-        for (int i = 0; i < n; i++) {
-            if (!done[i]) { activeEligible += eligible[i]; activeCount++; }
-        }
-        if (activeCount == 0) break;   // 全部达上限
+    结果满足：sum(result) == min(total, sum(cap))，且 0 <= result[i] <= cap[i]。
+    """
+    n = len(eligible)
+    result = [0] * n
+    remaining = min(total, sum(cap))         # 优惠封顶到可分摊总额
+    done = [cap[i] <= 0 for i in range(n)]   # 已达上限（或无上限空间）的行
 
-        // 分摊本轮
-        long allocated = 0;
-        long[] thisRound = new long[n];
-        List<int[]> rems = new ArrayList<>();
-        for (int i = 0; i < n; i++) {
-            if (done[i]) continue;
-            long num = remaining * eligible[i];
-            thisRound[i] = num / activeEligible;
-            rems.add(new int[]{i, (int)(num % activeEligible)});
-        }
-        // 余数补齐
-        long sum = 0;
-        for (long v : thisRound) sum += v;
-        long gap = remaining - sum;
-        rems.sort((a,b) -> b[1] != a[1] ? b[1]-a[1] : a[0]-b[0]);
-        for (int k = 0; k < gap; k++) thisRound[rems.get(k)[0]] += 1;
+    while remaining > 0:
+        active = [i for i in range(n) if not done[i]]
+        if not active:
+            break                            # 全部达上限
+        active_eligible = sum(eligible[i] for i in active)
+        if active_eligible <= 0:
+            # 剩余行基数都为 0：按行顺序依次填满，保证守恒
+            for i in active:
+                take = min(cap[i] - result[i], remaining)
+                result[i] += take
+                remaining -= take
+            break
 
-        // 应用并检查上限
-        long overflow = 0;
-        for (int i = 0; i < n; i++) {
-            if (done[i] || thisRound[i] == 0) continue;
-            long space = cap[i] - result[i];
-            if (thisRound[i] > space) {
-                overflow += thisRound[i] - space;
-                result[i] = cap[i];
-                done[i] = true;
-            } else {
-                result[i] += thisRound[i];
-            }
-        }
-        remaining = overflow;
-    }
-    return result;
-}
+        # 本轮按比例分摊 remaining（复用 allocate，保证本轮守恒）
+        this_round = allocate(remaining, [eligible[i] for i in active])
+
+        # 应用并检查上限，超出部分进入下一轮
+        overflow = 0
+        for i, amount in zip(active, this_round):
+            space = cap[i] - result[i]
+            if amount >= space:
+                overflow += amount - space
+                result[i] = cap[i]
+                done[i] = True
+            else:
+                result[i] += amount
+        remaining = overflow
+    return result
 ```
+
+> 循环一定终止：每一轮要么 `overflow == 0`（结束），要么至少有一行被标记为 `done`（活跃行数严格递减）。
 
 ### 6.4 为什么分摊必须精确（业务影响）
 
@@ -401,140 +395,163 @@ item B: 原价 20.00，分摊优惠 6.00，实付 14.00
 
 ### 7.1 输入输出
 
-```java
-// 输入（结算页 & 下单共用同一个服务）
-public class CalcPriceRequest {
-    Long userId;
-    List<CalcItem> items;         // skuId, num, 选中的
-    List<Long> couponCodeIds;     // 用户选中的券
-    boolean usePoints;
-    String addressId;             // 用于运费计算
-}
+```python
+# app/modules/promotion/schemas.py —— 结算页 & 下单共用同一个算价函数
+class CalcItem(BaseModel):
+    sku_id: int
+    num: int = Field(ge=1, le=200)
 
-public class CalcPriceResponse {
-    // ★ 每个字段都是"可以给前端看的"，同时后端也会用同一份结果下单
-    List<ItemResult> items;       // 每行的原价、促销价、分摊优惠、实付
-    List<ShopResult> shops;       // 按店铺分组
-    long totalAmount;             // 商品总额（原价）
-    long itemDiscount;            // 单品促销优惠
-    long shopDiscount;            // 店铺级优惠
-    long platformDiscount;        // 平台级优惠
-    long pointDeduction;          // 积分抵扣
-    long freight;                 // 运费
-    long payableAmount;           // 实付 = totalAmount - 所有优惠 + 运费
-    List<UnavailableCoupon> unavailableCoupons;  // 不可用券 + 原因
-    String priceToken;            // ★ 签名令牌，下单时必须带回
-    long expireAt;                // token 过期时间
-}
+
+class CalcPriceRequest(BaseModel):
+    items: list[CalcItem] = Field(min_length=1, max_length=100)
+    coupon_code_ids: list[int] = []      # 用户选中的券
+    use_points: bool = False
+    address_id: int                      # 用于运费计算
+    # user_id 不从请求体取，由鉴权依赖注入
+
+
+class CalcPriceResponse(BaseModel):
+    # ★ 每个字段都是"可以给前端看的"，同时后端也会用同一份结果下单
+    items: list[ItemResult]              # 每行的原价、促销价、分摊优惠、实付
+    shops: list[ShopResult]              # 按店铺分组
+    total_amount: int                    # 商品总额（原价）
+    item_discount: int                   # 单品促销优惠
+    shop_discount: int                   # 店铺级优惠
+    platform_discount: int               # 平台级优惠
+    point_deduction: int                 # 积分抵扣
+    freight: int                         # 运费
+    payable_amount: int                  # 实付 = total_amount - 所有优惠 + 运费
+    unavailable_coupons: list[UnavailableCoupon]   # 不可用券 + 原因
+    price_token: str                     # ★ 签名令牌，下单时必须带回
+    expire_at: int                       # token 过期时间（Unix 秒）
 ```
+
+> 接口 JSON 使用 camelCase（`totalAmount`），Python 内部使用 snake_case。在公共基类上配置 `model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)` 统一转换，ID 类字段序列化为字符串（见 [15](15-api-and-errors.md) §1）。
 
 ### 7.2 主流程伪代码
 
-```java
-public CalcPriceResponse calc(CalcPriceRequest req) {
-    // ---------- ① 加载数据 ----------
-    List<SkuInfo> skus = productClient.batchGet(req.items);          // 价格、重量、店铺、类目
-    Map<Long, Integer> stockMap = inventoryClient.batchCheck(...);   // 只校验，不预占
-    List<CouponCode> userCoupons = couponClient.getByCodes(req.couponCodeIds);
-    List<PromoActivity> activities = promoClient.match(skus);         // 命中的活动
+算价分成两段：**异步加载**（查 DB/Redis）和**纯函数计算**（无 IO，便于单测与复现）。
 
-    // ---------- ② 校验 ----------
-    validateSkuStatus(skus);            // 上架、未删除
-    validateStock(skus, stockMap);      // 库存充足（不预占）
-    validateCouponOwnership(userCoupons, req.userId);
+```python
+# app/modules/promotion/service.py
+async def calc_price(session: AsyncSession, user_id: int, req: CalcPriceRequest) -> CalcPriceResponse:
+    # ---------- ① 加载数据（并发执行，全部是同进程模块函数）----------
+    skus, stock_map, user_coupons, activities, address = await asyncio.gather(
+        product_service.batch_get_skus(session, [i.sku_id for i in req.items]),  # 价格、重量、店铺、类目
+        inventory_service.batch_check(req.items),                               # 只读 Redis，不预占
+        coupon_repo.get_user_coupons(session, user_id, req.coupon_code_ids),
+        activity_cache.match(req.items),                                        # 命中的活动（进程内缓存）
+        user_service.get_address(session, user_id, req.address_id),
+    )
+    points_balance = await points_service.get_balance(session, user_id) if req.use_points else 0
+```
 
-    // ---------- ③ Level 0：单品促销 ----------
-    for (SkuInfo sku : skus) {
-        ItemPromo p = pickBestItemPromo(sku, activities);   // 同一 SKU 的多个单品活动取最优
-        sku.promoPrice = p == null ? sku.unitPrice : p.apply(sku.unitPrice);
-        sku.itemDiscount = (sku.unitPrice - sku.promoPrice) * sku.num;
-    }
+> 注意：同一个 `AsyncSession` **不能被并发协程同时使用**。上面 `gather` 中涉及 DB 的函数要么各自从会话工厂取独立会话（只读查询），要么改为顺序 `await`。示例为表达"批量预加载"的意图，实际实现时 DB 查询顺序执行、Redis 查询并发执行。
 
-    // ---------- ④ Level 1：店铺级（按店铺分组独立计算）----------
-    for (ShopGroup shop : groupByShop(skus)) {
-        shopAmount = shop.sumCurrent();
-        candidates = shopActivities(shop) + shopCoupons(shop, userCoupons);
-        candidates = filterByScope(candidates, shop.items);         // 适用范围过滤
-        candidates = filterByThreshold(candidates, shopAmount);     // 门槛过滤
-        best = selectByConflictGroup(candidates);                   // 冲突组选最优
-        if (best != null) {
-            long discount = best.compute(shop.eligibleAmount());     // 计算优惠额（含封顶）
-            long[] alloc = allocateWithCap(discount, shop.eligibles(), shop.caps());
-            shop.applyAllocation(alloc, best.type());
-        }
-    }
+```python
+    # ---------- ② 校验 ----------
+    validate_sku_status(skus)                 # 上架、未删除
+    validate_stock(skus, stock_map)           # 库存充足（不预占）
+    validate_coupon_ownership(user_coupons, user_id)
 
-    // ---------- ⑤ Level 2：平台级 ----------
-    platformEligible = sumEligible(allItems, platformScopes);
-    candidates = platformActivities + platformCoupons;
-    best = selectByConflictGroup(candidates);
-    if (best != null) {
-        discount = best.compute(platformEligible);
-        alloc = allocateWithCap(discount, eligibles, caps);
-        applyAllocation(alloc);
-    }
+    # ---------- ③~⑥ 纯内存计算（无 IO）----------
+    calc = PriceCalculator(skus, req.items, activities, user_coupons, points_balance, stack_rules)
+    result = calc.run()                       # 见下
 
-    // ---------- ⑥ Level 3：积分 ----------
-    if (req.usePoints) {
-        long maxByAmount = payableBeforePoint * maxPointRatio / 10000;  // 如最多抵 50%
-        long maxByBalance = pointsClient.getBalance(userId) / RATE;      // 100 积分 = 1 元
-        long deduction = min(maxByAmount, maxByBalance);
-        deduction = floorToStep(deduction, 100);                          // 必须是 100 分的整数倍
-        alloc = allocateWithCap(deduction, eligibles, caps);
-        applyAllocation(alloc);
-    }
+    # ---------- ⑦ 运费（见 06-freight）----------
+    freight = await freight_service.calc(session, skus, address)
 
-    // ---------- ⑦ 运费（见 06-freight）----------
-    freight = freightClient.calc(skus, addressId);
+    # ---------- ⑧ 汇总 + 签名 ----------
+    payable = (result.total_amount - result.item_discount - result.shop_discount
+               - result.platform_discount - result.point_deduction + freight.total)
+    if payable < 0:
+        raise PriceInvariantError("应付金额为负")
+    token = price_token_signer.sign(user_id, req, result, freight)   # 见 11-price-consistency
+    return build_response(result, freight, payable, token)
 
-    // ---------- ⑧ 汇总 + 签名 ----------
-    resp.payableAmount = totalAmount - itemDiscount - shopDiscount
-                       - platformDiscount - pointDeduction + freight;
-    assert resp.payableAmount >= 0;
-    resp.priceToken = priceTokenSigner.sign(req, resp);   // 见 11-price-consistency
 
-    return resp;
-}
+class PriceCalculator:
+    def run(self) -> CalcResult:
+        # Level 0：单品促销（同一 SKU 的多个单品活动取最优）
+        for item in self.items:
+            promo = pick_best_item_promo(item, self.activities)
+            item.promo_price = promo.apply(item.unit_price) if promo else item.unit_price
+            item.promo_amount = (item.unit_price - item.promo_price) * item.num
+            item.current_amount = item.promo_price * item.num
+
+        # Level 1：店铺级（按店铺分组独立计算）
+        for shop in group_by_shop(self.items):
+            candidates = shop_activities(shop) + shop_coupons(shop, self.coupons)
+            candidates = filter_by_scope(candidates, shop.items)          # 适用范围过滤
+            candidates = filter_by_threshold(candidates, shop.eligible_amount())  # 门槛过滤
+            best = select_by_conflict_group(candidates, self.stack_rules)  # 冲突组选最优
+            if best:
+                discount = best.compute(shop.eligible_amount())            # 含封顶
+                alloc = allocate_with_cap(discount, shop.eligibles(), shop.caps())
+                shop.apply_allocation(alloc, best.type)
+
+        # Level 2：平台级（同 Level 1，eligible 只算平台券 scope 内的商品）
+        self.apply_platform_level()
+
+        # Level 3：积分（100 积分 = 1 元 = 100 分，最多抵 max_point_ratio）
+        if self.points_balance > 0:
+            payable_before_point = sum(i.current_amount for i in self.items)
+            max_by_amount = payable_before_point * self.max_point_ratio // 10000   # 如 5000 = 50%
+            max_by_balance = self.points_balance // POINTS_PER_YUAN * 100
+            deduction = min(max_by_amount, max_by_balance) // 100 * 100           # 取整到元
+            alloc = allocate_with_cap(deduction, self.eligibles(), self.caps())
+            self.apply_allocation(alloc, DiscountType.POINT)
+
+        return self.summarize()
 ```
 
 ### 7.3 不可用券的原因提示
 
 用户体验的关键：**券用不了要说清为什么**。
 
-```java
-enum UnavailableReason {
-    EXPIRED            ("已过期"),
-    NOT_STARTED        ("未到使用时间"),
-    THRESHOLD_NOT_MET  ("还差 ¥%.2f 可用"),        // ★ 最有价值：告诉用户还差多少
-    SCOPE_NOT_MATCH    ("仅限指定商品使用"),
-    SHOP_NOT_MATCH     ("仅限 XX 店铺商品使用"),
-    STACK_CONFLICT     ("与已选优惠互斥"),
-    LOCKED_BY_ORDER    ("正在被订单 %s 占用"),
-    STOCK_OUT          ("商品已下架或无货")           // 作用域商品全部失效
-}
+```python
+class UnavailableReason(StrEnum):
+    EXPIRED           = "已过期"
+    NOT_STARTED       = "未到使用时间"
+    THRESHOLD_NOT_MET = "还差 ¥{gap} 可用"          # ★ 最有价值：告诉用户还差多少
+    SCOPE_NOT_MATCH   = "仅限指定商品使用"
+    SHOP_NOT_MATCH    = "仅限 {shop_name} 店铺商品使用"
+    STACK_CONFLICT    = "与已选优惠互斥"
+    LOCKED_BY_ORDER   = "正在被订单 {order_no} 占用"
+    STOCK_OUT         = "商品已下架或无货"            # 作用域商品全部失效
+
+
+def fen_to_yuan(fen: int) -> str:
+    """分 → 展示用元字符串，只用于文案，不参与计算。"""
+    return f"{fen // 100}.{fen % 100:02d}"
 ```
 
-`THRESHOLD_NOT_MET` 的"还差多少"提示能显著提升转化（凑单行为）。实现上，在 §4 的 `filterByThreshold` 中计算 `threshold - eligibleAmount` 即可。
+`THRESHOLD_NOT_MET` 的"还差多少"提示能显著提升转化（凑单行为）。实现上，在 §7.2 的 `filter_by_threshold` 中计算 `threshold - eligible_amount` 即可。
 
 ## 8. 计算结果的持久化
 
 订单创建时，**把整份计算结果冻结到订单表**：
 
 ```sql
--- 母单的金额汇总
-CREATE TABLE `order_main` (
+-- 母单的金额汇总（完整 DDL 见 07-order-and-split）
+CREATE TABLE trade.order_main (
   ...
-  `total_amount`       BIGINT NOT NULL COMMENT '商品原价总额',
-  `item_discount`      BIGINT NOT NULL DEFAULT 0 COMMENT '单品促销优惠',
-  `shop_discount`      BIGINT NOT NULL DEFAULT 0 COMMENT '店铺级优惠',
-  `platform_discount`  BIGINT NOT NULL DEFAULT 0 COMMENT '平台级优惠',
-  `point_deduction`    BIGINT NOT NULL DEFAULT 0 COMMENT '积分抵扣',
-  `point_used`         INT    NOT NULL DEFAULT 0 COMMENT '消耗积分数量',
-  `freight_amount`     BIGINT NOT NULL DEFAULT 0 COMMENT '运费',
-  `discount_amount`    BIGINT GENERATED ALWAYS AS
+  total_amount       BIGINT NOT NULL,              -- 商品原价总额
+  item_discount      BIGINT NOT NULL DEFAULT 0,    -- 单品促销优惠
+  shop_discount      BIGINT NOT NULL DEFAULT 0,    -- 店铺级优惠
+  platform_discount  BIGINT NOT NULL DEFAULT 0,    -- 平台级优惠
+  point_deduction    BIGINT NOT NULL DEFAULT 0,    -- 积分抵扣
+  point_used         INT    NOT NULL DEFAULT 0,    -- 消耗积分数量
+  freight_amount     BIGINT NOT NULL DEFAULT 0,    -- 运费
+  discount_amount    BIGINT GENERATED ALWAYS AS
       (item_discount + shop_discount + platform_discount + point_deduction) STORED,
-  `payable_amount`     BIGINT NOT NULL COMMENT '应付 = total - discount + freight',
+  payable_amount     BIGINT NOT NULL,              -- 应付 = total - discount + freight
   ...
+  -- ★ 金额守恒由数据库兜底
+  CONSTRAINT ck_main_payable CHECK (
+    payable_amount = total_amount - item_discount - shop_discount
+                   - platform_discount - point_deduction + freight_amount
+    AND payable_amount >= 0)
 );
 ```
 
@@ -543,27 +560,26 @@ CREATE TABLE `order_main` (
 ## 9. 优惠快照表：审计与退款依据
 
 ```sql
-CREATE TABLE `order_discount_snapshot` (
-  `id`             BIGINT      NOT NULL AUTO_INCREMENT,
-  `order_main_no`  VARCHAR(32) NOT NULL,
-  `order_sub_no`   VARCHAR(32) DEFAULT NULL COMMENT '为空表示平台级（未拆到子单）',
-  `level`          TINYINT     NOT NULL COMMENT '0单品 1店铺 2平台 3积分',
-  `source_type`    VARCHAR(32) NOT NULL COMMENT 'ITEM_PROMO/SHOP_PROMO/COUPON_SHOP/COUPON_PLATFORM/POINT',
-  `source_id`      BIGINT      DEFAULT NULL COMMENT '活动ID或券码ID',
-  `source_name`    VARCHAR(128) NOT NULL COMMENT '快照名称，如"满200减30"',
-  `rule_snapshot`  JSON        NOT NULL COMMENT '★ 规则快照：threshold, discountValue, rate, scope...',
-  `discount_amount` BIGINT     NOT NULL COMMENT '本优惠总金额',
-  `created_at`     DATETIME(3) NOT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_main_level_source` (`order_main_no`, `level`, `source_type`, `source_id`),
-  KEY `idx_main` (`order_main_no`),
-  KEY `idx_coupon` (`source_type`, `source_id`)
-) ENGINE=InnoDB COMMENT='订单优惠快照（审计与退款依据）';
+CREATE TABLE trade.order_discount_snapshot (
+  id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_main_no   VARCHAR(32)  NOT NULL,
+  order_sub_no    VARCHAR(32),                  -- 为空表示平台级（未拆到子单）
+  level           SMALLINT     NOT NULL,        -- 0单品 1店铺 2平台 3积分
+  source_type     VARCHAR(32)  NOT NULL,        -- ITEM_PROMO/SHOP_PROMO/COUPON_SHOP/COUPON_PLATFORM/POINT
+  source_id       BIGINT       NOT NULL DEFAULT 0, -- 活动ID或券码ID，积分为 0
+  source_name     VARCHAR(128) NOT NULL,        -- 快照名称，如"满200减30"
+  rule_snapshot   JSONB        NOT NULL,        -- ★ 规则快照：threshold, discountValue, rate, scope...
+  discount_amount BIGINT       NOT NULL,        -- 本优惠总金额
+  created_at      TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
+  CONSTRAINT uk_discount_snap UNIQUE (order_main_no, level, source_type, source_id)
+);
+CREATE INDEX idx_discount_snap_source ON trade.order_discount_snapshot (source_type, source_id);
+COMMENT ON TABLE trade.order_discount_snapshot IS '订单优惠快照（审计与退款依据）';
 ```
 
-**为什么需要 `rule_snapshot`**：退款时按比例退还是按原额退，需要知道当时的规则。运营半年后改了活动规则，历史订单的退款逻辑不能跟着变。JSON 快照存下 `{"threshold":20000,"discountValue":3000,"scope":"SHOP","rate":null}`。
+**为什么需要 `rule_snapshot`**：退款时按比例退还是按原额退，需要知道当时的规则。运营半年后改了活动规则，历史订单的退款逻辑不能跟着变。JSONB 快照存下 `{"threshold":20000,"discountValue":3000,"scope":"SHOP","rate":null}`。
 
-**`uk_main_level_source` 的唯一约束**：防止同一活动的优惠被重复记账（幂等）。
+**`uk_discount_snap` 的唯一约束**：防止同一活动的优惠被重复记账（幂等）。`source_id` 用 `NOT NULL DEFAULT 0` 而不是可空——PG 的唯一约束中 `NULL` 互不相等，可空列会让积分类快照绕过唯一性。唯一约束的首列 `order_main_no` 同时覆盖了按母单查询，不需要再单独建索引。
 
 ## 10. 测试用例（必须覆盖）
 
@@ -587,33 +603,41 @@ CREATE TABLE `order_discount_snapshot` (
 | 14 | 优惠金额 > 订单金额（异常） | 优惠封顶到订单金额，payable = 0 |
 | 15 | 幂等：同一请求算两次 | 结果完全一致（确定性） |
 
-**守恒断言（生产环境也建议开启采样）**：
+测试使用 `pytest`，分摊函数额外用 `hypothesis` 做性质测试（随机生成金额与行数，断言守恒/非负/不超上限三条约束恒成立）。
 
-```java
-assert sum(item.discountAmount) == order.discountAmount
-    : "分摊不守恒: " + detail;
-assert order.payableAmount == order.totalAmount - order.discountAmount + order.freightAmount
-    : "金额不平";
-assert order.payableAmount >= 0 : "应付金额为负";
+**守恒检查（生产环境始终开启）**：
+
+Python 的 `assert` 在 `python -O` 下会被移除，**不能用来做生产校验**。改为显式检查并抛业务异常：
+
+```python
+def check_invariants(order: OrderDraft) -> None:
+    if sum(i.discount_amount for i in order.items) != order.discount_amount:
+        raise PriceInvariantError(f"分摊不守恒: {order.debug_detail()}")
+    if order.payable_amount != order.total_amount - order.discount_amount + order.freight_amount:
+        raise PriceInvariantError("金额不平")
+    if order.payable_amount < 0:
+        raise PriceInvariantError("应付金额为负")
 ```
+
+表上的 `CHECK` 约束（§8、[02](02-domain-model.md) §5）是最后一道防线。
 
 ## 11. 性能设计
 
 | 优化 | 说明 |
 |---|---|
-| 模板/活动本地缓存 | Caffeine 5 分钟，活动变更通过 MQ 广播失效 |
+| 模板/活动进程内缓存 | `cachetools.TTLCache` 5 分钟，活动变更时发布 `promotion.changed` 事件，各进程收到后清缓存 |
 | 作用域用 Redis Set | 避免每次解析大 JSON（见 [04 §7.1](04-coupon.md)） |
-| 计算无 IO | 所有数据预加载，纯内存计算，单次算价 < 5ms |
+| 计算无 IO | 所有数据预加载，`PriceCalculator` 纯内存计算，单次算价 < 5ms |
 | 结果缓存 | 相同 (userId, itemHash, couponIds, addressId) 的算价结果缓存 10s（防前端反复调用） |
-| 批量接口 | 结算页一次拿齐商品+库存+券+活动，避免 N+1 |
+| 批量查询 | 结算页一次拿齐商品+库存+券+活动（`WHERE id = ANY(:ids)`），避免 N+1 |
 
-**算价服务不应该有任何远程调用**（在预加载之后）。这是硬性约束——一旦算价里有同步 RPC，P99 就会不可控。
+**`PriceCalculator.run()` 内不允许有任何 `await`**。这是硬性约束——算价逻辑一旦夹杂 IO，P99 就不可控，也无法用固定输入做确定性单测。
 
 ## 12. 与其它模块的边界
 
 | 模块 | 边界 |
 |---|---|
-| 优惠券服务 | 提供"券的规则"，不提供"券怎么算"。**计算逻辑在促销引擎里**，券服务只管生命周期 |
-| 运费服务 | 促销引擎**不计算运费**，只把运费加到总额。运费券是例外：它作用于运费，由运费服务算完后回传给促销引擎抵扣 |
-| 积分服务 | 提供余额和兑换比例；**扣减发生在下单时**，由交易服务统一编排 |
-| 交易服务 | 调用促销引擎算价 → 冻结快照 → 创建订单 |
+| 优惠券（promotion.coupon） | 提供"券的规则"，不提供"券怎么算"。**计算逻辑在促销引擎里**，券只管生命周期 |
+| freight 模块 | 促销引擎**不计算运费**，只把运费加到总额。运费券是例外：它作用于运费，由 freight 模块算完后回传给促销引擎抵扣 |
+| user 模块（积分） | 提供余额和兑换比例；**扣减发生在下单事务内**，由 trade 模块统一编排 |
+| trade 模块 | 调用促销引擎算价 → 冻结快照 → 创建订单 |
