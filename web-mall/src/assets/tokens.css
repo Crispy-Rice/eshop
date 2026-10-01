@@ -1,0 +1,342 @@
+/* ============================================================================
+ * 设计 token —— 现代中性模块化货架风
+ *
+ * 三层结构，从上到下：
+ *   Layer 1  原始色板 / 尺度（primitives）—— 组件**永远不要**直接引用
+ *   Layer 2  语义 token                 —— 组件只引用这一层，换肤只改这一层
+ *   Layer 3  Element Plus 变量桥接       —— 把 --el-* 指到语义层，EP 组件自动跟随主题
+ *
+ * 换肤 = 切 <html data-theme>。主题块只覆盖 Layer 2 的一小撮营销 token，
+ * 所以新增一套皮肤不需要碰任何组件。
+ * ==========================================================================*/
+
+/* ==========================================================================
+ * Layer 1 — 原始色板
+ * ==========================================================================*/
+
+:root {
+  /* 中性灰阶。刻意用**无色相**的灰度（RGB 三通道相等），
+     这是「现代中性」和 Element Plus 那套偏蓝灰阶（#303133/#606266）的关键区别。 */
+  --n-0: #ffffff;
+  --n-25: #fcfcfc;
+  --n-50: #f7f7f8;
+  --n-100: #f1f1f3;
+  --n-150: #ebebed;
+  --n-200: #e4e4e7;
+  --n-300: #d4d4d8;
+  --n-400: #a1a1aa;
+  --n-500: #71717a;
+  --n-600: #52525b;
+  --n-700: #3f3f46;
+  --n-800: #27272a;
+  --n-900: #18181b;
+  --n-1000: #09090b;
+
+  /* 间距，4px 基准 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* 圆角 */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  --radius-pill: 999px;
+
+  /* 字号 */
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 30px;
+
+  /* 行高与字重 */
+  --leading-tight: 1.25;
+  --leading-snug: 1.4;
+  --leading-normal: 1.55;
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* 阴影。整体克制——货架风靠边框和留白分层，不靠投影。 */
+  --shadow-xs: 0 1px 2px rgba(9, 9, 11, 0.04);
+  --shadow-sm: 0 1px 3px rgba(9, 9, 11, 0.06), 0 1px 2px rgba(9, 9, 11, 0.04);
+  --shadow-md: 0 4px 12px rgba(9, 9, 11, 0.07);
+  --shadow-lg: 0 12px 28px rgba(9, 9, 11, 0.1);
+
+  /* 动效 */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --dur-slow: 280ms;
+
+  /* 层级 */
+  --z-sticky: 100;
+  --z-header: 200;
+  --z-overlay: 1000;
+  --z-toast: 2000;
+
+  /* 布局尺度 */
+  --layout-max: 1200px;
+  --layout-gutter: var(--space-6);
+  --header-h: 60px;
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Noto Sans SC", "Microsoft YaHei", sans-serif;
+}
+
+/* ==========================================================================
+ * Layer 2 — 语义 token（默认主题：中性）
+ *
+ * 大促主题只覆盖其中的强调色 / 交易色 / 营销层，其余（灰阶、间距、圆角）
+ * 保持不动——这样"换肤"换的是气质，不是结构。
+ * ==========================================================================*/
+
+:root {
+  /* 表面 */
+  --color-bg-page: var(--n-50);
+  --color-bg-surface: var(--n-0);
+  --color-bg-subtle: var(--n-100);
+  --color-bg-inset: var(--n-100);
+  --color-bg-hover: var(--n-100);
+  --color-bg-mask: rgba(9, 9, 11, 0.45);
+
+  /* 描边 */
+  --color-border: var(--n-200);
+  --color-border-strong: var(--n-300);
+
+  /* 文字 */
+  --color-text: var(--n-900);
+  --color-text-secondary: var(--n-600);
+  --color-text-tertiary: var(--n-500);
+  --color-text-placeholder: var(--n-400);
+  --color-text-inverse: var(--n-0);
+
+  /* 强调色（中性主题 = 墨黑，克制、偏"精品货架"而不是"叫卖场"） */
+  --color-accent: var(--n-900);
+  --color-accent-rgb: 24, 24, 27;
+  --color-accent-hover: var(--n-800);
+  --color-accent-active: var(--n-1000);
+  --color-accent-soft: var(--n-100);
+  --color-accent-contrast: var(--n-0);
+
+  /* 交易色。**商品优先**的视觉锚点：整页唯一的强色，扫一排不会跳。 */
+  --color-price: #d93025;
+  --color-price-soft: #fef2f1;
+
+  /* 状态色（比 EP 默认更沉稳的中性化配色） */
+  --color-success: #0f7b3f;
+  --color-success-soft: #e9f7ef;
+  --color-warning: #b45309;
+  --color-warning-soft: #fdf4e3;
+  --color-danger: #d93025;
+  --color-danger-soft: #fef2f1;
+  --color-info: var(--n-600);
+  --color-info-soft: var(--n-100);
+
+  /* 营销层——可换肤的部分，中性主题下是"安静的一条灰带" */
+  --promo-hero-bg: var(--n-100);
+  --promo-hero-text: var(--color-text);
+  --promo-hero-text-soft: var(--color-text-secondary);
+  --promo-badge-bg: var(--n-900);
+  --promo-badge-text: var(--n-0);
+
+  /* 卡片 */
+  --card-bg: var(--color-bg-surface);
+  --card-radius: var(--radius-lg);
+  --card-border: 1px solid var(--color-border);
+  --card-shadow: none;
+  --card-shadow-hover: var(--shadow-md);
+
+  /* 商品图占位底色——图挂了也像"货架空位"，而不是破图 */
+  --media-bg: var(--n-100);
+}
+
+/* ==========================================================================
+ * 大促皮肤
+ *
+ * 只覆盖 Layer 2 里与"气质"有关的 token。注意每个主题都要给一份
+ * --color-accent-rgb 裸三元组：Element Plus 内部用
+ * rgba(var(--el-color-primary-rgb), .1) 算外发光和 tag 底色，
+ * 这个变量要的是 "225, 37, 27" 这样的数字，没法用 color-mix 推出来。
+ * ==========================================================================*/
+
+[data-theme="promo-618"] {
+  --color-bg-page: #fff8f7;
+  --color-accent: #e1251b;
+  --color-accent-rgb: 225, 37, 27;
+  --color-accent-hover: #c81e15;
+  --color-accent-active: #a81610;
+  --color-accent-soft: #fdeceb;
+
+  --color-price: #e1251b;
+  --color-price-soft: #fdeceb;
+
+  --promo-hero-bg: linear-gradient(100deg, #c81e15 0%, #e1251b 45%, #ff6a3d 100%);
+  --promo-hero-text: #fff;
+  --promo-hero-text-soft: rgba(255, 255, 255, 0.82);
+  --promo-badge-bg: rgba(255, 255, 255, 0.92);
+  --promo-badge-text: #c81e15;
+}
+
+[data-theme="promo-double11"] {
+  --color-bg-page: #f9f8ff;
+  --color-accent: #6a3df0;
+  --color-accent-rgb: 106, 61, 240;
+  --color-accent-hover: #5b2ee0;
+  --color-accent-active: #4a22bd;
+  --color-accent-soft: #f0ecfe;
+
+  --color-price: #7c3aed;
+  --color-price-soft: #f0ecfe;
+
+  --promo-hero-bg: linear-gradient(100deg, #4a22bd 0%, #6a3df0 50%, #2563eb 100%);
+  --promo-hero-text: #fff;
+  --promo-hero-text-soft: rgba(255, 255, 255, 0.82);
+  --promo-badge-bg: rgba(255, 255, 255, 0.92);
+  --promo-badge-text: #4a22bd;
+}
+
+[data-theme="promo-spring"] {
+  --color-bg-page: #fffaf3;
+  --color-accent: #d97706;
+  --color-accent-rgb: 217, 119, 6;
+  --color-accent-hover: #b45309;
+  --color-accent-active: #92400e;
+  --color-accent-soft: #fdf1e0;
+
+  --color-price: #c2410c;
+  --color-price-soft: #fdf1e0;
+
+  --promo-hero-bg: linear-gradient(100deg, #b45309 0%, #d97706 50%, #f59e0b 100%);
+  --promo-hero-text: #fff;
+  --promo-hero-text-soft: rgba(255, 255, 255, 0.85);
+  --promo-badge-bg: rgba(255, 255, 255, 0.92);
+  --promo-badge-text: #b45309;
+}
+
+/* ==========================================================================
+ * Layer 3 — Element Plus 桥接
+ *
+ * ★ 这个文件必须在 element-plus/dist/index.css **之后**导入，
+ *   否则 EP 的 :root 定义会盖掉这里（优先级相同，后者胜）。
+ *
+ * color-mix 让 hover / disabled / 浅底色自动跟着强调色走，
+ * 换肤时不用逐个主题手写 9 档色阶。
+ * ==========================================================================*/
+
+:root {
+  --el-color-primary: var(--color-accent);
+  --el-color-primary-rgb: var(--color-accent-rgb);
+  --el-color-primary-light-3: color-mix(in srgb, var(--color-accent) 70%, #fff);
+  --el-color-primary-light-5: color-mix(in srgb, var(--color-accent) 50%, #fff);
+  --el-color-primary-light-7: color-mix(in srgb, var(--color-accent) 30%, #fff);
+  --el-color-primary-light-8: color-mix(in srgb, var(--color-accent) 20%, #fff);
+  --el-color-primary-light-9: color-mix(in srgb, var(--color-accent) 10%, #fff);
+  --el-color-primary-dark-2: color-mix(in srgb, var(--color-accent) 80%, #000);
+
+  --el-color-success: var(--color-success);
+  --el-color-success-light-3: color-mix(in srgb, var(--color-success) 70%, #fff);
+  --el-color-success-light-5: color-mix(in srgb, var(--color-success) 50%, #fff);
+  --el-color-success-light-8: color-mix(in srgb, var(--color-success) 20%, #fff);
+  --el-color-success-light-9: color-mix(in srgb, var(--color-success) 10%, #fff);
+  --el-color-success-dark-2: color-mix(in srgb, var(--color-success) 80%, #000);
+
+  --el-color-warning: var(--color-warning);
+  --el-color-warning-light-3: color-mix(in srgb, var(--color-warning) 70%, #fff);
+  --el-color-warning-light-5: color-mix(in srgb, var(--color-warning) 50%, #fff);
+  --el-color-warning-light-8: color-mix(in srgb, var(--color-warning) 20%, #fff);
+  --el-color-warning-light-9: color-mix(in srgb, var(--color-warning) 10%, #fff);
+  --el-color-warning-dark-2: color-mix(in srgb, var(--color-warning) 80%, #000);
+
+  --el-color-danger: var(--color-danger);
+  --el-color-danger-light-3: color-mix(in srgb, var(--color-danger) 70%, #fff);
+  --el-color-danger-light-5: color-mix(in srgb, var(--color-danger) 50%, #fff);
+  --el-color-danger-light-8: color-mix(in srgb, var(--color-danger) 20%, #fff);
+  --el-color-danger-light-9: color-mix(in srgb, var(--color-danger) 10%, #fff);
+  --el-color-danger-dark-2: color-mix(in srgb, var(--color-danger) 80%, #000);
+
+  --el-color-error: var(--color-danger);
+  --el-color-error-light-3: color-mix(in srgb, var(--color-danger) 70%, #fff);
+  --el-color-error-light-5: color-mix(in srgb, var(--color-danger) 50%, #fff);
+  --el-color-error-light-8: color-mix(in srgb, var(--color-danger) 20%, #fff);
+  --el-color-error-light-9: color-mix(in srgb, var(--color-danger) 10%, #fff);
+  --el-color-error-dark-2: color-mix(in srgb, var(--color-danger) 80%, #000);
+
+  --el-color-info: var(--color-info);
+  --el-color-info-light-3: color-mix(in srgb, var(--color-info) 70%, #fff);
+  --el-color-info-light-5: color-mix(in srgb, var(--color-info) 50%, #fff);
+  --el-color-info-light-8: color-mix(in srgb, var(--color-info) 20%, #fff);
+  --el-color-info-light-9: color-mix(in srgb, var(--color-info) 10%, #fff);
+  --el-color-info-dark-2: color-mix(in srgb, var(--color-info) 80%, #000);
+
+  /* 文字 */
+  --el-text-color-primary: var(--color-text);
+  --el-text-color-regular: var(--color-text-secondary);
+  --el-text-color-secondary: var(--color-text-tertiary);
+  --el-text-color-placeholder: var(--color-text-placeholder);
+  --el-text-color-disabled: var(--color-text-placeholder);
+
+  /* 描边 */
+  --el-border-color: var(--color-border-strong);
+  --el-border-color-hover: var(--color-text-tertiary);
+  --el-border-color-light: var(--color-border);
+  --el-border-color-lighter: var(--color-border);
+  --el-border-color-extra-light: var(--color-border);
+  --el-border-color-dark: var(--color-border-strong);
+  --el-border-color-darker: var(--color-border-strong);
+
+  /* 填充 */
+  --el-fill-color: var(--color-bg-subtle);
+  --el-fill-color-light: var(--color-bg-subtle);
+  --el-fill-color-lighter: var(--color-bg-subtle);
+  --el-fill-color-extra-light: var(--color-bg-page);
+  --el-fill-color-blank: var(--color-bg-surface);
+  --el-fill-color-dark: var(--n-200);
+  --el-fill-color-darker: var(--n-300);
+
+  /* 背景 */
+  --el-bg-color: var(--color-bg-surface);
+  --el-bg-color-page: var(--color-bg-page);
+  --el-bg-color-overlay: var(--color-bg-surface);
+
+  /* 圆角 / 字号 / 阴影 */
+  --el-border-radius-base: var(--radius-md);
+  --el-border-radius-small: var(--radius-sm);
+  --el-border-radius-round: var(--radius-pill);
+  --el-font-size-base: var(--text-base);
+  --el-font-size-small: var(--text-sm);
+  --el-font-size-extra-small: var(--text-xs);
+  --el-font-size-medium: var(--text-md);
+  --el-font-size-large: var(--text-lg);
+  --el-box-shadow: var(--shadow-md);
+  --el-box-shadow-light: var(--shadow-sm);
+  --el-box-shadow-lighter: var(--shadow-xs);
+  --el-box-shadow-dark: var(--shadow-lg);
+
+  /* 组件级 */
+  --el-card-bg-color: var(--color-bg-surface);
+  --el-card-border-color: var(--color-border);
+  --el-card-border-radius: var(--radius-lg);
+  --el-card-padding: var(--space-5);
+  --el-tag-border-radius: var(--radius-sm);
+  --el-disabled-bg-color: var(--color-bg-subtle);
+  --el-disabled-text-color: var(--color-text-placeholder);
+  --el-disabled-border-color: var(--color-border);
+  --el-transition-duration: var(--dur);
+  --el-mask-color: var(--color-bg-mask);
+}

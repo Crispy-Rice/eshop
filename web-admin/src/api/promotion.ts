@@ -1,0 +1,218 @@
+import { get, post } from './http'
+
+// ============================================================
+// 后端契约（取值必须与 backend/app/modules/promotion/models.py 对齐）
+// ============================================================
+
+/** 券类型 */
+export const COUPON_TYPE_THRESHOLD = 1
+export const COUPON_TYPE_DISCOUNT = 2
+export const COUPON_TYPE_NO_THRESHOLD = 3
+export const COUPON_TYPE_EXCHANGE = 4
+export const COUPON_TYPE_FREIGHT = 5
+
+export const COUPON_TYPE_TEXT: Record<number, string> = {
+  [COUPON_TYPE_THRESHOLD]: '满减券',
+  [COUPON_TYPE_DISCOUNT]: '折扣券',
+  [COUPON_TYPE_NO_THRESHOLD]: '无门槛券',
+  [COUPON_TYPE_EXCHANGE]: '兑换券',
+  [COUPON_TYPE_FREIGHT]: '运费券',
+}
+
+/** 有效期类型 */
+export const VALID_FIXED = 1
+export const VALID_DAYS_AFTER = 2
+
+/** 适用范围 */
+export const SCOPE_ALL = 1
+export const SCOPE_SKU = 2
+export const SCOPE_CATEGORY = 3
+export const SCOPE_SHOP = 4
+
+export const SCOPE_TYPE_TEXT: Record<number, string> = {
+  [SCOPE_ALL]: '全场',
+  [SCOPE_SKU]: '指定商品',
+  [SCOPE_CATEGORY]: '指定类目',
+  [SCOPE_SHOP]: '指定店铺',
+}
+
+/** 券模板状态 */
+export const TPL_NOT_STARTED = 1
+export const TPL_ONGOING = 2
+export const TPL_ENDED = 3
+export const TPL_VOID = 4
+
+/** 活动层级。**顺序是语义的一部分**，0 是最内层 */
+export const LEVEL_ITEM = 0
+export const LEVEL_SHOP = 1
+export const LEVEL_PLATFORM = 2
+
+export const LEVEL_TEXT: Record<number, string> = {
+  [LEVEL_ITEM]: '单品级',
+  [LEVEL_SHOP]: '店铺级',
+  [LEVEL_PLATFORM]: '平台级',
+}
+
+/** 活动优惠类型。这些字符串是叠加规则矩阵的键，不能改 */
+export const PROMO_TYPE_BY_LEVEL: Record<number, string> = {
+  [LEVEL_ITEM]: 'PROMO_ITEM',
+  [LEVEL_SHOP]: 'PROMO_ORDER_SHOP',
+  [LEVEL_PLATFORM]: 'PROMO_ORDER_PLATFORM',
+}
+
+export const PROMO_TYPE_TEXT: Record<string, string> = {
+  PROMO_ITEM: '单品促销',
+  PROMO_ORDER_SHOP: '店铺活动',
+  PROMO_ORDER_PLATFORM: '平台活动',
+}
+
+/** 计算方式 */
+export const CALC_DIRECT = 1
+export const CALC_RATE = 2
+export const CALC_FIXED = 3
+
+export const CALC_TYPE_TEXT: Record<number, string> = {
+  [CALC_DIRECT]: '直降',
+  [CALC_RATE]: '折扣',
+  [CALC_FIXED]: '特价',
+}
+
+// ============================================================
+// 类型
+// ============================================================
+export interface AdminCouponTemplate {
+  id: string
+  shopId: string
+  name: string
+  type: number
+  typeText: string
+  getType: number
+  discountValue: number
+  maxDiscount: number
+  threshold: number
+  totalCount: number
+  issuedCount: number
+  usedCount: number
+  perUserLimit: number
+  validType: number
+  validStart: string | null
+  validEnd: string | null
+  validDays: number | null
+  scopeType: number
+  /** ★ 字符串数组：雪花 ID 超 2^53，用 number 会丢精度 */
+  scopeValue: string[] | null
+  status: number
+  statusText: string
+  createdAt: string
+}
+
+export interface AdminPromoActivity {
+  id: string
+  name: string
+  level: number
+  levelText: string
+  type: string
+  typeText: string
+  calcType: number
+  calcTypeText: string
+  discountValue: number
+  maxDiscount: number
+  threshold: number
+  shopId: string
+  scopeType: number
+  scopeValue: string[] | null
+  startAt: string
+  endAt: string
+  priority: number
+  status: number
+  statusText: string
+  createdAt: string
+}
+
+export interface CursorPage<T> {
+  items: T[]
+  nextCursor: string | null
+  hasMore: boolean
+}
+
+export interface CouponTemplateInput {
+  name: string
+  shopId?: string
+  type: number
+  discountValue: number
+  maxDiscount?: number
+  threshold?: number
+  totalCount: number
+  perUserLimit?: number
+  validType: number
+  validStart?: string | null
+  validEnd?: string | null
+  validDays?: number | null
+  scopeType?: number
+  scopeValue?: number[] | null
+}
+
+export interface PromoActivityInput {
+  name: string
+  level: number
+  type: string
+  calcType: number
+  discountValue: number
+  maxDiscount?: number
+  threshold?: number
+  shopId?: string
+  scopeType?: number
+  scopeValue?: number[] | null
+  startAt: string
+  endAt: string
+  priority?: number
+}
+
+/** 补发的券。后端**只支持单个 userId**，没有批量也没有用户搜索。 */
+export interface IssuedCoupon {
+  id: string
+  code: string
+  name: string
+  validStart: string
+  validEnd: string
+}
+
+// ============================================================
+// 接口
+// ============================================================
+export function listCouponTemplates(params: {
+  status?: number
+  cursor?: string
+  limit?: number
+}): Promise<CursorPage<AdminCouponTemplate>> {
+  return get<CursorPage<AdminCouponTemplate>>('/admin/coupons/templates', { params })
+}
+
+export function createCouponTemplate(
+  payload: CouponTemplateInput,
+): Promise<AdminCouponTemplate> {
+  return post<AdminCouponTemplate>('/admin/coupons/templates', payload)
+}
+
+/** 客服补发。不占活动额度（issuedCount 不变），所以列表里看不到"已发"增加。 */
+export function issueCoupon(payload: {
+  templateId: string
+  userId: string
+  count?: number
+}): Promise<IssuedCoupon[]> {
+  return post<IssuedCoupon[]>('/admin/coupons/issue', payload)
+}
+
+export function listPromoActivities(params: {
+  status?: number
+  cursor?: string
+  limit?: number
+}): Promise<CursorPage<AdminPromoActivity>> {
+  return get<CursorPage<AdminPromoActivity>>('/admin/promotions', { params })
+}
+
+export function createPromoActivity(
+  payload: PromoActivityInput,
+): Promise<{ id: string; name: string }> {
+  return post<{ id: string; name: string }>('/admin/promotions', payload)
+}

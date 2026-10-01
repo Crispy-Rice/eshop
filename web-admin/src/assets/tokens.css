@@ -1,0 +1,258 @@
+/* ============================================================================
+ * 设计 token —— 企业级中后台极简高效风
+ *
+ * 与 web-mall 同源（同一套中性灰阶、同一套语义分层、同样把 --el-* 桥接过来），
+ * 但**尺度不同**：这里更密、更平、圆角更小，一切为"信息密度和效率"让路。
+ * 两个应用是两个独立的设计系统，不共享文件；改配色时记得两边都看一眼。
+ *
+ * 三层结构同 web-mall：
+ *   Layer 1 原始色板 / 尺度 → Layer 2 语义 token → Layer 3 Element Plus 桥接
+ * ==========================================================================*/
+
+/* ==========================================================================
+ * Layer 1 — 原始色板
+ * ==========================================================================*/
+
+:root {
+  /* 与 web-mall 完全一致的中性灰阶，保证两个应用是一套产品 */
+  --n-0: #ffffff;
+  --n-25: #fcfcfc;
+  --n-50: #f7f7f8;
+  --n-100: #f1f1f3;
+  --n-150: #ebebed;
+  --n-200: #e4e4e7;
+  --n-300: #d4d4d8;
+  --n-400: #a1a1aa;
+  --n-500: #71717a;
+  --n-600: #52525b;
+  --n-700: #3f3f46;
+  --n-800: #27272a;
+  --n-900: #18181b;
+  --n-1000: #09090b;
+
+  /* 间距：同样是 4px 基准，但后台实际用到的档位更小 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* 圆角：整体比前台小一档 —— 这是"工具感"和"商城感"最直接的分界 */
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-lg: 6px;
+  --radius-pill: 999px;
+
+  /* 字号：比前台密一档，表格里 12~13px 是信息密度的舒适区 */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-2xl: 22px;
+
+  --leading-tight: 1.25;
+  --leading-snug: 1.4;
+  --leading-normal: 1.5;
+
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* 阴影：后台几乎不用。靠边框和底色分层，投影会显得"糊" */
+  --shadow-xs: 0 1px 2px rgba(9, 9, 11, 0.04);
+  --shadow-sm: 0 1px 3px rgba(9, 9, 11, 0.06);
+  --shadow-md: 0 4px 12px rgba(9, 9, 11, 0.08);
+  --shadow-lg: 0 12px 28px rgba(9, 9, 11, 0.12);
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 100ms;
+  --dur: 150ms;
+
+  --z-sticky: 100;
+  --z-header: 200;
+  --z-overlay: 1000;
+
+  --layout-max: 1200px;
+  --layout-gutter: var(--space-6);
+  --header-h: 56px;
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Noto Sans SC", "Microsoft YaHei", sans-serif;
+}
+
+/* ==========================================================================
+ * Layer 2 — 语义 token
+ *
+ * 后台只有一套主题，但**照搬了前台的分层结构**：
+ * 将来要加大促皮肤，在下面加一个 [data-theme=...] 块覆盖这几个值即可，
+ * 不用改任何组件。这是"可扩展"的具体含义。
+ * ==========================================================================*/
+
+:root {
+  /* 表面：页面底比卡片深一档，靠底色就能分出不规则区块，不必到处加边框 */
+  --color-bg-page: var(--n-100);
+  --color-bg-surface: var(--n-0);
+  --color-bg-subtle: var(--n-50);
+  --color-bg-inset: var(--n-50);
+  --color-bg-hover: var(--n-100);
+  --color-bg-mask: rgba(9, 9, 11, 0.45);
+
+  /* 图片占位底色。多个页面在用（评价图、售后凭证、订单缩略图），
+     但此前**只在页面里被引用、从未定义** —— 等于没生效。
+     走中性色阶，换肤时它不该跟着变（占位图本就该是中性灰）。 */
+  --media-bg: var(--n-100);
+
+  --color-border: var(--n-200);
+  --color-border-strong: var(--n-300);
+
+  --color-text: var(--n-900);
+  --color-text-secondary: var(--n-600);
+  --color-text-tertiary: var(--n-500);
+  --color-text-placeholder: var(--n-400);
+  --color-text-inverse: var(--n-0);
+
+  /* 强调色同样是墨黑：和前台默认皮肤一致，两个应用看起来是一套产品 */
+  --color-accent: var(--n-900);
+  --color-accent-rgb: 24, 24, 27;
+  --color-accent-hover: var(--n-800);
+  --color-accent-active: var(--n-1000);
+  --color-accent-soft: var(--n-100);
+  --color-accent-contrast: var(--n-0);
+
+  /* 金额沿用交易红。后台看的是"价格"，不是"促销价"，所以不参与换肤 */
+  --color-price: #d93025;
+  --color-price-soft: #fef2f1;
+
+  /* 状态色。后台高频用作标签，所以 soft 底色要足够淡，整屏才不吵 */
+  --color-success: #0f7b3f;
+  --color-success-soft: #e9f7ef;
+  --color-warning: #b45309;
+  --color-warning-soft: #fdf4e3;
+  --color-danger: #d93025;
+  --color-danger-soft: #fef2f1;
+  --color-info: var(--n-600);
+  --color-info-soft: var(--n-100);
+
+  /* 表格：后台的主角，单独抽出来方便统一调密度。
+     ★ 注意这几个只是"原料"，不能直接写进 --el-table-*：Element Plus 把
+       --el-table-* 定义在 `.el-table` 元素上（组件作用域），写在 :root 上会被它盖掉。
+       真正的桥接在 base.css 的 `.el-table` 块里。 */
+  --table-header-bg: var(--n-50);
+  --table-header-text: var(--n-500);
+  --table-row-hover: var(--n-50);
+  --table-border: var(--n-200);
+  --table-cell-py: var(--space-3);
+}
+
+/* ==========================================================================
+ * Layer 3 — Element Plus 桥接
+ *
+ * ★ 必须在 element-plus/dist/index.css **之后**导入，靠"后者胜"覆盖 EP 默认值。
+ * ==========================================================================*/
+
+:root {
+  --el-color-primary: var(--color-accent);
+  --el-color-primary-rgb: var(--color-accent-rgb);
+  --el-color-primary-light-3: color-mix(in srgb, var(--color-accent) 70%, #fff);
+  --el-color-primary-light-5: color-mix(in srgb, var(--color-accent) 50%, #fff);
+  --el-color-primary-light-7: color-mix(in srgb, var(--color-accent) 30%, #fff);
+  --el-color-primary-light-8: color-mix(in srgb, var(--color-accent) 20%, #fff);
+  --el-color-primary-light-9: color-mix(in srgb, var(--color-accent) 10%, #fff);
+  --el-color-primary-dark-2: color-mix(in srgb, var(--color-accent) 80%, #000);
+
+  --el-color-success: var(--color-success);
+  --el-color-success-light-3: color-mix(in srgb, var(--color-success) 70%, #fff);
+  --el-color-success-light-5: color-mix(in srgb, var(--color-success) 50%, #fff);
+  --el-color-success-light-8: color-mix(in srgb, var(--color-success) 20%, #fff);
+  --el-color-success-light-9: color-mix(in srgb, var(--color-success) 10%, #fff);
+  --el-color-success-dark-2: color-mix(in srgb, var(--color-success) 80%, #000);
+
+  --el-color-warning: var(--color-warning);
+  --el-color-warning-light-3: color-mix(in srgb, var(--color-warning) 70%, #fff);
+  --el-color-warning-light-5: color-mix(in srgb, var(--color-warning) 50%, #fff);
+  --el-color-warning-light-8: color-mix(in srgb, var(--color-warning) 20%, #fff);
+  --el-color-warning-light-9: color-mix(in srgb, var(--color-warning) 10%, #fff);
+  --el-color-warning-dark-2: color-mix(in srgb, var(--color-warning) 80%, #000);
+
+  --el-color-danger: var(--color-danger);
+  --el-color-danger-light-3: color-mix(in srgb, var(--color-danger) 70%, #fff);
+  --el-color-danger-light-5: color-mix(in srgb, var(--color-danger) 50%, #fff);
+  --el-color-danger-light-8: color-mix(in srgb, var(--color-danger) 20%, #fff);
+  --el-color-danger-light-9: color-mix(in srgb, var(--color-danger) 10%, #fff);
+  --el-color-danger-dark-2: color-mix(in srgb, var(--color-danger) 80%, #000);
+
+  --el-color-error: var(--color-danger);
+  --el-color-error-light-3: color-mix(in srgb, var(--color-danger) 70%, #fff);
+  --el-color-error-light-5: color-mix(in srgb, var(--color-danger) 50%, #fff);
+  --el-color-error-light-8: color-mix(in srgb, var(--color-danger) 20%, #fff);
+  --el-color-error-light-9: color-mix(in srgb, var(--color-danger) 10%, #fff);
+  --el-color-error-dark-2: color-mix(in srgb, var(--color-danger) 80%, #000);
+
+  --el-color-info: var(--color-info);
+  --el-color-info-light-3: color-mix(in srgb, var(--color-info) 70%, #fff);
+  --el-color-info-light-5: color-mix(in srgb, var(--color-info) 50%, #fff);
+  --el-color-info-light-8: color-mix(in srgb, var(--color-info) 20%, #fff);
+  --el-color-info-light-9: color-mix(in srgb, var(--color-info) 10%, #fff);
+  --el-color-info-dark-2: color-mix(in srgb, var(--color-info) 80%, #000);
+
+  --el-text-color-primary: var(--color-text);
+  --el-text-color-regular: var(--color-text-secondary);
+  --el-text-color-secondary: var(--color-text-tertiary);
+  --el-text-color-placeholder: var(--color-text-placeholder);
+  --el-text-color-disabled: var(--color-text-placeholder);
+
+  --el-border-color: var(--color-border-strong);
+  --el-border-color-hover: var(--color-text-tertiary);
+  --el-border-color-light: var(--color-border);
+  --el-border-color-lighter: var(--color-border);
+  --el-border-color-extra-light: var(--color-border);
+  --el-border-color-dark: var(--color-border-strong);
+  --el-border-color-darker: var(--color-border-strong);
+
+  --el-fill-color: var(--color-bg-subtle);
+  --el-fill-color-light: var(--color-bg-subtle);
+  --el-fill-color-lighter: var(--color-bg-subtle);
+  --el-fill-color-extra-light: var(--color-bg-page);
+  --el-fill-color-blank: var(--color-bg-surface);
+  --el-fill-color-dark: var(--n-200);
+  --el-fill-color-darker: var(--n-300);
+
+  --el-bg-color: var(--color-bg-surface);
+  --el-bg-color-page: var(--color-bg-page);
+  --el-bg-color-overlay: var(--color-bg-surface);
+
+  /* 圆角统一取 --radius-sm(3px)：比前台的 6px 明显更"工具" */
+  --el-border-radius-base: var(--radius-md);
+  --el-border-radius-small: var(--radius-sm);
+  --el-border-radius-round: var(--radius-pill);
+  --el-font-size-base: var(--text-base);
+  --el-font-size-small: var(--text-sm);
+  --el-font-size-extra-small: var(--text-xs);
+  --el-font-size-medium: var(--text-md);
+  --el-font-size-large: var(--text-lg);
+  --el-box-shadow: var(--shadow-md);
+  --el-box-shadow-light: var(--shadow-sm);
+  --el-box-shadow-lighter: var(--shadow-xs);
+  --el-box-shadow-dark: var(--shadow-lg);
+
+  /* 组件级 */
+  --el-card-bg-color: var(--color-bg-surface);
+  --el-card-border-color: var(--color-border);
+  --el-card-border-radius: var(--radius-lg);
+  --el-card-padding: var(--space-4);
+  --el-tag-border-radius: var(--radius-sm);
+  --el-disabled-bg-color: var(--color-bg-subtle);
+  --el-disabled-text-color: var(--color-text-placeholder);
+  --el-disabled-border-color: var(--color-border);
+  --el-transition-duration: var(--dur);
+  --el-mask-color: var(--color-bg-mask);
+}

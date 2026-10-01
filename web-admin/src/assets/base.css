@@ -1,0 +1,235 @@
+/* ============================================================================
+ * 全局基础样式 —— 企业级中后台
+ *
+ * 职责：reset、排版基线、Element Plus 组件的**密度与质感**统一。
+ * 颜色/间距/圆角一律引用 tokens.css 的语义 token，不要写死色值。
+ *
+ * 导入顺序必须是：element-plus/dist/index.css → tokens.css → base.css
+ * ==========================================================================*/
+
+/* --------------------------------------------------------------------------
+ * Reset 与排版基线
+ * ------------------------------------------------------------------------*/
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--color-text);
+  background-color: var(--color-bg-page);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p,
+figure {
+  margin: 0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+button {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+}
+
+/* 数字等宽：金额列、销量列竖着扫不会左右跳 */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--n-300) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--n-300);
+  background-clip: content-box;
+  border: 2px solid transparent;
+  border-radius: var(--radius-pill);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--n-400);
+  background-clip: content-box;
+}
+
+/* --------------------------------------------------------------------------
+ * Element Plus：输入控件
+ * ------------------------------------------------------------------------*/
+
+.el-button {
+  font-weight: var(--weight-medium);
+}
+
+/* EP 用 inset box-shadow 当边框，换成更中性的描边色 */
+.el-input__wrapper,
+.el-textarea__inner {
+  box-shadow: 0 0 0 1px var(--color-border) inset;
+}
+
+.el-input__wrapper:hover,
+.el-textarea__inner:hover {
+  box-shadow: 0 0 0 1px var(--color-border-strong) inset;
+}
+
+.el-input__wrapper.is-focus,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px var(--color-accent) inset;
+}
+
+/* --------------------------------------------------------------------------
+ * Element Plus：卡片
+ * ------------------------------------------------------------------------*/
+
+.el-card {
+  box-shadow: none;
+}
+
+.el-card__header {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+
+.el-card__body {
+  padding: var(--space-4);
+}
+
+/* --------------------------------------------------------------------------
+ * Element Plus：表格 —— 后台的主角
+ *
+ * ★ 表格变量必须打在 `.el-table` 上，不能放在 tokens.css 的 :root 里：
+ *   EP 自己就是在 `.el-table` 作用域定义 `--el-table-*` 的，:root 那层的赋值
+ *   会被它盖掉（组件作用域离元素更近）。这里同选择器、后加载，才盖得住。
+ * ------------------------------------------------------------------------*/
+
+.el-table {
+  --el-table-bg-color: var(--color-bg-surface);
+  --el-table-tr-bg-color: var(--color-bg-surface);
+  --el-table-header-bg-color: var(--table-header-bg);
+  --el-table-header-text-color: var(--table-header-text);
+  --el-table-text-color: var(--color-text);
+  --el-table-border-color: var(--table-border);
+  --el-table-row-hover-bg-color: var(--table-row-hover);
+  --el-table-fixed-box-shadow: none;
+}
+
+.el-table th.el-table__cell {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  padding: var(--space-2) 0;
+}
+
+.el-table td.el-table__cell {
+  padding: var(--table-cell-py) 0;
+}
+
+.el-table .cell {
+  line-height: var(--leading-snug);
+}
+
+/* 表格自带外框会和 card 的边框叠成双线 */
+.el-table--border {
+  border-color: var(--color-border);
+}
+
+/* --------------------------------------------------------------------------
+ * Element Plus：标签 / 提示 / 表单
+ *
+ * 状态标签的柔和底色由 tokens.css 的 color-mix 桥接自动生成
+ * （--el-color-*-light-9 就是 10% 状态色 + 白），这里只调形状。
+ * ------------------------------------------------------------------------*/
+
+.el-tag {
+  border-radius: var(--radius-sm);
+  font-weight: var(--weight-medium);
+}
+
+.el-alert {
+  border-radius: var(--radius-md);
+}
+
+.el-form-item__label {
+  font-size: var(--text-base);
+  color: var(--color-text-secondary);
+}
+
+.el-descriptions__label {
+  font-weight: var(--weight-medium);
+  color: var(--color-text-tertiary);
+}
+
+.el-empty__description p {
+  color: var(--color-text-tertiary);
+}
+
+/* 分段控件（状态筛选）做成贴着工具栏的一组按钮，去掉胶囊感 */
+.el-radio-group .el-radio-button__inner {
+  font-weight: var(--weight-normal);
+}
+
+.el-radio-group .el-radio-button__original-radio:checked + .el-radio-button__inner {
+  font-weight: var(--weight-medium);
+  box-shadow: none;
+}

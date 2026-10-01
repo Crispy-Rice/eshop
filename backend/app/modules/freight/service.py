@@ -1,0 +1,438 @@
+"""freight 模块的领域逻辑。
+
+分两块：
+
+- **模板配置**（商家）：建/改模板、区域规则、不发货区域、SKU 绑定，
+  以及 docs/06 §12 点名的那些配置校验
+- **计算入口**：把"商品行 + 收货区域"解析成引擎需要的 ``FreightItem``，
+  再交给纯函数 ``calculator.calc_freight``
+
+解析这一步是 IO，计算那一步不是 —— 分开才能让引擎保持可在单测里复现。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.errors import BizError, ErrorCode
+from app.core.snowflake import next_id
+from app.modules.freight import repository as repo
+from app.modules.freight.calculator import (
+    FreightItem,
+    FreightResult,
+    FreightRule,
+    RegionRuleEntry,
+    calc_freight,
+    pick_region_rule,
+)
+from app.modules.freight.models import (
+    CHARGE_BY_WEIGHT,
+    REGION_ALL,
+    FreightExcludeRegion,
+    FreightRegionRule,
+    FreightTemplate,
+    SkuFreightBind,
+)
+from app.modules.freight.schemas import (
+    ExcludeRegionIn,
+    FreightTemplateCreateRequest,
+    FreightTemplateUpdateRequest,
+    RegionRuleIn,
+)
+
+# 商品的兜底重量（历史脏数据 weight_g = 0 时用），与引擎里的常量一致
+FALLBACK_WEIGHT_G = 500
+
+
+@dataclass(slots=True)
+class FreightLine:
+    """算价时传进来的一行商品。"""
+
+    sku_id: int
+    num: int
+    weight_g: int
+    amount: int
+    shop_id: int
+    title: str = ""
+
+
+# ============================================================
+# 配置校验（docs/06 §12）
+# ============================================================
+def validate_template(req: FreightTemplateCreateRequest | FreightTemplateUpdateRequest) -> None:
+    """模板参数的校验。
+
+    ``first_unit`` 的规则有个例外：**按件数计费时它表示"首件数"，可以是 0**
+    （等于没有免费额度，第一件就开始收首重价）；按重量时必须是正数，
+    否则"首重 0 克"会让计费公式失去意义。
+    """
+    if req.first_price < 0:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "首重价不能为负")
+    if req.add_price < 0:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "续重价不能为负")
+    if req.add_unit <= 0:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "续重单位必须大于 0")
+    if req.charge_type == CHARGE_BY_WEIGHT and req.first_unit <= 0:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "按重量计费时首重必须大于 0")
+    if req.free_threshold < 0 or req.free_num < 0:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "包邮门槛不能为负")
+
+
+def validate_region_rules(rules: list[RegionRuleIn]) -> None:
+    """区域规则的整体校验。
+
+    ★ **必须有"全国默认"规则**（``region_code = "0"``）。否则除了显式配置的
+    省市之外，其他地区一条规则都匹配不到，用户结算时会被"该地区不配送"拦住 ——
+    而商家的本意显然不是这样。这是 docs/06 §12 点名的第 3 条。
+    """
+    if not rules:
+        return
+    if not any(r.region_code == REGION_ALL for r in rules):
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            '配置了区域规则就必须同时保留一条"全国默认"，否则其他地区无法下单',
+        )
+    seen: set[str] = set()
+    for r in rules:
+        if r.region_code in seen:
+            raise BizError(ErrorCode.VALIDATION_ERROR, f"区域 {r.region_code} 重复配置")
+        seen.add(r.region_code)
+        if r.add_unit <= 0:
+            raise BizError(ErrorCode.VALIDATION_ERROR, "续重单位必须大于 0")
+        if r.first_price < 0 or r.add_price < 0:
+            raise BizError(ErrorCode.VALIDATION_ERROR, "运费不能为负")
+
+
+def validate_exclude_regions(
+    exclude_codes: Sequence[str], delivered_codes: set[str]
+) -> None:
+    """不发货区域不能与已配置的配送区域冲突（docs/06 §12 第 4 条）。
+
+    只挡住"精确同码"的情况 —— 省级排除 + 市级配送这种更细的冲突判断起来很绕，
+    而且实际业务里商家不会这么配。**宁可少判，不要误判**。
+    """
+    for code in exclude_codes:
+        if code in delivered_codes:
+            raise BizError(
+                ErrorCode.VALIDATION_ERROR,
+                f"区域 {code} 既配了配送规则又配了不发货，请二选一",
+            )
+
+
+# ============================================================
+# 模板 CRUD
+# ============================================================
+async def create_template(
+    session: AsyncSession, shop_id: int, req: FreightTemplateCreateRequest
+) -> FreightTemplate:
+    validate_template(req)
+    tpl = FreightTemplate(
+        id=next_id(),
+        shop_id=shop_id,
+        name=req.name,
+        charge_type=req.charge_type,
+        first_unit=req.first_unit,
+        first_price=req.first_price,
+        add_unit=req.add_unit,
+        add_price=req.add_price,
+        free_shipping=req.free_shipping,
+        free_threshold=req.free_threshold,
+        free_num=req.free_num,
+        merge_type=req.merge_type,
+        status=1,
+    )
+    return await repo.insert_template(session, tpl)
+
+
+async def update_template(
+    session: AsyncSession, shop_id: int, template_id: int, req: FreightTemplateUpdateRequest
+) -> tuple[FreightTemplate, int]:
+    """改模板。返回 ``(模板, 受影响的 SKU 数)``。
+
+    影响面要给商家看：改了之后**新建订单立刻生效，已下单的不受影响**
+    ——因为订单里存的是运费的计算快照（docs/06 §12 第 6 点）。
+    """
+    validate_template(req)
+    tpl = await repo.get_shop_template(session, shop_id, template_id)
+    if tpl is None:
+        raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
+
+    tpl.name = req.name
+    tpl.charge_type = req.charge_type
+    tpl.first_unit = req.first_unit
+    tpl.first_price = req.first_price
+    tpl.add_unit = req.add_unit
+    tpl.add_price = req.add_price
+    tpl.free_shipping = req.free_shipping
+    tpl.free_threshold = req.free_threshold
+    tpl.free_num = req.free_num
+    tpl.merge_type = req.merge_type
+    tpl.status = req.status
+
+    affected = await repo.count_binds_of_template(session, template_id)
+    return tpl, affected
+
+
+async def replace_region_rules(
+    session: AsyncSession, shop_id: int, template_id: int, rules: list[RegionRuleIn]
+) -> int:
+    """整体替换区域规则。返回规则条数。
+
+    整体替换而不是增删改：区域规则是一组配置，逐条 diff 的复杂度远高于收益。
+    """
+    tpl = await repo.get_shop_template(session, shop_id, template_id)
+    if tpl is None:
+        raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
+
+    validate_region_rules(rules)
+    # 与现有的不发货区域做一次交叉校验，避免两边配了同一个区域
+    existing_excludes = await repo.list_exclude_regions(session, template_id)
+    validate_exclude_regions(
+        [r.region_code for r in rules],
+        {e.region_code for e in existing_excludes},
+    )
+
+    await repo.delete_region_rules(session, template_id)
+    if rules:
+        await repo.insert_region_rules(
+            session,
+            [
+                FreightRegionRule(
+                    id=next_id(),
+                    template_id=template_id,
+                    region_code=r.region_code,
+                    region_level=r.region_level,
+                    first_unit=r.first_unit,
+                    first_price=r.first_price,
+                    add_unit=r.add_unit,
+                    add_price=r.add_price,
+                    free_shipping=r.free_shipping,
+                    enabled=r.enabled,
+                    priority=r.priority,
+                )
+                for r in rules
+            ],
+        )
+    return len(rules)
+
+
+async def replace_exclude_regions(
+    session: AsyncSession, shop_id: int, template_id: int, excludes: list[ExcludeRegionIn]
+) -> int:
+    tpl = await repo.get_shop_template(session, shop_id, template_id)
+    if tpl is None:
+        raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
+
+    rules = await repo.list_region_rules(session, template_id)
+    validate_exclude_regions(
+        [e.region_code for e in excludes],
+        {r.region_code for r in rules if r.region_code != REGION_ALL},
+    )
+
+    await repo.delete_exclude_regions(session, template_id)
+    if excludes:
+        await repo.insert_exclude_regions(
+            session,
+            [
+                FreightExcludeRegion(
+                    id=next_id(),
+                    template_id=template_id,
+                    region_code=e.region_code,
+                    reason=e.reason,
+                )
+                for e in excludes
+            ],
+        )
+    return len(excludes)
+
+
+async def bind_sku(
+    session: AsyncSession,
+    shop_id: int,
+    *,
+    sku_id: int,
+    template_id: int,
+    warehouse_id: int,
+    priority: int = 0,
+) -> None:
+    """把 SKU 绑到运费模板。同一 (SKU, 模板, 仓库) 重复绑定时更新优先级。"""
+    tpl = await repo.get_shop_template(session, shop_id, template_id)
+    if tpl is None:
+        raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
+    await repo.upsert_bind(
+        session,
+        sku_id=sku_id,
+        template_id=template_id,
+        warehouse_id=warehouse_id,
+        priority=priority,
+        bind_id=next_id(),
+    )
+
+
+async def list_binds(
+    session: AsyncSession, shop_id: int, template_id: int
+) -> list[SkuFreightBind]:
+    """某个模板绑了哪些 SKU。
+
+    先校验模板属于本店 —— 否则拿别人的 template_id 就能问出"他绑了哪些 SKU"。
+    与 ``bind_sku`` 同样的归属检查，不存在与无权一律回 404（不区分两者）。
+    """
+    tpl = await repo.get_shop_template(session, shop_id, template_id)
+    if tpl is None:
+        raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
+    return await repo.list_binds_by_template(session, template_id)
+
+
+async def list_templates(session: AsyncSession, shop_id: int) -> list[FreightTemplate]:
+    return await repo.list_templates(session, shop_id)
+
+
+async def list_region_rules(session: AsyncSession, shop_id: int, template_id: int):
+    tpl = await repo.get_shop_template(session, shop_id, template_id)
+    if tpl is None:
+        raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
+    return await repo.list_region_rules(session, template_id)
+
+
+async def list_exclude_regions(session: AsyncSession, shop_id: int, template_id: int):
+    tpl = await repo.get_shop_template(session, shop_id, template_id)
+    if tpl is None:
+        raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
+    return await repo.list_exclude_regions(session, template_id)
+
+
+# ============================================================
+# 计算入口
+# ============================================================
+def _to_rule(tpl: FreightTemplate, region) -> FreightRule:
+    """模板 + 区域规则 → 最终计费规则。区域规则优先级高于模板默认值。"""
+    if region is None:
+        return FreightRule(
+            charge_type=tpl.charge_type,
+            first_unit=tpl.first_unit,
+            first_price=tpl.first_price,
+            add_unit=tpl.add_unit,
+            add_price=tpl.add_price,
+            free_shipping=tpl.free_shipping,
+            free_threshold=tpl.free_threshold,
+        )
+    return FreightRule(
+        charge_type=tpl.charge_type,
+        first_unit=region.first_unit,
+        first_price=region.first_price,
+        add_unit=region.add_unit,
+        add_price=region.add_price,
+        free_shipping=region.free_shipping or tpl.free_shipping,
+        free_threshold=tpl.free_threshold,
+    )
+
+
+async def estimate(
+    session: AsyncSession,
+    *,
+    lines: Sequence[FreightLine],
+    region_code: str,
+    warehouses: dict[int, int],
+) -> FreightResult:
+    """算整单运费。
+
+    :param warehouses: ``sku_id -> warehouse_id``，由调用方从库存模块取。
+        **没有发货仓的 SKU 直接拒绝** —— 不知道该从哪发，就算不出运费。
+    """
+    if not lines:
+        return FreightResult(total=0, packages=[], notices=[])
+
+    sku_ids = [ln.sku_id for ln in lines]
+    binds = await repo.list_binds_by_skus(session, sku_ids)
+
+    # 每个 SKU 取优先级最高的那条绑定
+    bind_of: dict[int, SkuFreightBind] = {}
+    for b in binds:
+        bind_of.setdefault(b.sku_id, b)
+
+    tpl_ids = {b.template_id for b in bind_of.values()}
+    if not tpl_ids:
+        first = lines[0]
+        raise BizError(
+            ErrorCode.SKU_NOT_SUPPORTED,
+            f"「{first.title or first.sku_id}」还没有绑定运费模板，无法计算运费",
+        )
+
+    templates = {t.id: t for t in await repo.list_templates_by_ids(session, list(tpl_ids))}
+    region_rules = await repo.list_region_rules_by_templates(session, list(tpl_ids))
+    excludes = await repo.list_exclude_by_templates(session, list(tpl_ids))
+
+    # 按模板分组，避免每条 SKU 都重新筛一遍
+    rules_of: dict[int, list[FreightRegionRule]] = {}
+    for r in region_rules:
+        rules_of.setdefault(r.template_id, []).append(r)
+    exclude_of: dict[int, set[str]] = {}
+    for e in excludes:
+        exclude_of.setdefault(e.template_id, set()).add(e.region_code)
+
+    items: list[FreightItem] = []
+    for ln in lines:
+        bind = bind_of.get(ln.sku_id)
+        if bind is None:
+            raise BizError(
+                ErrorCode.SKU_NOT_SUPPORTED,
+                f"「{ln.title or ln.sku_id}」还没有绑定运费模板，无法计算运费",
+            )
+        tpl = templates.get(bind.template_id)
+        if tpl is None or tpl.status != 1:
+            raise BizError(ErrorCode.SKU_NOT_SUPPORTED, f"「{ln.title}」的运费模板已停用")
+
+        # ① 不发货区域：直接拦住，不进计算
+        if _region_excluded(exclude_of.get(tpl.id, set()), region_code):
+            raise BizError(
+                ErrorCode.NOT_DELIVERABLE,
+                f"「{ln.title or ln.sku_id}」暂不支持配送至该地区",
+            )
+
+        # ② 区域规则覆盖模板默认值
+        entries = [
+            RegionRuleEntry(
+                region_code=r.region_code,
+                region_level=r.region_level,
+                priority=r.priority,
+                rule=_to_rule(tpl, r),
+            )
+            for r in rules_of.get(tpl.id, [])
+            if r.enabled
+        ]
+        picked = pick_region_rule(entries, region_code) if entries else None
+        rule = picked.rule if picked else _to_rule(tpl, None)
+
+        items.append(
+            FreightItem(
+                sku_id=ln.sku_id,
+                num=ln.num,
+                weight_g=ln.weight_g if ln.weight_g > 0 else FALLBACK_WEIGHT_G,
+                amount=ln.amount,
+                warehouse_id=warehouses.get(ln.sku_id, 0),
+                template_id=tpl.id,
+                title=ln.title,
+                rule=rule,
+            )
+        )
+
+    return calc_freight(
+        items,
+        template_names={t.id: t.name for t in templates.values()},
+        free_num_of={t.id: t.free_num for t in templates.values()},
+        merge_type_of={t.id: t.merge_type for t in templates.values()},
+    )
+
+
+def _region_excluded(excluded: set[str], region_code: str) -> bool:
+    """收货区域是否在排除名单里（支持前缀：排除整个省就挡住该省所有市）。"""
+    if not region_code:
+        return False
+    return any(
+        code == REGION_ALL or region_code == code or region_code.startswith(code)
+        for code in excluded
+        if code
+    )

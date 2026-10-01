@@ -1,0 +1,241 @@
+# ============================================================
+# eshop 生产部署（Docker Compose）
+#
+# 用法（在 deploy/ 目录下）：
+#   docker compose build
+#   docker compose run --rm migrate        # 迁移 + 审计表加固
+#   docker compose up -d
+#   curl http://127.0.0.1/healthz
+#
+# 2 核 2G 的演示机叠加覆盖文件（内存裁剪）：
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+#
+# ★ 密钥全部来自同目录的 .env（权限 600）。本文件里只有 ${VAR} 引用，
+#   不含任何真实值，可以提交到仓库。
+#
+# ★ 关于密钥的一处已知取舍：数据库口令走 compose 的 env_file 注入容器环境，
+#   因此 `docker inspect eshop-postgres` 能读到它（需要宿主机 root）。
+#   应用容器的 JWT_SECRET 等同理。要做到 inspect 也读不到，得把所有密钥
+#   改走 docker secrets（应用侧再支持 *_FILE 后缀）。演示环境不做这层，
+#   但**不要**把 `docker inspect` 的输出贴到任何外部地方。
+#
+# ★ volume 全部是宿主机绝对路径绑定（/data/...），不用命名卷 ——
+#   数据和系统盘分开，便于快照与扩容（docs/16 §5.1）。
+#   宿主机目录的属主要提前设好，见 deploy/scripts/prepare-host.sh。
+# ============================================================
+
+name: eshop
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"      # 防止日志写满磁盘
+    max-file: "5"
+
+# api / worker / migrate 共用同一个镜像，只是启动命令不同
+x-app: &app
+  image: eshop-api:${APP_VERSION:-dev}
+  env_file: .env
+  restart: unless-stopped
+  logging: *logging
+  deploy:
+    resources:
+      limits:
+        memory: 512m
+
+services:
+  # ============================================================
+  # PostgreSQL
+  # ============================================================
+  postgres:
+    image: postgres:17.6
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      # init 脚本（init/01-init.sh）用这四个变量建应用角色与只读角色
+      POSTGRES_USER: ${POSTGRES_OWNER_USER:-eshop_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD 未设置}
+      POSTGRES_DB: ${POSTGRES_DB:-eshop}
+      APP_USER: ${POSTGRES_APP_USER:-eshop_app}
+      APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD 未设置}
+      READONLY_USER: ${POSTGRES_READONLY_USER:-eshop_readonly}
+      READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD:?POSTGRES_READONLY_PASSWORD 未设置}
+    volumes:
+      - /data/pgdata:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      # 只在数据目录为空时执行（首次初始化），后续升级不会重跑
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    ports:
+      # ★ 只绑本机回环：外部必须经 SSH 隧道才能连（docs/16 §4.1），
+      #   安全组也绝不能放行 15432/5432
+      - "127.0.0.1:15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_OWNER_USER:-eshop_owner} -d ${POSTGRES_DB:-eshop}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    shm_size: 256mb
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+
+  # ============================================================
+  # Redis
+  # ============================================================
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      # 只给健康检查用的 redis-cli 读，避免在命令行上再写一遍口令
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD 未设置}
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD 未设置}
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      # ★★ noeviction 不是性能选项，是**正确性**选项。
+      #    库存与券的可售量存在 Redis 里，一旦内存触顶按 LRU 淘汰，
+      #    库存键会凭空消失 —— 表现就是超卖。宁可直接写失败（应用侧有
+      #    DB 兜底与对账），也不能静默丢键。
+      - --maxmemory-policy
+      - noeviction
+      - --maxmemory
+      - 1536mb
+      - --save
+      - "900 1"
+      # 生产环境关掉危险命令（docs/16 §9 检查清单第 6 条）
+      - --rename-command
+      - FLUSHALL
+      - ""
+      - --rename-command
+      - FLUSHDB
+      - ""
+      - --rename-command
+      - KEYS
+      - ""
+    volumes:
+      - /data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  # ============================================================
+  # 迁移（一次性，跑完退出）
+  # ============================================================
+  migrate:
+    <<: *app
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      # 迁移失败必须让整个发布停下（docs/16 §5.3 第 4 步）
+      - |
+        set -e
+        alembic upgrade head
+        python scripts/harden_grants.py
+
+  # ============================================================
+  # API
+  # ============================================================
+  api:
+    <<: *app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # 等迁移跑完再起，避免新代码撞旧表结构
+      migrate:
+        condition: service_completed_successfully
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - ${API_WORKERS:-4}
+    volumes:
+      # 上传目录要可写。容器以 uid 10001 运行，宿主机目录属主要对齐
+      - /data/media:/data/media
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ============================================================
+  # 后台任务（延迟任务 + cron + 对账）
+  # ============================================================
+  worker:
+    <<: *app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: ["arq", "app.worker.main.WorkerSettings"]
+    volumes:
+      - /data/media:/data/media
+
+  # ============================================================
+  # Nginx（静态资源 + 反向代理，唯一的对外入口）
+  # ============================================================
+  nginx:
+    image: eshop-nginx:${APP_VERSION:-dev}
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      # 用 service_started 而不是 service_healthy：api 重启期间 nginx 应当
+      # 继续提供服务（返回 502），而不是被一起拉停
+      api:
+        condition: service_started
+    ports:
+      # ★ 对外端口可配。默认 80；演示机上 80 已经被另一个应用的 nginx 占着
+      #   （那个 server 块是 `listen 80 default_server`，会吃掉 80 上所有请求），
+      #   所以 eshop 用 ESHOP_HTTP_PORT=8081 独立一个端口。
+      #   容器内部始终是 80（nginx.conf 里写死的）。
+      - "${ESHOP_HTTP_PORT:-80}:80"
+    volumes:
+      # 只读挂载：nginx 只需要读图片，不需要写
+      - /data/media:/data/media:ro
+    healthcheck:
+      # 只探 nginx 自己（静态文件），不经过 api：
+      # 否则 api 一抖动，nginx 也会被判不健康
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/index.html"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 64m

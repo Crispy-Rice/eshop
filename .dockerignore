@@ -1,0 +1,30 @@
+# 构建上下文是仓库根目录（nginx 镜像要同时拿 web-mall 与 web-admin），
+# 所以这里必须把不相关的东西挡在外面，否则光是 node_modules 就有几百 MB。
+#
+# 只留下 deploy/nginx/ 与两个前端源码目录。
+
+# 后端完全不参与前端镜像的构建
+backend/
+docs/
+.claude/
+.idea/
+.git/
+.gitignore
+
+# 依赖与构建产物（镜像里由 npm ci / vite build 重新生成）
+**/node_modules/
+**/dist/
+**/.vite/
+**/coverage/
+
+# 本地数据与密钥
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+**/*.p12
+data/
+
+**/*.log
+**/.DS_Store

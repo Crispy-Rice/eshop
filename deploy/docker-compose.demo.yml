@@ -1,0 +1,95 @@
+# ============================================================
+# 2 核 2G 演示环境的裁剪覆盖（docs/16-deployment.md §5.5）
+#
+# 用法：
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+#
+# 这份文件只做两件事：把各服务的内存上限压下来，并把 PG / Redis 的
+# 内存参数调到与之一致。**不要单独使用它**，它依赖 docker-compose.yml
+# 里的服务定义。
+#
+# 内存账（docs/16 §5.5.1，单位 MB）：
+#   nginx 64 + api 400 + worker 300 + postgres 640 + redis 256 = 1660
+#   系统与 dockerd 约 350~450，余量不足 400 → 必须加 2G swap（§5.5.2），
+#   且演示前要停掉这台机器上的其他应用。
+#
+# ★ 这台机器**只能演示**：不给真实用户用，也不要压测。要正式对外得升到 4 核 8G。
+# ============================================================
+
+services:
+  postgres:
+    # 命令行 -c 的优先级高于 postgresql.conf，所以不用改配置文件
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - max_connections=50
+      - -c
+      - effective_cache_size=768MB
+    deploy:
+      resources:
+        limits:
+          memory: 640m
+
+  redis:
+    # 其余参数与生产一致（尤其 noeviction：内存小更要保证不淘汰库存键，
+    # 宁可写失败也不能悄悄丢键造成超卖）
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD 未设置}
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+      - --maxmemory
+      - 192mb
+      - --save
+      - "900 1"
+      - --rename-command
+      - FLUSHALL
+      - ""
+      - --rename-command
+      - FLUSHDB
+      - ""
+      - --rename-command
+      - KEYS
+      - ""
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  api:
+    # 单 worker：2 核机器上多开只会互相抢，且连接池总占用会顶到
+    # max_connections=50
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+    deploy:
+      resources:
+        limits:
+          memory: 400m
+
+  worker:
+    deploy:
+      resources:
+        limits:
+          memory: 300m
+
+  nginx:
+    deploy:
+      resources:
+        limits:
+          memory: 64m

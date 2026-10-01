@@ -1,0 +1,28 @@
+# ★ 绝不能进镜像的东西
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# 本地虚拟环境与缓存（镜像里的依赖来自 uv sync，不是这里）
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# 本地运行数据：上传的图片、种子数据。生产挂的是 /data/media 卷
+data/
+
+# 测试不进生产镜像（跑测试在宿主机或 CI）
+tests/
+
+# 开发工具残留
+.python-version
+*.log

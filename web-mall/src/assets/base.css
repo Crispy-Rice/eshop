@@ -1,0 +1,203 @@
+/* ============================================================================
+ * 全局基础样式
+ *
+ * 职责：reset、排版基线、Element Plus 组件的质感统一。
+ * 颜色/间距/圆角一律引用 tokens.css 的语义 token，**不要写死色值**。
+ *
+ * 导入顺序必须是：element-plus/dist/index.css → tokens.css → base.css
+ * ==========================================================================*/
+
+/* --------------------------------------------------------------------------
+ * Reset 与排版基线
+ * ------------------------------------------------------------------------*/
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--color-text);
+  background-color: var(--color-bg-page);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p,
+figure {
+  margin: 0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+button {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+}
+
+/* 数字等宽：扫一排价格时位数不会左右跳，是「货架感」的一部分 */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 滚动条：细、无色、悬停才显形 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--n-300) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--n-300);
+  background-clip: content-box;
+  border: 2px solid transparent;
+  border-radius: var(--radius-pill);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--n-400);
+  background-clip: content-box;
+}
+
+/* --------------------------------------------------------------------------
+ * 换肤过渡
+ *
+ * 切主题时给 <html> 挂上 .theme-switching，让所有色值变化走一段短过渡。
+ * 用 !important + `*` 是有意的：只在切换的 ~280ms 内生效，
+ * 平时不挂这个 class，所以不会干扰组件自身的动效。
+ * ------------------------------------------------------------------------*/
+
+html.theme-switching,
+html.theme-switching * {
+  transition:
+    background-color var(--dur) var(--ease-in-out),
+    border-color var(--dur) var(--ease-in-out),
+    color var(--dur) var(--ease-in-out),
+    fill var(--dur) var(--ease-in-out) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.theme-switching,
+  html.theme-switching * {
+    transition: none !important;
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Element Plus 质感统一
+ *
+ * 只调「观感」，不改结构。颜色靠 tokens.css 的变量桥接自动跟随主题，
+ * 这里处理的是 EP 没法用变量表达的部分（字重、边框位置、间距）。
+ * ------------------------------------------------------------------------*/
+
+.el-button {
+  font-weight: var(--weight-medium);
+}
+
+/* EP 用 inset box-shadow 当输入框边框，这里把它换成更中性的描边色 */
+.el-input__wrapper,
+.el-textarea__inner {
+  box-shadow: 0 0 0 1px var(--color-border) inset;
+}
+
+.el-input__wrapper:hover,
+.el-textarea__inner:hover {
+  box-shadow: 0 0 0 1px var(--color-border-strong) inset;
+}
+
+.el-input__wrapper.is-focus,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px var(--color-accent) inset;
+}
+
+/* 卡片靠 1px 描边分层，不靠投影 */
+.el-card {
+  box-shadow: none;
+}
+
+.el-card__header {
+  border-bottom: 1px solid var(--color-border);
+  font-weight: var(--weight-semibold);
+}
+
+/* 标签用柔和底 + 同色文字，比 EP 默认的实心块更耐看 */
+.el-tag {
+  border-radius: var(--radius-sm);
+  font-weight: var(--weight-medium);
+}
+
+.el-breadcrumb__inner {
+  color: var(--color-text-tertiary);
+  font-weight: var(--weight-normal);
+}
+
+.el-breadcrumb__inner.is-link:hover {
+  color: var(--color-accent);
+}
+
+.el-empty__description p {
+  color: var(--color-text-tertiary);
+}
+
+.el-alert {
+  border-radius: var(--radius-md);
+}
+
+.el-pagination {
+  --el-pagination-font-size: var(--text-sm);
+}
