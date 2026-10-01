@@ -294,6 +294,15 @@ async def create_shop(session: AsyncSession, user_id: int, req: ShopCreateReques
     )
 
 
+async def get_shop_id(session: AsyncSession, user_id: int) -> int | None:
+    """当前用户的店铺 ID，没有店铺返回 None。
+
+    其他模块（product、trade…）用它判断"这个用户能不能卖东西"。
+    """
+    shop = await repo.get_shop_by_owner(session, user_id)
+    return shop.id if shop else None
+
+
 async def get_my_shop(session: AsyncSession, user_id: int) -> ShopOut:
     shop = await repo.get_shop_by_owner(session, user_id)
     if shop is None:

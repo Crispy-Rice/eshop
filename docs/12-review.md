@@ -118,7 +118,7 @@ async def check_eligibility(session: AsyncSession, user_id: int, order_item_id: 
 
 ```python
 async def submit_review(session: AsyncSession, user_id: int, req: ReviewSubmitRequest) -> int:
-    """在路由的 async with session.begin() 内调用。"""
+    """调用方（路由）的会话内执行，事务边界由 DbSession 依赖统一管理。"""
     # ① 资格校验（快速失败，好体验）
     e = await check_eligibility(session, user_id, req.order_item_id)
     if not e.eligible:

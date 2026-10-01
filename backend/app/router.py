@@ -15,14 +15,14 @@ from __future__ import annotations
 from fastapi import APIRouter, FastAPI
 
 from app.modules.account.router import router as account_router
+from app.modules.product.router import router as product_router
 
-# from app.modules.product.router import router as product_router
 # from app.modules.trade.router import router as trade_router
 # ... 其余模块同理
 
 MODULE_ROUTERS: list[APIRouter] = [
     account_router,
-    # product_router,
+    product_router,
     # trade_router,
 ]
 

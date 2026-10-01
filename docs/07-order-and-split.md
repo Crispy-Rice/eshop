@@ -470,7 +470,11 @@ WHERE order_sub_no = :sub_no AND status = :from;
 
 **三重保护**：`SELECT ... FOR UPDATE`（行锁）→ 状态机查表（业务校验）→ `WHERE status = :from`（CAS）。任一层失效，其他层仍能拦住。
 
-> 事务边界由路由层统一管理：每个写接口通过依赖 `get_session()` 拿到会话，在 `async with session.begin():` 内调用 service，service 函数本身不 `commit`。这样多个 service 调用能组合在同一事务里。
+> 事务边界由**会话依赖**统一管理（`app/core/db.py` 的 `get_session`）：一个请求一个事务，成功提交、异常回滚。路由和 service 都不自己 `begin()` / `commit()`。
+>
+> 为什么不让路由写 `async with session.begin()`：依赖（如"取当前店铺"）也会查库，SQLAlchemy 的 autobegin 会先把事务开起来，路由再 `begin()` 就会抛 `A transaction is already begun`。把事务边界收到会话依赖这一层，路由和依赖都能自由读写同一个事务。
+>
+> 需要在**主事务之外**独立提交的场景（例如"写完审计记录后立刻抛异常"，或后台任务），显式用 `async with get_session_factory()() as session, session.begin():` 另起一个事务 —— 见 [10 §3](#) 与 `account` 模块的登录失败计数。
 
 ### 4.5 状态流水表
 
@@ -727,10 +731,10 @@ order_sub.status = 20/30/40     ←→  refund_order.status ∈ {11 商家拒绝
 
 ```python
 # aftersale 模块：退款成功（由 payment 模块的退款回调触发）
-async with session.begin():
-    await refund_repo.mark_success(session, refund_no)                 # 售后单 → 70
-    await trade_service.transit(session, refund.order_sub_no,
-                                OrderEvent.REFUND_SUCCESS, ctx)         # 子单 60 → 70
+# 事务由会话依赖统一管理，两处写在同一个事务里，任何一步失败整体回滚
+await refund_repo.mark_success(session, refund_no)                 # 售后单 → 70
+await trade_service.transit(session, refund.order_sub_no,
+                            OrderEvent.REFUND_SUCCESS, ctx)         # 子单 60 → 70
 ```
 
 **对账兜底**：即便如此，仍保留每日对账 SQL，用来发现代码 Bug 导致的不一致：

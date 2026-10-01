@@ -1,4 +1,8 @@
-"""account 模块的 HTTP 路由。"""
+"""account 模块的 HTTP 路由。
+
+事务由 ``get_session`` 依赖统一管理（一个请求一个事务），路由里不再写
+``async with session.begin()`` —— 详见 app/core/db.py 的说明。
+"""
 
 from __future__ import annotations
 
@@ -34,15 +38,14 @@ async def register(
     session: DbSession,
     user_agent: str | None = Header(default=None),
 ) -> ApiResponse[TokenResponse]:
-    async with session.begin():
-        tokens = await service.register(
-            session,
-            phone=body.phone,
-            password=body.password,
-            nickname=body.nickname,
-            ip=client_ip(request),
-            user_agent=user_agent,
-        )
+    tokens = await service.register(
+        session,
+        phone=body.phone,
+        password=body.password,
+        nickname=body.nickname,
+        ip=client_ip(request),
+        user_agent=user_agent,
+    )
     return ApiResponse.ok(tokens)
 
 
@@ -53,14 +56,13 @@ async def login(
     session: DbSession,
     user_agent: str | None = Header(default=None),
 ) -> ApiResponse[TokenResponse]:
-    async with session.begin():
-        tokens = await service.login(
-            session,
-            phone=body.phone,
-            password=body.password,
-            ip=client_ip(request),
-            user_agent=user_agent,
-        )
+    tokens = await service.login(
+        session,
+        phone=body.phone,
+        password=body.password,
+        ip=client_ip(request),
+        user_agent=user_agent,
+    )
     return ApiResponse.ok(tokens)
 
 
@@ -71,20 +73,18 @@ async def refresh(
     session: DbSession,
     user_agent: str | None = Header(default=None),
 ) -> ApiResponse[TokenResponse]:
-    async with session.begin():
-        tokens = await service.refresh(
-            session,
-            refresh_token=body.refresh_token,
-            ip=client_ip(request),
-            user_agent=user_agent,
-        )
+    tokens = await service.refresh(
+        session,
+        refresh_token=body.refresh_token,
+        ip=client_ip(request),
+        user_agent=user_agent,
+    )
     return ApiResponse.ok(tokens)
 
 
 @router.post("/api/auth/logout", response_model=ApiResponse[None], summary="登出")
 async def logout(body: RefreshRequest, session: DbSession) -> ApiResponse[None]:
-    async with session.begin():
-        await service.logout(session, refresh_token=body.refresh_token)
+    await service.logout(session, refresh_token=body.refresh_token)
     return ApiResponse.ok(None)
 
 
@@ -100,9 +100,7 @@ async def get_me(user: CurrentUserDep, session: DbSession) -> ApiResponse[UserOu
 async def update_me(
     body: UpdateProfileRequest, user: CurrentUserDep, session: DbSession
 ) -> ApiResponse[UserOut]:
-    async with session.begin():
-        result = await service.update_me(session, user.id, body)
-    return ApiResponse.ok(result)
+    return ApiResponse.ok(await service.update_me(session, user.id, body))
 
 
 # ============================================================
@@ -117,24 +115,19 @@ async def list_addresses(user: CurrentUserDep, session: DbSession) -> ApiRespons
 async def create_address(
     body: AddressIn, user: CurrentUserDep, session: DbSession
 ) -> ApiResponse[AddressOut]:
-    async with session.begin():
-        result = await service.create_address(session, user.id, body)
-    return ApiResponse.ok(result)
+    return ApiResponse.ok(await service.create_address(session, user.id, body))
 
 
 @router.put("/api/me/addresses/{address_id}", response_model=ApiResponse[AddressOut], summary="修改地址")
 async def update_address(
     address_id: int, body: AddressUpdate, user: CurrentUserDep, session: DbSession
 ) -> ApiResponse[AddressOut]:
-    async with session.begin():
-        result = await service.update_address(session, user.id, address_id, body)
-    return ApiResponse.ok(result)
+    return ApiResponse.ok(await service.update_address(session, user.id, address_id, body))
 
 
 @router.delete("/api/me/addresses/{address_id}", response_model=ApiResponse[None], summary="删除地址")
 async def delete_address(address_id: int, user: CurrentUserDep, session: DbSession) -> ApiResponse[None]:
-    async with session.begin():
-        await service.delete_address(session, user.id, address_id)
+    await service.delete_address(session, user.id, address_id)
     return ApiResponse.ok(None)
 
 
@@ -145,9 +138,7 @@ async def delete_address(address_id: int, user: CurrentUserDep, session: DbSessi
 async def create_shop(
     body: ShopCreateRequest, user: CurrentUserDep, session: DbSession
 ) -> ApiResponse[ShopOut]:
-    async with session.begin():
-        result = await service.create_shop(session, user.id, body)
-    return ApiResponse.ok(result)
+    return ApiResponse.ok(await service.create_shop(session, user.id, body))
 
 
 @router.get("/api/merchant/shop", response_model=ApiResponse[ShopOut], summary="我的店铺")

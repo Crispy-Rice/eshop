@@ -36,13 +36,20 @@ from alembic.config import Config  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 
+from app.core.crypto import phone_hash  # noqa: E402
 from app.core.db import dispose_engine, get_session_factory  # noqa: E402
 from app.core.redis import close_redis, get_redis  # noqa: E402
 from app.core.snowflake import start_snowflake, stop_snowflake  # noqa: E402
 from app.main import app  # noqa: E402
 
-# 每个用例前清空的表
+# 每个用例前清空的表（TRUNCATE ... CASCADE 会自动处理外键顺序）
 _TRUNCATE = (
+    "product.sku_spec",
+    "product.spec_value",
+    "product.spec_group",
+    "product.sku",
+    "product.spu",
+    "product.category",
     "account.user_address",
     "account.shop_member",
     "account.shop",
@@ -106,6 +113,31 @@ async def register(client: AsyncClient, phone: str = TEST_PHONE, password: str =
     resp = await client.post(
         "/api/auth/register", json={"phone": phone, "password": password, "nickname": "测试用户"}
     )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["data"]
+
+
+async def open_shop(client: AsyncClient, access_token: str, name: str = "测试旗舰店") -> str:
+    """开店并返回 shop_id。"""
+    resp = await client.post("/api/merchant/shop", json={"name": name}, headers=auth_header(access_token))
+    assert resp.status_code == 200, resp.text
+    return resp.json()["data"]["id"]
+
+
+async def make_admin(client: AsyncClient, session, phone: str = "13900139001") -> dict:
+    """造一个平台管理员。
+
+    角色的唯一来源是数据库（token 里带 role），所以改完角色要重新登录
+    才能拿到带 admin 的 token。
+    """
+    await register(client, phone=phone)
+    await session.execute(
+        text("UPDATE account.user SET role = 'admin' WHERE phone_hash = :h"),
+        {"h": phone_hash(phone)},
+    )
+    await session.commit()
+
+    resp = await client.post("/api/auth/login", json={"phone": phone, "password": TEST_PASSWORD})
     assert resp.status_code == 200, resp.text
     return resp.json()["data"]
 

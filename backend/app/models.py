@@ -15,8 +15,16 @@ from app.modules.account.models import (  # noqa: F401
     UserAddress,
 )
 from app.modules.core.models import LocalMessage  # noqa: F401
+from app.modules.product.models import (  # noqa: F401
+    Category,
+    Sku,
+    SkuSpec,
+    SpecGroup,
+    SpecValue,
+    Spu,
+)
 
 # 后续模块在这里登记，例如：
-# from app.modules.product.models import Spu, Sku
+# from app.modules.trade.models import OrderMain, OrderSub
 
 __all__ = ["Base"]

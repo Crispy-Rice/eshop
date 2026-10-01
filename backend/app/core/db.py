@@ -66,6 +66,23 @@ async def dispose_engine() -> None:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """FastAPI 依赖：请求级会话（不自动提交）。"""
+    """FastAPI 依赖：请求级会话，**由它统一管理事务**。
+
+    一个请求 = 一个事务：成功提交，异常回滚。
+
+    为什么不把 ``async with session.begin()`` 写进路由：依赖（如
+    "取当前店铺"）也会查库，SQLAlchemy 的 autobegin 会先把事务开起来，
+    路由再调 ``session.begin()`` 就会抛 "A transaction is already begun"。
+    把事务边界收到这一层，路由和依赖都能自由读写同一个事务。
+
+    这也正是模块化单体相对微服务的最大红利：下单、预占库存、锁券、
+    写 outbox 全在一个本地事务里（docs/07-order-and-split.md）。
+    """
     async with get_session_factory()() as session:
-        yield session
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise
+        else:
+            await session.commit()

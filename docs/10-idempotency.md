@@ -145,12 +145,20 @@ async def create_order(
     session: DbSession,
     idem: Annotated[IdemContext, Depends(Idempotency(ttl=300))],
 ) -> ApiResponse[OrderCreated]:
-    async with session.begin():
-        result = await order_service.create(session, user.id, body, request_id=idem.redis_key)
+    # 事务由 DbSession 依赖统一管理（见 07 §4.4），路由一般不写 begin()
+    result = await order_service.create(session, user.id, body, request_id=idem.redis_key)
+
+    # ★ 但写幂等缓存必须**先提交再写**：依赖的提交发生在路由返回之后，
+    #   如果不在这里显式提交就写缓存，一旦提交阶段失败（约束冲突等），
+    #   用户会拿到一个"成功"的缓存响应，而订单其实没落库。
+    await session.commit()
+
     resp = ApiResponse.ok(result)
-    await idem.save(resp)                    # ★ 事务提交之后再写缓存
+    await idem.save(resp)
     return resp
 ```
+
+> 依赖里那次 `commit()` 在已提交的情况下是空操作，不会重复提交。
 
 > FastAPI 0.106 起，带 `yield` 的依赖在**响应发送前**执行退出代码，因此依赖内能捕获到路由抛出的异常。实现时以项目锁定的 FastAPI 版本跑一遍 §11 的测试用例确认行为。
 
