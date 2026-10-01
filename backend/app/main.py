@@ -73,7 +73,7 @@ app = FastAPI(
 # 中间件：请求 ID
 # ============================================================
 @app.middleware("http")
-async def request_id_middleware(request: Request, call_next):  # noqa: ANN001, ANN201
+async def request_id_middleware(request: Request, call_next):
     """Nginx 会生成 X-Request-Id 并透传；没有就自己生成一个。
 
     写进 ContextVar，日志和错误响应都会自动带上，方便用户报障时定位。
@@ -118,9 +118,7 @@ async def cached_response_handler(request: Request, exc: CachedResponse) -> JSON
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_error_handler(
-    request: Request, exc: RequestValidationError
-) -> JSONResponse:
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """请求体/参数校验失败。
 
     FastAPI 默认返回 422，本系统约定 422 专用于"业务规则不满足"，
@@ -191,7 +189,7 @@ async def readyz() -> JSONResponse:
         async with get_session_factory()() as session:
             await session.execute(text("SELECT 1"))
         checks["postgres"] = "ok"
-    except Exception as exc:  # noqa: BLE001 - 探针要报告而不抛
+    except Exception as exc:
         logger.warning("readyz: PostgreSQL 不可用", extra={"error": str(exc)})
         checks["postgres"] = "error"
 

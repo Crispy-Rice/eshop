@@ -7,7 +7,12 @@
 from __future__ import annotations
 
 from sqlalchemy import MetaData
+from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import DeclarativeBase
+
+# 毫秒精度、带时区。全站统一存 UTC，展示时再转东八区
+# （docs/13-schema.md §0.2）
+TS = TIMESTAMP(timezone=True, precision=3)
 
 NAMING_CONVENTION = {
     "ix": "idx_%(table_name)s_%(column_0_N_name)s",

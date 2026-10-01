@@ -15,9 +15,11 @@ from typing import Any
 from app.core.context import current_request_id
 
 # LogRecord 自带的属性，不算业务附加字段
-_RESERVED: frozenset[str] = frozenset(
-    logging.LogRecord("", 0, "", 0, "", (), None).__dict__
-) | {"message", "asctime", "taskName"}
+_RESERVED: frozenset[str] = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
+    "message",
+    "asctime",
+    "taskName",
+}
 
 
 class JsonFormatter(logging.Formatter):

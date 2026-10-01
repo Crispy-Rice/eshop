@@ -13,11 +13,11 @@ from __future__ import annotations
 import asyncio
 from logging.config import fileConfig
 
+from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from alembic import context
 from app.core.config import get_settings
 from app.models import Base
 
@@ -39,6 +39,21 @@ config.set_main_option("sqlalchemy.url", _url.replace("%", "%%"))
 # 版本表固定放 public，不跟着业务 schema 走
 VERSION_TABLE_SCHEMA = "public"
 
+# 这些是数据库自带的，不该参与比对
+EXCLUDED_SCHEMAS = frozenset({"information_schema", "pg_catalog", "pg_toast"})
+
+
+def _include_object(obj: object, name: str | None, type_: str, reflected: bool, compare_to: object) -> bool:
+    """过滤掉不该被 autogenerate 插手的对象。
+
+    ★ 必须排除 alembic 自己的版本表：开了 include_schemas 之后，
+    它会出现在 public schema 里却不在 metadata 中，autogenerate 会
+    生成 ``op.drop_table('alembic_version')`` —— 直接把迁移历史删掉。
+    """
+    if type_ == "table" and name == "alembic_version":
+        return False
+    return getattr(obj, "schema", None) not in EXCLUDED_SCHEMAS
+
 
 def _configure(connection: Connection | None = None, url: str | None = None) -> None:
     context.configure(
@@ -46,6 +61,7 @@ def _configure(connection: Connection | None = None, url: str | None = None) -> 
         url=url,
         target_metadata=target_metadata,
         include_schemas=True,
+        include_object=_include_object,
         version_table_schema=VERSION_TABLE_SCHEMA,
         compare_type=True,  # 列类型变化也生成迁移
         compare_server_default=True,

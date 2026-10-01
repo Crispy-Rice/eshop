@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Generic, TypeVar
-
 from pydantic import Field
 
 from app.core.context import current_request_id
 from app.core.schemas import CamelModel
 
-T = TypeVar("T")
 
+class ApiResponse[T](CamelModel):
+    """所有接口的响应外壳。
 
-class ApiResponse(CamelModel, Generic[T]):
+    ``request_id`` 由 X-Request-Id 中间件写入 ContextVar，用户报障时报这个值
+    就能直接定位日志。
+    """
+
     code: str = "OK"
     message: str = "success"
     data: T | None = None
@@ -39,6 +41,6 @@ class PageMeta(CamelModel):
     next_cursor: str | None = None
 
 
-class Page(CamelModel, Generic[T]):
+class Page[T](CamelModel):
     items: list[T]
     meta: PageMeta

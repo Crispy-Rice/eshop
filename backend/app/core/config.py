@@ -37,9 +37,7 @@ class Settings(BaseSettings):
     api_workers: int = 1
 
     # ---------- PostgreSQL ----------
-    database_url: str = (
-        "postgresql+asyncpg://eshop_app:dev-only-app-password@127.0.0.1:5432/eshop"
-    )
+    database_url: str = "postgresql+asyncpg://eshop_app:dev-only-app-password@127.0.0.1:5432/eshop"
     # 迁移用（需要 DDL 权限，用 owner 角色）；为空时回落到 database_url
     migration_database_url: str | None = None
     db_echo: bool = False
@@ -83,7 +81,7 @@ class Settings(BaseSettings):
     def _validate_phone_enc_key(cls, v: str) -> str:
         try:
             raw = base64.b64decode(v, validate=True)
-        except Exception as exc:  # noqa: BLE001 - 统一转成配置错误
+        except Exception as exc:
             raise ValueError("PHONE_ENC_KEY 不是合法的 base64") from exc
         if len(raw) != 32:
             raise ValueError(f"PHONE_ENC_KEY 解码后必须是 32 字节，当前 {len(raw)} 字节")

@@ -144,7 +144,7 @@ class PriceInvariantError(BizError):
         super().__init__(ErrorCode.INTERNAL_ERROR, f"金额校验失败：{detail}")
 
 
-class CachedResponse(Exception):  # noqa: N818 - 它不是"错误"，是控制流信号
+class CachedResponse(Exception):
     """幂等命中：带着上次的响应体，由异常处理器直接 200 返回。"""
 
     def __init__(self, body: dict[str, Any]) -> None:

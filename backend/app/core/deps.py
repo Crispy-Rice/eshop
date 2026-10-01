@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,7 +58,7 @@ async def get_current_merchant(user: CurrentUserDep) -> CurrentUser:
 CurrentMerchantDep = Annotated[CurrentUser, Depends(get_current_merchant)]
 
 
-def require_role(*roles: str):  # noqa: ANN201 - 返回 FastAPI 依赖，类型由 Annotated 表达
+def require_role(*roles: str):
     """用法：``user: Annotated[CurrentUser, Depends(require_role("admin", "finance"))]``"""
 
     async def _dep(user: CurrentUserDep) -> CurrentUser:
@@ -67,3 +67,16 @@ def require_role(*roles: str):  # noqa: ANN201 - 返回 FastAPI 依赖，类型�
         return user
 
     return _dep
+
+
+def client_ip(request: Request) -> str | None:
+    """取客户端真实 IP。
+
+    生产环境前面有 Nginx，`request.client` 拿到的是 Nginx 的地址，
+    所以要读它设置的 X-Real-IP。只在开发环境（直连）才回落到 socket 地址。
+    """
+    forwarded = request.headers.get("X-Real-IP") or request.headers.get("X-Forwarded-For")
+    if forwarded:
+        # X-Forwarded-For 可能是 "客户端, 代理1, 代理2"，取第一个
+        return forwarded.split(",")[0].strip()[:64]
+    return request.client.host if request.client else None

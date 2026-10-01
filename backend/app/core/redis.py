@@ -47,5 +47,5 @@ async def ping_redis() -> bool:
     """健康检查用。异常一律吞掉，由调用方决定怎么报告。"""
     try:
         return bool(await get_redis().ping())
-    except Exception:  # noqa: BLE001 - 健康检查不该因为探活失败而抛错
+    except Exception:
         return False

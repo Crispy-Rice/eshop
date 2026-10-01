@@ -7,6 +7,8 @@ access token 有效期 30 分钟，只放最小信息；refresh token 是随机�
 
 from __future__ import annotations
 
+import hashlib
+import secrets
 import time
 from typing import Any
 
@@ -47,6 +49,51 @@ def password_needs_rehash(hashed: str) -> bool:
         return _hasher.check_needs_rehash(hashed)
     except (Argon2Error, ValueError, TypeError):
         return False
+
+
+def validate_password_strength(raw: str) -> str:
+    """密码强度校验。返回原值，校验失败抛 ValueError（由 Pydantic 转成 400）。
+
+    规则：长度达标 + 至少包含两类字符（小写/大写/数字/符号）。
+    不强制"必须含特殊字符"这类容易逼用户写便签的规则。
+    """
+    min_length = get_settings().password_min_length
+    if len(raw) < min_length:
+        raise ValueError(f"密码至少 {min_length} 位")
+    if len(raw) > 128:
+        raise ValueError("密码过长")
+
+    classes = sum(
+        (
+            any(c.islower() for c in raw),
+            any(c.isupper() for c in raw),
+            any(c.isdigit() for c in raw),
+            any(not c.isalnum() for c in raw),
+        )
+    )
+    if classes < 2:
+        raise ValueError("密码需包含字母、数字、符号中的至少两类")
+
+    if raw.lower() in {"12345678", "password", "qwertyui", "11111111"}:
+        raise ValueError("密码过于简单")
+    return raw
+
+
+# ------------------------------------------------------------
+# 刷新令牌
+# ------------------------------------------------------------
+def generate_refresh_token() -> tuple[str, str]:
+    """生成刷新令牌，返回 (原文, SHA-256 哈希)。
+
+    原文只在这一次响应里返回给客户端，库里只存哈希 ——
+    即使数据库被拖走也无法直接冒用。
+    """
+    raw = secrets.token_urlsafe(48)
+    return raw, hash_refresh_token(raw)
+
+
+def hash_refresh_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ------------------------------------------------------------
