@@ -1,18 +1,56 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+
+import { useAuthStore } from '@/stores/auth'
+
+const routes: RouteRecordRaw[] = [
+  {
+    path: '/',
+    name: 'products',
+    component: () => import('@/views/ProductListView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/products/new',
+    name: 'product-create',
+    component: () => import('@/views/ProductCreateView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/products/:spuId',
+    name: 'product-edit',
+    component: () => import('@/views/ProductEditView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/login',
+    name: 'login',
+    component: () => import('@/views/LoginView.vue'),
+    meta: { guestOnly: true },
+  },
+  {
+    path: '/status',
+    name: 'status',
+    component: () => import('@/views/StatusView.vue'),
+  },
+]
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
-  routes: [
-    {
-      path: '/',
-      name: 'home',
-      component: () => import('@/views/HomeView.vue'),
-    },
-    // 后台路由随模块实现逐步补充：
-    //   商品管理 /spus、库存 /inventory、订单 /orders、发货 /deliveries、
-    //   售后 /aftersales、优惠券 /coupons、运费模板 /freight-templates、
-    //   评价审核 /reviews、对账差异 /reconcile、告警 /alerts
-  ],
+  routes,
+  scrollBehavior: () => ({ top: 0 }),
+})
+
+router.beforeEach(async (to) => {
+  const auth = useAuthStore()
+  if (auth.user === null) await auth.restore()
+
+  if (to.meta.requiresAuth && !auth.isLoggedIn) {
+    return { name: 'login', query: { redirect: to.fullPath } }
+  }
+  if (to.meta.guestOnly && auth.isLoggedIn) {
+    return { name: 'products' }
+  }
+  return true
 })
 
 export default router

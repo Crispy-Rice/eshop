@@ -3,10 +3,6 @@ import { onMounted, ref } from 'vue'
 import { fetchHealth, fetchReady } from '@/api/system'
 import { isBizError } from '@/api/errors'
 
-/**
- * 骨架自检页：验证「浏览器 → Vite 代理 → FastAPI → PostgreSQL/Redis」整条链路。
- * 业务页面做好之后这个页面可以移除。
- */
 const health = ref('检查中…')
 const ready = ref<Record<string, string>>({})
 const loading = ref(false)
@@ -40,7 +36,7 @@ onMounted(check)
   <el-card shadow="never">
     <template #header>
       <div class="card-header">
-        <span>前后端连通性自检</span>
+        <span>系统状态</span>
         <el-button :loading="loading" size="small" @click="check">重新检查</el-button>
       </div>
     </template>
@@ -61,9 +57,7 @@ onMounted(check)
       </el-descriptions-item>
     </el-descriptions>
 
-    <p class="hint">
-      能看到三项都是「正常 / ok」，说明前端代理、FastAPI、数据库、缓存都已经打通。
-    </p>
+    <p class="hint">三项都是「正常 / ok」说明前端代理、FastAPI、数据库、缓存都已打通。</p>
   </el-card>
 </template>
 

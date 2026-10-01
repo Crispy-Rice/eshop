@@ -4,6 +4,95 @@
 
 v2.0 技术栈：**Vue 3 前端 + Python/FastAPI 模块化单体 + PostgreSQL + Redis，Docker Compose 部署到腾讯云 CVM**。
 
+## 快速开始（本地开发）
+
+前置：**Docker Desktop 已启动**（需要 WSL2）。Python 与 Node 的依赖安装见 [16-deployment §2](docs/16-deployment.md)。
+
+### 1. 启动数据库与 Redis
+
+```bash
+docker compose -f deploy/docker-compose.dev.yml up -d
+```
+
+首次启动会自动建好 3 个角色、3 个扩展、14 个 schema（`deploy/postgres/init/01-init.sh`）。
+端口只绑定 `127.0.0.1`，不对局域网暴露。
+
+### 2. 初始化后端
+
+```bash
+cd backend && cp ../deploy/.env.example .env
+```
+
+```bash
+cd backend && uv sync && uv run alembic upgrade head
+```
+
+`uv sync` 会自动使用 3.12（见 `backend/.python-version`）。
+
+### 3. 起三个服务（各开一个终端窗口）
+
+```bash
+cd backend && uv run uvicorn app.main:app --reload --port 8000
+```
+
+```bash
+cd web-mall && npm run dev
+```
+
+```bash
+cd web-admin && npm run dev
+```
+
+| 服务 | 地址 | 说明 |
+|---|---|---|
+| 后端 API | http://127.0.0.1:8000 | 接口文档 http://127.0.0.1:8000/docs |
+| 买家商城 | http://localhost:5173 | 搜索商品、规格选择 |
+| 商家后台 | http://localhost:5174 | 发布商品、上下架 |
+
+### 4. 造演示数据（可选）
+
+```bash
+cd backend && uv run python scripts/seed_demo.py
+```
+
+会建好类目树、一个平台管理员、一个商家和三个已上架商品，并在最后打印两个账号的密码。
+用商家账号登录 http://localhost:5174 就能看到商品；用买家身份在 http://localhost:5173 浏览。
+
+### 5. 跑测试
+
+```bash
+cd backend && uv run pytest -q
+```
+
+测试连的是**真实的 PostgreSQL 和 Redis**（独立 `eshop_test` 库），每个用例前清表。
+首次运行前需要建一次测试库：
+
+```bash
+docker exec eshop-postgres psql -U eshop_owner -d eshop -c "CREATE DATABASE eshop_test OWNER eshop_owner;"
+```
+
+```bash
+docker exec eshop-postgres psql -U eshop_owner -d eshop_test -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin; CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+```
+
+### 常用命令
+
+```bash
+docker compose -f deploy/docker-compose.dev.yml logs -f postgres
+```
+
+```bash
+docker exec -it eshop-postgres psql -U eshop_owner -d eshop
+```
+
+```bash
+docker exec -it eshop-redis redis-cli
+```
+
+```bash
+cd backend && uv run alembic revision --autogenerate -m "描述"
+```
+
 ## 文档索引
 
 | # | 文档 | 解决的问题（对应需求编号） |

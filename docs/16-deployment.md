@@ -119,12 +119,16 @@ eshop/
 │   │   ├── modules/               # 业务模块（待实现）
 │   │   └── worker/main.py         # ARQ worker 配置与入口
 │   ├── migrations/                # Alembic（env.py + versions/）
+│   ├── scripts/seed_demo.py       # 本地演示数据（类目、管理员、商家、商品）
 │   ├── lua/                       # Redis Lua 脚本（待添加）
-│   ├── tests/                     # 待添加
+│   ├── tests/                     # 集成测试（连真实 PG/Redis）
 │   └── Dockerfile                 # 待添加
 ├── web-mall/                      # 买家 PC 商城（Vue 3.5 + Vite 8 + TS 6 + Element Plus 2.14）
-│   └── src/api/                   # errors.ts（错误码镜像）/ http.ts / system.ts
+│   └── src/{api,stores,router,views,utils}
+│       └── views/                 # 登录、商品列表、商品详情（含规格选择器）、我的、系统状态
 ├── web-admin/                     # 商家/运营后台（同上，跑在 5174 端口）
+│   └── src/views/                 # 登录、我的商品、发布商品（规格编辑器）、编辑商品、系统状态
+├── .claude/launch.json            # 三个本地服务的启动配置（api / web-mall / web-admin）
 ├── shared/                        # 待添加：price-testcases.json（11 §8）
 ├── deploy/
 │   ├── docker-compose.dev.yml     # 本地：只起 PostgreSQL 17 + Redis 7.4
@@ -150,43 +154,74 @@ CI 会加一条比对检查（15 §3.1）。将来这套代码变大后，再考
 
 ### 3.2 本地启动步骤
 
+**准备**：Docker Desktop 已启动（需要 WSL2）。本机若还没有 `backend/.env`：
+
 ```bash
-# ① 启动 PostgreSQL 与 Redis（端口只绑定 127.0.0.1，不对局域网暴露）
+cd backend && cp ../deploy/.env.example .env
+```
+
+**① PostgreSQL 与 Redis**（端口只绑定 127.0.0.1，不对局域网暴露）
+
+```bash
 docker compose -f deploy/docker-compose.dev.yml up -d
 ```
 
+首次启动会自动执行 `deploy/postgres/init/01-init.sh`：建 3 个角色、3 个扩展、14 个 schema 并配好默认权限。
+
+**② 后端依赖与迁移**
+
 ```bash
-# ② 安装后端依赖并执行数据库迁移
 cd backend && uv sync && uv run alembic upgrade head
 ```
 
+**③ 起三个服务**（各开一个终端窗口）
+
 ```bash
-# ③ 启动后端（热重载）
 cd backend && uv run uvicorn app.main:app --reload --port 8000
 ```
 
 ```bash
-# ④ 启动 worker（另开一个终端）
+cd web-mall && npm run dev
+```
+
+```bash
+cd web-admin && npm run dev
+```
+
+| 服务 | 地址 | 说明 |
+|---|---|---|
+| 后端 API | http://127.0.0.1:8000 | 接口文档 `/docs`（生产环境自动关闭） |
+| 买家商城 | http://localhost:5173 | 搜索、规格选择 |
+| 商家/运营后台 | http://localhost:5174 | 发布商品、上下架 |
+
+**④ 异步任务 worker**（用到延迟任务与定时任务时才需要）
+
+```bash
 cd backend && uv run arq app.worker.main.WorkerSettings
 ```
 
+**⑤ 演示数据**（可选）
+
 ```bash
-# ⑤ 启动商城前端（另开一个终端，Vite 把 /api 代理到 8000 端口）
-cd web-mall && npm install && npm run dev
+cd backend && uv run python scripts/seed_demo.py
 ```
 
-本地的 `backend/.env` 由 `deploy/.env.example` 复制而来，开发环境使用固定的弱密码即可（只监听 127.0.0.1），**不要把生产密钥放到本地文件里**。
+会建好类目树、一个平台管理员、一个商家和三个已上架商品，并在结尾打印两个账号的密码。
 
-常用调试命令：
+> 本地 `backend/.env` 用的是 `deploy/.env.example` 里的弱密码，只监听回环地址，**不要把生产密钥放到本地文件里**。
+
+**开发调试命令**
 
 ```bash
-# 进入 psql
-docker compose -f deploy/docker-compose.dev.yml exec postgres psql -U eshop_owner -d eshop
+docker compose -f deploy/docker-compose.dev.yml logs -f postgres
 ```
 
 ```bash
-# 进入 redis-cli
-docker compose -f deploy/docker-compose.dev.yml exec redis redis-cli
+docker exec -it eshop-postgres psql -U eshop_owner -d eshop
+```
+
+```bash
+docker exec -it eshop-redis redis-cli
 ```
 
 ### 3.3 测试
@@ -195,8 +230,24 @@ docker compose -f deploy/docker-compose.dev.yml exec redis redis-cli
 |---|---|---|
 | 后端单元测试 | pytest + hypothesis | 算价、分摊、状态机等纯函数 |
 | 后端集成测试 | pytest + pytest-asyncio + httpx | 连接 docker 中独立的测试库 `eshop_test`，**不 mock 数据库**（唯一约束、行锁、CHECK 约束只有真库才能测出来） |
-| 前端单元测试 | vitest | 价格工具函数、共享用例对齐（11 §8） |
-| 代码检查 | ruff、mypy、eslint、vue-tsc | CI 中执行 |
+| 前端单元测试 | vitest | 价格工具函数、共享用例对齐（11 §8）；**尚未搭建** |
+| 代码检查 | ruff、eslint + oxlint、vue-tsc | 已接入；mypy 与 CI 待补 |
+
+集成测试跑之前需要**建一次测试库**（用 `eshop_owner` 连接，避免和应用角色纠缠权限）：
+
+```bash
+docker exec eshop-postgres psql -U eshop_owner -d eshop -c "CREATE DATABASE eshop_test OWNER eshop_owner;"
+```
+
+```bash
+docker exec eshop-postgres psql -U eshop_owner -d eshop_test -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin; CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+```
+
+之后直接跑 pytest 即可，夹具会自动把测试库迁移到最新版本，并在每个用例前清空业务表：
+
+```bash
+cd backend && uv run pytest -q
+```
 
 ## 4. 生产环境：Docker Compose
 
