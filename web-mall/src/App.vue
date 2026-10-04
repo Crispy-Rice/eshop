@@ -112,13 +112,6 @@ async function onLogout(): Promise<void> {
     <main class="content">
       <RouterView />
     </main>
-
-    <footer class="footer">
-      <div class="footer-inner">
-        <span class="footer-copy">eshop · 演示环境</span>
-        <RouterLink to="/status" class="footer-link">系统状态</RouterLink>
-      </div>
-    </footer>
   </div>
 </template>
 
@@ -309,33 +302,6 @@ async function onLogout(): Promise<void> {
   max-width: var(--layout-max);
   margin: 0 auto;
   padding: var(--space-6) var(--layout-gutter) var(--space-12);
-}
-
-/* ---------- 页脚 ---------- */
-
-.footer {
-  border-top: 1px solid var(--color-border);
-  background: var(--color-bg-surface);
-}
-
-.footer-inner {
-  max-width: var(--layout-max);
-  margin: 0 auto;
-  padding: var(--space-5) var(--layout-gutter);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-}
-
-.footer-copy,
-.footer-link {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-}
-
-.footer-link:hover {
-  color: var(--color-text-secondary);
 }
 
 @media (max-width: 768px) {

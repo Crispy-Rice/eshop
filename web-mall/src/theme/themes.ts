@@ -20,8 +20,8 @@ export interface ThemeDef {
   themeColor: string
   /** 营销带主标题 */
   headline: string
-  /** 营销带副文案 */
-  slogan: string
+  /** 营销带副文案。可选 —— 中性主题不喊口号，只有大促主题才有 */
+  slogan?: string
   /** 营销带右上角徽标；中性主题没有大促，所以是可选的 */
   badge?: string
 }
@@ -33,7 +33,6 @@ export const THEMES: Record<ThemeId, ThemeDef> = {
     swatch: '#18181b',
     themeColor: '#f7f7f8',
     headline: '甄选好物',
-    slogan: '中性货架 · 专注商品本身',
   },
   'promo-618': {
     id: 'promo-618',

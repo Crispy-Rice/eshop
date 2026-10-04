@@ -19,7 +19,7 @@ const { themeDef } = useTheme()
     <div class="promo-inner">
       <span v-if="themeDef.badge" class="promo-badge">{{ themeDef.badge }}</span>
       <h2 class="promo-headline">{{ themeDef.headline }}</h2>
-      <p class="promo-slogan">{{ themeDef.slogan }}</p>
+      <p v-if="themeDef.slogan" class="promo-slogan">{{ themeDef.slogan }}</p>
     </div>
   </section>
 </template>
