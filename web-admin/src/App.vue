@@ -4,6 +4,7 @@ import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
 import { setUnauthorizedHandler } from '@/api/http'
+import { MALL_APP_URL } from '@/utils/siblingApp'
 import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
@@ -49,6 +50,9 @@ async function onLogout(): Promise<void> {
         </nav>
 
         <div class="spacer" />
+
+        <!-- 同一个账号也能逛商城（卖家账号买东西是常规做法），给个顺手的入口 -->
+        <a :href="MALL_APP_URL" class="mall-link">去商城</a>
 
         <div v-if="auth.isLoggedIn" class="user">
           <span class="nickname">{{ auth.user?.nickname }}</span>
@@ -159,6 +163,18 @@ async function onLogout(): Promise<void> {
 
 .spacer {
   flex: 1;
+}
+
+/* 跨端入口：贴着用户区但不参与它内部的紧凑排布 */
+.mall-link {
+  flex: 0 0 auto;
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.mall-link:hover {
+  color: var(--color-accent);
 }
 
 .user {

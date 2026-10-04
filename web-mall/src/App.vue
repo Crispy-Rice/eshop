@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { computed, onMounted } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
@@ -8,12 +8,26 @@ import { setUnauthorizedHandler } from '@/api/http'
 import { useTheme } from '@/composables/useTheme'
 import { useAuthStore } from '@/stores/auth'
 import { useCartStore } from '@/stores/cart'
+import { ADMIN_APP_URL } from '@/utils/siblingApp'
 
 const auth = useAuthStore()
 const cart = useCartStore()
 const router = useRouter()
 const route = useRoute()
 const { theme, themes, setTheme } = useTheme()
+
+/**
+ * 后台入口。只给真进得去的人显示 —— 买家点「商家后台」只会撞 403，
+ * 不如等他在「我的」里开完店再出现（运营/财务则直接给运营后台）。
+ */
+const backendEntry = computed(() => {
+  const user = auth.user
+  if (!user) return null
+  if (user.role === 'admin' || user.role === 'finance') {
+    return { label: '运营后台', url: ADMIN_APP_URL }
+  }
+  return user.shopId ? { label: '商家后台', url: ADMIN_APP_URL } : null
+})
 
 // 令牌失效时由 http 层回调：清状态并跳登录
 setUnauthorizedHandler(() => {
@@ -80,6 +94,9 @@ async function onLogout(): Promise<void> {
 
         <div class="user">
           <template v-if="auth.isLoggedIn">
+            <a v-if="backendEntry" :href="backendEntry.url" class="backend-link">
+              {{ backendEntry.label }}
+            </a>
             <span class="nickname">{{ auth.user?.nickname }}</span>
             <el-button link type="primary" @click="onLogout">退出</el-button>
           </template>
@@ -268,6 +285,17 @@ async function onLogout(): Promise<void> {
   flex: 0 0 auto;
 }
 
+/* 跨端入口：比站内导航轻一档，不跟"购物车/我的订单"抢注意力 */
+.backend-link {
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.backend-link:hover {
+  color: var(--color-accent);
+}
+
 .nickname {
   font-size: var(--text-base);
   color: var(--color-text);
@@ -316,6 +344,11 @@ async function onLogout(): Promise<void> {
   }
 
   .nav {
+    display: none;
+  }
+
+  /* 窄屏和 .nav 一并收起：header 里每样都是定宽，留着会把内容顶出可视区 */
+  .backend-link {
     display: none;
   }
 }
