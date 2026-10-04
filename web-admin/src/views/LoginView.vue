@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 
@@ -18,6 +18,29 @@ const form = reactive({
   password: '',
   confirmPassword: '',
   nickname: '',
+})
+
+/**
+ * 记住手机号。
+ *
+ * ★ **只存手机号，不存密码。** 手机号是非机密标识，明写在页面上，存 localStorage
+ *   不增加暴露面；密码是机密，明文落进 localStorage 后页面里任何一处 XSS 都能读走，
+ *   而用户往往在别处复用同一个密码，伤害半径比丢一个 token 大得多。真要"记住密码"，
+ *   交给浏览器自带的密码管理器 —— 下面输入框上的 autocomplete 属性就是为它准备的，
+ *   由系统钥匙串保管。商城那边是同一套做法。
+ *
+ * 和商城**共用同一个 key**：生产环境两个前端同源（`/` 与 `/admin/`），本来就是一套
+ * 账号，手机号在任一边填过一次就够 —— 和 token 的共享是同一个道理。
+ */
+const REMEMBERED_PHONE_KEY = 'eshop.rememberedPhone'
+const rememberPhone = ref(false)
+
+onMounted(() => {
+  const saved = localStorage.getItem(REMEMBERED_PHONE_KEY)
+  if (saved) {
+    form.phone = saved
+    rememberPhone.value = true
+  }
 })
 
 const rules: FormRules = {
@@ -50,6 +73,11 @@ async function onSubmit(): Promise<void> {
   try {
     if (mode.value === 'login') {
       await auth.login(form.phone, form.password)
+      if (rememberPhone.value) {
+        localStorage.setItem(REMEMBERED_PHONE_KEY, form.phone)
+      } else {
+        localStorage.removeItem(REMEMBERED_PHONE_KEY)
+      }
       ElMessage.success('登录成功')
     } else {
       await auth.register(form.phone, form.password, form.nickname || undefined)
@@ -75,7 +103,12 @@ function switchMode(): void {
 
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent>
         <el-form-item label="手机号" prop="phone">
-          <el-input v-model="form.phone" placeholder="11 位手机号" maxlength="11" />
+          <el-input
+            v-model="form.phone"
+            placeholder="11 位手机号"
+            maxlength="11"
+            autocomplete="username"
+          />
         </el-form-item>
 
         <el-form-item label="密码" prop="password">
@@ -84,11 +117,22 @@ function switchMode(): void {
             type="password"
             show-password
             placeholder="至少 8 位，含字母/数字/符号中的两类"
+            :autocomplete="mode === 'login' ? 'current-password' : 'new-password'"
           />
         </el-form-item>
 
+        <!-- 只记手机号；密码交给浏览器自己的密码管理器（见脚本里的说明） -->
+        <el-form-item v-if="mode === 'login'">
+          <el-checkbox v-model="rememberPhone">记住手机号</el-checkbox>
+        </el-form-item>
+
         <el-form-item v-if="mode === 'register'" label="确认密码" prop="confirmPassword">
-          <el-input v-model="form.confirmPassword" type="password" show-password />
+          <el-input
+            v-model="form.confirmPassword"
+            type="password"
+            show-password
+            autocomplete="new-password"
+          />
         </el-form-item>
 
         <el-form-item v-if="mode === 'register'" label="昵称（选填）" prop="nickname">

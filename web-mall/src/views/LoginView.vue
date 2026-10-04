@@ -126,7 +126,6 @@ function switchMode(): void {
         <!-- 只记手机号；密码交给浏览器自己的密码管理器（见脚本里的说明） -->
         <el-form-item v-if="mode === 'login'">
           <el-checkbox v-model="rememberPhone">记住手机号</el-checkbox>
-          <span class="remember-hint">密码由浏览器保存</span>
         </el-form-item>
 
         <el-form-item v-if="mode === 'register'" label="确认密码" prop="confirmPassword">
@@ -184,12 +183,6 @@ function switchMode(): void {
 
 .submit {
   width: 100%;
-}
-
-.remember-hint {
-  margin-left: var(--space-3);
-  font-size: var(--text-xs);
-  color: var(--color-text-placeholder);
 }
 
 .switch {
