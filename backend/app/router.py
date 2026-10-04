@@ -3,9 +3,14 @@
 每个模块在自己的 ``router.py`` 里定义 ``router = APIRouter(prefix="/api/...")``，
 在这里统一挂载。按路径前缀分三组：
 
-- 买家端   /api/...
-- 商家端   /api/merchant/...   require_role("merchant")
-- 运营端   /api/admin/...      require_role("admin", "finance")
+- 买家端   /api/...            登录即可，不校验角色
+- 商家端   /api/merchant/...   ``CurrentShopIdDep``（account/deps.py）按**店铺归属**校验
+- 运营端   /api/admin/...      ``require_role("admin", "finance")``
+
+★ 商家端**刻意不看 role**。``role`` 是签发 token 那一刻的快照：用户开完店，
+数据库里已经是 ``merchant``，手里那张 token 仍然写着 ``buyer``，要等下次刷新
+才更新（account/service.py 的 ``create_shop`` 只改库，不重签）。用店铺归属判权
+既比角色更精确（角色是粗粒度的，店铺是资源级的），也不会被过期 token 坑。
 
 模块实现后把对应 import 打开即可（docs/01-overview.md §2.1）。
 """

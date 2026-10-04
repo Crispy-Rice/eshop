@@ -21,7 +21,7 @@
 | 密码存储 | `argon2-cffi` 哈希（Argon2id），不可逆 |
 | access token | JWT（HS256，`PyJWT`），有效期 30 分钟，载荷只放 `sub`（用户 ID）、`role`、`shop_id`、`exp` |
 | refresh token | 随机串，有效期 14 天，**哈希后**存 PG，可吊销；前端存 `localStorage` |
-| 角色 | `buyer` / `merchant` / `admin` / `finance`，路由用 `Depends(require_role(...))` 声明 |
+| 角色 | `buyer` / `merchant` / `admin` / `finance`。运营端用 `Depends(require_role("admin", "finance"))`；**商家端不校验角色，而是校验店铺归属**（`CurrentShopIdDep`）—— token 里的 `role` 是签发时的快照，开完店不会立即更新 |
 | 登录防爆破 | 同账号 5 次失败锁定 15 分钟，同 IP 每分钟 20 次（Redis 计数） |
 
 > refresh token 存 `localStorage` 会受 XSS 影响。第一期通过严格的输出转义与 CSP 降低风险（§4）；启用 HTTPS 后改为 `HttpOnly; Secure; SameSite=Strict` Cookie 存放 refresh token。
