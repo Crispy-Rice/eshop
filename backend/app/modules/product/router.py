@@ -15,9 +15,12 @@ from app.core.response import ApiResponse
 from app.modules.account.deps import CurrentShopIdDep
 from app.modules.product import service
 from app.modules.product.schemas import (
+    AdminCategoryTreeOut,
     CategoryCreateRequest,
+    CategoryMoveRequest,
     CategoryOut,
     CategoryTreeOut,
+    CategoryUpdateRequest,
     SkuBatchRequest,
     SkuBriefOut,
     SkuUpdateRequest,
@@ -159,11 +162,56 @@ async def off_shelf(spu_id: int, shop_id: CurrentShopIdDep, session: DbSession) 
 # ============================================================
 # 平台运营端
 # ============================================================
+@router.get(
+    "/api/admin/categories",
+    response_model=ApiResponse[list[AdminCategoryTreeOut]],
+    summary="类目树（含停用节点）",
+)
+async def list_admin_categories(
+    admin: AdminDep, session: DbSession
+) -> ApiResponse[list[AdminCategoryTreeOut]]:
+    return ApiResponse.ok(await service.list_admin_category_tree(session))
+
+
 @router.post("/api/admin/categories", response_model=ApiResponse[CategoryOut], summary="新建类目")
 async def create_category(
     body: CategoryCreateRequest, admin: AdminDep, session: DbSession
 ) -> ApiResponse[CategoryOut]:
     return ApiResponse.ok(await service.create_category(session, body, is_admin=True))
+
+
+@router.put(
+    "/api/admin/categories/{category_id}",
+    response_model=ApiResponse[CategoryOut],
+    summary="改类目（名称/排序/启停）",
+)
+async def update_category(
+    category_id: int, body: CategoryUpdateRequest, admin: AdminDep, session: DbSession
+) -> ApiResponse[CategoryOut]:
+    return ApiResponse.ok(await service.update_category(session, category_id, body))
+
+
+@router.post(
+    "/api/admin/categories/{category_id}/move",
+    response_model=ApiResponse[CategoryOut],
+    summary="移动类目（连同子树）",
+)
+async def move_category(
+    category_id: int, body: CategoryMoveRequest, admin: AdminDep, session: DbSession
+) -> ApiResponse[CategoryOut]:
+    """单独一个动作端点，不并进 PUT：移动会重写整棵子树的 path/level，
+    和"改个名字"不是一回事（与既有的 /api/admin/spus/{id}/audit 同一种风格）。"""
+    return ApiResponse.ok(await service.move_category(session, category_id, body.parent_id))
+
+
+@router.delete(
+    "/api/admin/categories/{category_id}",
+    response_model=ApiResponse[None],
+    summary="删除类目（仅叶子且无商品）",
+)
+async def delete_category(category_id: int, admin: AdminDep, session: DbSession) -> ApiResponse[None]:
+    await service.delete_category(session, category_id)
+    return ApiResponse.ok(None)
 
 
 @router.post("/api/admin/spus/{spu_id}/audit", response_model=ApiResponse[None], summary="商品审核")

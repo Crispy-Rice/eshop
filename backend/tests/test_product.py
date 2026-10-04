@@ -157,6 +157,349 @@ async def test_duplicate_category_name_rejected(client: AsyncClient, session) ->
     assert resp.status_code == 400
 
 
+async def _db_category(session, category_id: str) -> dict:
+    """直接读库拿 path/level。
+
+    接口出参里没有这两个字段，而"移动"的正确性几乎全在 path 上（子孙是不是
+    跟着重写了），只断言接口返回是看不出来的。
+    """
+    row = (
+        await session.execute(
+            text("SELECT parent_id, level, path FROM product.category WHERE id = :cid"),
+            {"cid": int(category_id)},
+        )
+    ).one()
+    return {
+        "parent_id": None if row[0] is None else str(row[0]),
+        "level": row[1],
+        "path": row[2],
+    }
+
+
+async def _admin_tree(client: AsyncClient, token: str) -> list[dict]:
+    resp = await client.get("/api/admin/categories", headers=auth_header(token))
+    assert resp.status_code == 200, resp.text
+    return resp.json()["data"]
+
+
+# ---------- 改名 / 排序 / 启停 ----------
+
+
+async def test_update_category_rename_and_sort(client: AsyncClient, session) -> None:
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "数码")
+
+    resp = await client.put(
+        f"/api/admin/categories/{category}",
+        json={"name": "数码产品", "sort": 5},
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["name"] == "数码产品"
+    assert resp.json()["data"]["sort"] == 5
+
+
+async def test_rename_to_own_name_is_ok(client: AsyncClient, session) -> None:
+    """★ 改回自己现在的名字不该被自己那一行判成重名（所以需要 exclude_id）。"""
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "数码")
+    resp = await client.put(
+        f"/api/admin/categories/{category}",
+        json={"name": "数码"},
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def test_rename_to_sibling_name_rejected(client: AsyncClient, session) -> None:
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    await _make_category(client, admin["accessToken"], "数码")
+    other = await _make_category(client, admin["accessToken"], "家电")
+
+    resp = await client.put(f"/api/admin/categories/{other}", json={"name": "数码"}, headers=headers)
+    assert resp.status_code == 400
+    assert "同名" in resp.json()["message"]
+    # ★ 必须是预检挡下来的，不能是撞了唯一约束 —— 那会中断整个事务
+    assert [c["name"] for c in (await client.get("/api/categories")).json()["data"]] == ["数码", "家电"]
+
+
+async def test_sort_changes_tree_order(client: AsyncClient, session) -> None:
+    """★ 锁住"sort 是假的"这个缺陷。
+
+    原来 ORDER BY 把 path 放在最前，而兄弟节点的 path 各自含自己的 id，
+    等价于按 id 排 —— 运营改了 sort，顺序纹丝不动。
+    """
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    jia = await _make_category(client, admin["accessToken"], "甲")
+    yi = await _make_category(client, admin["accessToken"], "乙")
+
+    # 都是 sort=0，按 id 排，"甲"在前
+    assert [c["name"] for c in (await client.get("/api/categories")).json()["data"]] == ["甲", "乙"]
+
+    assert (await client.put(f"/api/admin/categories/{jia}", json={"sort": 2}, headers=headers)).status_code == 200
+    assert (await client.put(f"/api/admin/categories/{yi}", json={"sort": 1}, headers=headers)).status_code == 200
+
+    assert [c["name"] for c in (await client.get("/api/categories")).json()["data"]] == ["乙", "甲"], (
+        "改了 sort 顺序必须跟着变"
+    )
+
+
+async def test_disable_category_hides_it_from_public_tree(client: AsyncClient, session) -> None:
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    parent = await _make_category(client, admin["accessToken"], "数码")
+    leaf = await _make_category(client, admin["accessToken"], "手机", parent_id=parent)
+
+    resp = await client.put(f"/api/admin/categories/{leaf}", json={"status": 2}, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    tree = (await client.get("/api/categories")).json()["data"]
+    assert [c["name"] for c in tree] == ["数码"]
+    assert tree[0]["children"] == [], "停用的类目不该出现在公开树里"
+
+    # 管理端树仍然看得见它，而且带着状态
+    node = (await _admin_tree(client, admin["accessToken"]))[0]["children"][0]
+    assert node["name"] == "手机"
+    assert node["status"] == 2
+
+
+async def test_disable_parent_with_active_child_rejected(client: AsyncClient, session) -> None:
+    """★ 停用父类目会让子类目在公开树里"冒"成一级（父不在树里就归入 roots）。"""
+    admin = await make_admin(client, session)
+    parent = await _make_category(client, admin["accessToken"], "数码")
+    await _make_category(client, admin["accessToken"], "手机", parent_id=parent)
+
+    resp = await client.put(
+        f"/api/admin/categories/{parent}", json={"status": 2}, headers=auth_header(admin["accessToken"])
+    )
+    assert resp.status_code == 400
+    assert "子类目" in resp.json()["message"]
+
+
+async def test_disabled_category_cannot_take_new_spu(client: AsyncClient, session) -> None:
+    """停用后商家选它发商品要报"类目不存在或已停用"。"""
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "智能手机")
+    assert (
+        await client.put(
+            f"/api/admin/categories/{category}",
+            json={"status": 2},
+            headers=auth_header(admin["accessToken"]),
+        )
+    ).status_code == 200
+
+    merchant = await register(client, phone="13800138012")
+    await open_shop(client, merchant["accessToken"])
+    resp = await client.post(
+        "/api/merchant/spus",
+        json=_spu_payload(category),
+        headers=auth_header(merchant["accessToken"]),
+    )
+    assert resp.status_code == 400
+    assert "停用" in resp.json()["message"]
+
+
+# ---------- 移动 ----------
+
+
+async def test_move_leaf_between_parents(client: AsyncClient, session) -> None:
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    a = await _make_category(client, admin["accessToken"], "数码")
+    b = await _make_category(client, admin["accessToken"], "家电")
+    leaf = await _make_category(client, admin["accessToken"], "手机", parent_id=a)
+
+    resp = await client.post(f"/api/admin/categories/{leaf}/move", json={"parentId": b}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["parentId"] == b
+    assert resp.json()["data"]["level"] == 2
+
+    row = await _db_category(session, leaf)
+    assert row["parent_id"] == b
+    assert row["path"] == f"/{b}/{leaf}/"
+
+
+async def test_move_rewrites_whole_subtree(client: AsyncClient, session) -> None:
+    """★ 核心用例：移动带子树的类目，子孙的 path 前缀和 level 都得跟着重写。"""
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    a = await _make_category(client, admin["accessToken"], "数码")
+    b = await _make_category(client, admin["accessToken"], "家电")
+    mid = await _make_category(client, admin["accessToken"], "手机", parent_id=a)
+    leaf = await _make_category(client, admin["accessToken"], "智能手机", parent_id=mid)
+    assert (await _db_category(session, leaf))["path"] == f"/{a}/{mid}/{leaf}/"
+
+    resp = await client.post(f"/api/admin/categories/{mid}/move", json={"parentId": b}, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    assert (await _db_category(session, mid))["path"] == f"/{b}/{mid}/"
+    moved = await _db_category(session, leaf)
+    assert moved["path"] == f"/{b}/{mid}/{leaf}/", "子孙的 path 前缀必须跟着换"
+    assert moved["level"] == 3
+    assert moved["parent_id"] == mid, "子孙的父子关系本身没变"
+
+    roots = {c["name"]: c for c in (await client.get("/api/categories")).json()["data"]}
+    assert roots["数码"]["children"] == []
+    assert roots["家电"]["children"][0]["name"] == "手机"
+    assert roots["家电"]["children"][0]["children"][0]["name"] == "智能手机"
+
+
+async def test_move_into_own_descendant_rejected(client: AsyncClient, session) -> None:
+    """环：把类目移到它自己或它的后代下必须挡住，否则子树会挂到自己底下。"""
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    a = await _make_category(client, admin["accessToken"], "数码")
+    mid = await _make_category(client, admin["accessToken"], "手机", parent_id=a)
+    leaf = await _make_category(client, admin["accessToken"], "智能手机", parent_id=mid)
+
+    for target in (a, mid, leaf):
+        resp = await client.post(f"/api/admin/categories/{a}/move", json={"parentId": target}, headers=headers)
+        assert resp.status_code == 400, f"移到 {target} 应当被拒"
+
+    assert (await _db_category(session, mid))["path"] == f"/{a}/{mid}/", "被拒后树不能被动过"
+
+
+async def test_move_exceeding_depth_rejected(client: AsyncClient, session) -> None:
+    """深了要 400，而不是撞 level 的 CHECK 约束变成 500。"""
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    a = await _make_category(client, admin["accessToken"], "数码")
+    b = await _make_category(client, admin["accessToken"], "家电")
+    b2 = await _make_category(client, admin["accessToken"], "电视", parent_id=b)  # level 2
+    mid = await _make_category(client, admin["accessToken"], "手机", parent_id=a)  # level 2
+    await _make_category(client, admin["accessToken"], "智能手机", parent_id=mid)  # level 3
+
+    # mid 子树最深 3 级，挂到 level 2 的 b2 下 → 最深会变成 4
+    resp = await client.post(f"/api/admin/categories/{mid}/move", json={"parentId": b2}, headers=headers)
+    assert resp.status_code == 400
+    assert "层级" in resp.json()["message"]
+    assert (await _db_category(session, mid))["parent_id"] == a, "失败后不能留下半个移动"
+
+
+async def test_move_to_same_parent_is_noop(client: AsyncClient, session) -> None:
+    """移到当前父节点：幂等成功 —— 重名预检不能把自己算进去。"""
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    a = await _make_category(client, admin["accessToken"], "数码")
+    mid = await _make_category(client, admin["accessToken"], "手机", parent_id=a)
+
+    resp = await client.post(f"/api/admin/categories/{mid}/move", json={"parentId": a}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert (await _db_category(session, mid))["path"] == f"/{a}/{mid}/"
+
+
+async def test_move_to_name_conflict_rejected(client: AsyncClient, session) -> None:
+    """不同父下同名是合法的，但移动后就会撞车 —— 同样要预检。"""
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    a = await _make_category(client, admin["accessToken"], "数码")
+    b = await _make_category(client, admin["accessToken"], "家电")
+    await _make_category(client, admin["accessToken"], "手机", parent_id=a)
+    moveme = await _make_category(client, admin["accessToken"], "手机", parent_id=b)
+
+    resp = await client.post(f"/api/admin/categories/{moveme}/move", json={"parentId": a}, headers=headers)
+    assert resp.status_code == 400
+    assert "同名" in resp.json()["message"]
+
+
+async def test_move_to_root(client: AsyncClient, session) -> None:
+    """parentId 传 null = 升为一级类目。"""
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    a = await _make_category(client, admin["accessToken"], "数码")
+    mid = await _make_category(client, admin["accessToken"], "手机", parent_id=a)
+
+    resp = await client.post(f"/api/admin/categories/{mid}/move", json={"parentId": None}, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    row = await _db_category(session, mid)
+    assert row["parent_id"] is None
+    assert row["level"] == 1
+    assert row["path"] == f"/{mid}/"
+
+
+# ---------- 删除 ----------
+
+
+async def test_delete_leaf_category(client: AsyncClient, session) -> None:
+    admin = await make_admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    category = await _make_category(client, admin["accessToken"], "数码")
+
+    resp = await client.delete(f"/api/admin/categories/{category}", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert (await client.get("/api/categories")).json()["data"] == []
+
+
+async def test_delete_category_with_children_rejected(client: AsyncClient, session) -> None:
+    admin = await make_admin(client, session)
+    parent = await _make_category(client, admin["accessToken"], "数码")
+    await _make_category(client, admin["accessToken"], "手机", parent_id=parent)
+
+    resp = await client.delete(
+        f"/api/admin/categories/{parent}", headers=auth_header(admin["accessToken"])
+    )
+    assert resp.status_code == 400
+    assert "子类目" in resp.json()["message"]
+    assert len((await client.get("/api/categories")).json()["data"]) == 1
+
+
+async def test_delete_category_with_spu_rejected(client: AsyncClient, session) -> None:
+    """★ spu.category_id 没有外键，删了不会级联也不会被数据库拦住 —— 必须应用层挡。"""
+    admin = await make_admin(client, session)
+    admin_headers = auth_header(admin["accessToken"])
+    category = await _make_category(client, admin["accessToken"], "智能手机")
+
+    merchant = await register(client, phone="13800138013")
+    await open_shop(client, merchant["accessToken"])
+    assert (
+        await client.post(
+            "/api/merchant/spus",
+            json=_spu_payload(category),
+            headers=auth_header(merchant["accessToken"]),
+        )
+    ).status_code == 200
+
+    resp = await client.delete(f"/api/admin/categories/{category}", headers=admin_headers)
+    assert resp.status_code == 400
+    assert "1 件商品" in resp.json()["message"]
+
+
+async def test_non_admin_cannot_mutate_categories(client: AsyncClient) -> None:
+    buyer = await register(client)
+    headers = auth_header(buyer["accessToken"])
+    assert (await client.get("/api/admin/categories", headers=headers)).status_code == 403
+    assert (
+        await client.put("/api/admin/categories/1", json={"name": "x"}, headers=headers)
+    ).status_code == 403
+    assert (await client.post("/api/admin/categories/1/move", json={}, headers=headers)).status_code == 403
+    assert (await client.delete("/api/admin/categories/1", headers=headers)).status_code == 403
+
+
+async def test_admin_tree_reports_spu_count(client: AsyncClient, session) -> None:
+    """管理端树带商品数 —— 删除被挡住时运营一眼能看到原因。"""
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "智能手机")
+
+    assert (await _admin_tree(client, admin["accessToken"]))[0]["spuCount"] == 0
+
+    merchant = await register(client, phone="13800138014")
+    await open_shop(client, merchant["accessToken"])
+    assert (
+        await client.post(
+            "/api/merchant/spus",
+            json=_spu_payload(category),
+            headers=auth_header(merchant["accessToken"]),
+        )
+    ).status_code == 200
+
+    node = (await _admin_tree(client, admin["accessToken"]))[0]
+    assert node["spuCount"] == 1
+    assert node["status"] == 1
+
+
 # ============================================================
 # 发布商品
 # ============================================================

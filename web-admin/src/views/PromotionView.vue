@@ -2,8 +2,8 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 
+import { fetchCategoryTree, type Category } from '@/api/category'
 import { isBizError } from '@/api/errors'
-import { fetchCategoryTree, type Category } from '@/api/product'
 import {
   CALC_DIRECT,
   CALC_FIXED,

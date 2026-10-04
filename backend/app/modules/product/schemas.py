@@ -42,6 +42,38 @@ class CategoryTreeOut(CategoryOut):
 CategoryTreeOut.model_rebuild()
 
 
+class CategoryUpdateRequest(CamelModel):
+    """部分更新：只改传了的字段（全量提交会把没动过的字段一起覆盖掉）。"""
+
+    name: str | None = Field(default=None, min_length=1, max_length=32)
+    sort: int | None = None
+    status: int | None = Field(default=None, ge=1, le=2, description="1 启用 / 2 停用")
+
+
+class CategoryMoveRequest(CamelModel):
+    parent_id: SnowflakeId | None = Field(default=None, description="新上级；null 表示升为一级类目")
+
+
+class AdminCategoryTreeOut(CamelModel):
+    """管理端的类目节点：比公开树多出停用状态和商品数。
+
+    商品数（spu_count）是刻意带上的 —— 运营点删除被挡住时，一眼就能看到是这个原因，
+    不用去商品列表里翻。它只算未删除的商品，和删除校验用的是同一个口径。
+    """
+
+    id: SnowflakeId
+    parent_id: SnowflakeId | None = None
+    name: str
+    level: int
+    sort: int
+    status: int
+    spu_count: int = 0
+    children: list[AdminCategoryTreeOut] = []
+
+
+AdminCategoryTreeOut.model_rebuild()
+
+
 # ============================================================
 # 商家：发布 / 编辑商品
 # ============================================================

@@ -16,7 +16,11 @@ from app.modules.product.models import Category, Sku, SkuSpec, SpecGroup, SpecVa
 
 
 async def list_categories(session: AsyncSession, *, only_active: bool = True) -> list[Category]:
-    stmt = select(Category).order_by(Category.path, Category.sort, Category.id)
+    # ★ 按 (sort, id) 排，**不能**把 path 放在前面。兄弟节点的 path 各自含自己的
+    #   id（``/1/10/`` 与 ``/1/20/``），按 path 排等价于按 id 排，``sort`` 就永远
+    #   轮不到 —— 树是照这个顺序往父节点的 children 里 append 的，顺序错了运营在
+    #   界面上改排序也不会动。
+    stmt = select(Category).order_by(Category.sort, Category.id)
     if only_active:
         stmt = stmt.where(Category.status == 1)
     result = await session.scalars(stmt)
@@ -27,9 +31,22 @@ async def get_category(session: AsyncSession, category_id: int) -> Category | No
     return await session.get(Category, category_id)
 
 
-async def category_name_exists(session: AsyncSession, parent_id: int | None, name: str) -> bool:
+async def category_name_exists(
+    session: AsyncSession,
+    parent_id: int | None,
+    name: str,
+    *,
+    exclude_id: int | None = None,
+) -> bool:
+    """同级下是否已有同名类目。
+
+    ``exclude_id`` 是给"改自己的名字"和"移动到自己当前的父节点"用的 —— 不排掉
+    自己，这两种操作都会被自己那个同名行判成重名。
+    """
     stmt = select(Category.id).where(Category.name == name)
     stmt = stmt.where(Category.parent_id.is_(None) if parent_id is None else Category.parent_id == parent_id)
+    if exclude_id is not None:
+        stmt = stmt.where(Category.id != exclude_id)
     return await session.scalar(stmt.limit(1)) is not None
 
 
@@ -52,12 +69,68 @@ async def list_categories_by_ids(session: AsyncSession, category_ids: Sequence[i
     return list(result)
 
 
-async def count_children(session: AsyncSession, category_id: int) -> int:
-    return (
-        await session.scalar(
-            select(func.count()).select_from(Category).where(Category.parent_id == category_id)
+async def count_children(session: AsyncSession, category_id: int, *, only_active: bool = False) -> int:
+    stmt = select(func.count()).select_from(Category).where(Category.parent_id == category_id)
+    if only_active:
+        stmt = stmt.where(Category.status == 1)
+    return (await session.scalar(stmt)) or 0
+
+
+async def count_spus_by_category_ids(
+    session: AsyncSession, category_ids: Sequence[int]
+) -> dict[int, int]:
+    """一次 GROUP BY 拿到多个类目下的商品数。
+
+    管理端整棵树都要显示"N 件商品"，逐个查会变成 N+1。
+    """
+    if not category_ids:
+        return {}
+    rows = await session.execute(
+        select(Spu.category_id, func.count())
+        .where(Spu.category_id.in_(category_ids), Spu.deleted.is_(False))
+        .group_by(Spu.category_id)
+    )
+    return {int(category_id): int(count) for category_id, count in rows}
+
+
+async def max_level_in_subtree(session: AsyncSession, path: str) -> int:
+    """子树里最深的层级。移动前判"搬完会不会超过三级"用。"""
+    deepest = await session.scalar(select(func.max(Category.level)).where(Category.path.startswith(path)))
+    return int(deepest) if deepest is not None else 1
+
+
+async def rewrite_subtree(
+    session: AsyncSession, *, old_prefix: str, new_prefix: str, level_delta: int
+) -> None:
+    """把整棵子树搬到新前缀下，一条 SQL 搞定，不加载子树。
+
+    物化路径的好处就在这里：子孙的 ``path`` 一定以祖先的 ``path`` 开头，所以
+    换个前缀、层级整体平移就够，不用递归。
+
+    ★ 前缀一律带尾斜杠。``path`` 是 ``/1/10/`` 这种形态，带斜杠才能保证
+    ``/1/1/`` 不会误伤 ``/1/10/``（``LIKE '/1/1/%'`` 对 ``/1/10/`` 不成立）。
+    """
+    await session.execute(
+        update(Category)
+        .where(Category.path.startswith(old_prefix))
+        .values(
+            path=func.concat(new_prefix, func.substring(Category.path, len(old_prefix) + 1)),
+            level=Category.level + level_delta,
+            updated_at=func.now(),
         )
-    ) or 0
+    )
+
+
+async def update_category_fields(session: AsyncSession, category_id: int, values: dict[str, Any]) -> None:
+    """部分更新。照 ``update_spu_fields`` 写，但**没有 version 自增** —— 类目表没有这列。"""
+    if not values:
+        return
+    values["updated_at"] = func.now()
+    await session.execute(update(Category).where(Category.id == category_id).values(**values))
+
+
+async def delete_category(session: AsyncSession, category_id: int) -> None:
+    await session.execute(delete(Category).where(Category.id == category_id))
 
 
 # ============================================================

@@ -14,6 +14,12 @@ const route = useRoute()
 /** 营销中心只有平台运营能进：后端接口只放给 admin / finance */
 const isAdmin = computed(() => auth.user?.role === 'admin' || auth.user?.role === 'finance')
 
+/**
+ * 类目维护比营销更窄：后端 product 模块的 AdminDep 是 require_role("admin")，
+ * 不含 finance。所以这里单独判，别复用 isAdmin 把财务也放进来。
+ */
+const isPlatformAdmin = computed(() => auth.user?.role === 'admin')
+
 setUnauthorizedHandler(() => {
   auth.clearLocal()
   ElMessage.warning('登录已过期，请重新登录')
@@ -44,6 +50,7 @@ async function onLogout(): Promise<void> {
           <RouterLink to="/orders" class="nav-link">订单</RouterLink>
           <RouterLink to="/aftersales" class="nav-link">售后</RouterLink>
           <RouterLink to="/reviews" class="nav-link">评价</RouterLink>
+          <RouterLink v-if="isPlatformAdmin" to="/categories" class="nav-link">类目</RouterLink>
           <RouterLink v-if="isAdmin" to="/promotions" class="nav-link">营销</RouterLink>
           <RouterLink to="/inventory" class="nav-link">库存</RouterLink>
           <RouterLink to="/freight" class="nav-link">运费</RouterLink>

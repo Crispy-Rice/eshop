@@ -1,14 +1,5 @@
 import { get, post, put } from './http'
 
-export interface Category {
-  id: string
-  parentId: string | null
-  name: string
-  level: number
-  sort: number
-  children: Category[]
-}
-
 export interface SpuCard {
   id: string
   shopId: string
@@ -124,11 +115,6 @@ export const SPU_STATUS_TYPE: Record<number, 'info' | 'success' | 'warning' | 'd
 }
 
 // ---------- 接口 ----------
-
-export const fetchCategoryTree = () => get<Category[]>('/categories')
-
-export const createCategory = (name: string, parentId?: string | null) =>
-  post<Category>('/admin/categories', { name, parentId: parentId ?? null })
 
 export const listMySpus = (params: { status?: number; keyword?: string; cursor?: string | null; limit?: number }) =>
   get<SpuList>('/merchant/spus', { params })

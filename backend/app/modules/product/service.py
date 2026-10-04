@@ -28,9 +28,11 @@ from app.modules.product.models import (
     Spu,
 )
 from app.modules.product.schemas import (
+    AdminCategoryTreeOut,
     CategoryCreateRequest,
     CategoryOut,
     CategoryTreeOut,
+    CategoryUpdateRequest,
     SkuBriefOut,
     SkuDetailOut,
     SkuUpdateRequest,
@@ -116,13 +118,7 @@ async def create_category(
         status=1,
     )
     await repo.insert_category(session, category)
-    return CategoryOut(
-        id=category.id,
-        parent_id=category.parent_id,
-        name=category.name,
-        level=category.level,
-        sort=category.sort,
-    )
+    return _category_out(category)
 
 
 async def list_category_tree(session: AsyncSession) -> list[CategoryTreeOut]:
@@ -143,6 +139,172 @@ async def list_category_tree(session: AsyncSession) -> list[CategoryTreeOut]:
         else:
             roots.append(node)
     return roots
+
+
+# ============================================================
+# 类目的运营维护：改名 / 排序 / 启停 / 移动 / 删除
+#
+# 角色一律由路由层的 AdminDep（require_role("admin")）把关，下面几个函数
+# 不重复判 is_admin —— create_category 里那层是更早的写法，没动它。
+# ============================================================
+
+# 与 product.category 的 CHECK 约束（level BETWEEN 1 AND 3）一致
+MAX_CATEGORY_LEVEL = 3
+
+
+def _category_out(category: Category) -> CategoryOut:
+    return CategoryOut(
+        id=category.id,
+        parent_id=category.parent_id,
+        name=category.name,
+        level=category.level,
+        sort=category.sort,
+    )
+
+
+async def list_admin_category_tree(session: AsyncSession) -> list[AdminCategoryTreeOut]:
+    """完整类目树，**含停用节点**。
+
+    公开的 ``list_category_tree`` 只给启用的。运营要能看到并重新启用停用的类目，
+    所以单走一条，而不是给公开接口加个开关 —— 那个接口被商城筛选和商家选类目
+    两处依赖，语义必须保持"只有启用的"。
+    """
+    categories = await repo.list_categories(session, only_active=False)
+    counts = await repo.count_spus_by_category_ids(session, [c.id for c in categories])
+
+    nodes: dict[int, AdminCategoryTreeOut] = {
+        c.id: AdminCategoryTreeOut(
+            id=c.id,
+            parent_id=c.parent_id,
+            name=c.name,
+            level=c.level,
+            sort=c.sort,
+            status=c.status,
+            spu_count=counts.get(c.id, 0),
+            children=[],
+        )
+        for c in categories
+    }
+    roots: list[AdminCategoryTreeOut] = []
+    for c in categories:
+        node = nodes[c.id]
+        if c.parent_id is not None and c.parent_id in nodes:
+            nodes[c.parent_id].children.append(node)
+        else:
+            roots.append(node)
+    return roots
+
+
+async def update_category(
+    session: AsyncSession, category_id: int, req: CategoryUpdateRequest
+) -> CategoryOut:
+    """部分更新：只写传了的字段。"""
+    category = await repo.get_category(session, category_id)
+    if category is None:
+        raise BizError(ErrorCode.NOT_FOUND, "类目不存在")
+
+    values: dict[str, Any] = {}
+
+    if req.name is not None and req.name != category.name:
+        # ★ 预检而不是让唯一约束去撞：唯一冲突会中断整个 PG 事务
+        #   （exclude_id 是必须的，否则"改回自己现在的名字"会被自己判成重名）
+        if await repo.category_name_exists(session, category.parent_id, req.name, exclude_id=category_id):
+            raise BizError(ErrorCode.VALIDATION_ERROR, "同级下已存在同名类目")
+        values["name"] = req.name
+
+    if req.sort is not None:
+        values["sort"] = req.sort
+
+    if req.status is not None and req.status != category.status:
+        # 停用父类目会让它的子类目在公开树里"冒"成一级（见 list_category_tree
+        # 把"父节点不在树里"的节点归入 roots 那段），所以先拦住。
+        if await repo.count_children(session, category_id, only_active=True) > 0:
+            raise BizError(ErrorCode.VALIDATION_ERROR, "请先停用或移走它下面的子类目")
+        values["status"] = req.status
+
+    await repo.update_category_fields(session, category_id, values)
+
+    return CategoryOut(
+        id=category.id,
+        parent_id=category.parent_id,
+        name=values.get("name", category.name),
+        level=category.level,
+        sort=values.get("sort", category.sort),
+    )
+
+
+async def move_category(
+    session: AsyncSession, category_id: int, new_parent_id: int | None
+) -> CategoryOut:
+    """把类目（连同整棵子树）挂到新上级下。``new_parent_id`` 为 None 表示升为一级。"""
+    category = await repo.get_category(session, category_id)
+    if category is None:
+        raise BizError(ErrorCode.NOT_FOUND, "类目不存在")
+
+    # 已经在目标位置。提前返回同时避免下面的重名预检把自己算进去。
+    if new_parent_id == category.parent_id:
+        return _category_out(category)
+
+    new_level = 1
+    new_prefix = "/"
+    if new_parent_id is not None:
+        parent = await repo.get_category(session, new_parent_id)
+        if parent is None:
+            raise BizError(ErrorCode.NOT_FOUND, "新上级类目不存在")
+        if parent.status != 1:
+            raise BizError(ErrorCode.VALIDATION_ERROR, "上级类目已停用")
+        # ★ 环检测：新上级的 path 以本节点 path 开头，说明它就是本节点或它的后代。
+        #   物化路径让这件事变成一行字符串判断，不用递归。
+        if parent.path.startswith(category.path):
+            raise BizError(ErrorCode.VALIDATION_ERROR, "不能把类目移动到它自己或其子类目下")
+        new_level = parent.level + 1
+        new_prefix = parent.path
+
+    if await repo.category_name_exists(session, new_parent_id, category.name, exclude_id=category_id):
+        raise BizError(ErrorCode.VALIDATION_ERROR, "目标位置已有同名类目")
+
+    level_delta = new_level - category.level
+    if level_delta:
+        # 不判的话会撞 level 的 CHECK 约束，变成一个 500
+        deepest = await repo.max_level_in_subtree(session, category.path)
+        if deepest + level_delta > MAX_CATEGORY_LEVEL:
+            raise BizError(ErrorCode.VALIDATION_ERROR, f"移动后层级会超过 {MAX_CATEGORY_LEVEL} 级")
+
+    await repo.rewrite_subtree(
+        session,
+        old_prefix=category.path,
+        new_prefix=f"{new_prefix}{category.id}/",
+        level_delta=level_delta,
+    )
+    await repo.update_category_fields(session, category_id, {"parent_id": new_parent_id})
+
+    return CategoryOut(
+        id=category.id,
+        parent_id=new_parent_id,
+        name=category.name,
+        level=new_level,
+        sort=category.sort,
+    )
+
+
+async def delete_category(session: AsyncSession, category_id: int) -> None:
+    """删除类目。**只允许叶子**，且不能被商品引用。
+
+    ``spu.category_id`` 是裸字段没有外键，删掉不会级联也不会被数据库拦住 ——
+    挡不住的话商品会静默失去类目，所以这里必须挡。
+    """
+    category = await repo.get_category(session, category_id)
+    if category is None:
+        raise BizError(ErrorCode.NOT_FOUND, "类目不存在")
+
+    if await repo.count_children(session, category_id) > 0:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "该类目下还有子类目，请先删除子类目")
+
+    spu_count = await repo.count_on_shelf_spus_by_category(session, category_id)
+    if spu_count > 0:
+        raise BizError(ErrorCode.VALIDATION_ERROR, f"该类目下还有 {spu_count} 件商品，无法删除")
+
+    await repo.delete_category(session, category_id)
 
 
 async def _resolve_category(session: AsyncSession, category_id: int) -> Category:

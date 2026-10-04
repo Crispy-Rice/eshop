@@ -53,6 +53,13 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
+    // 运营专属：后端的 /api/admin/categories 只放给 admin（不含 finance）
+    path: '/categories',
+    name: 'categories',
+    component: () => import('@/views/CategoryView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/inventory/flows',
     name: 'inventory-flows',
     component: () => import('@/views/InventoryFlowsView.vue'),
