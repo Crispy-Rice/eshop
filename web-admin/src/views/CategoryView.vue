@@ -203,38 +203,56 @@ onMounted(load)
         <p class="empty-hint">商家发布商品时要选末级类目，先把树建起来</p>
       </el-empty>
 
-      <el-tree
-        v-else
-        class="cat-tree"
-        :data="tree"
-        node-key="id"
-        default-expand-all
-        :expand-on-click-node="false"
-        :indent="20"
-      >
-        <template #default="{ data }">
-          <div class="node">
-            <span class="node-name" :class="{ off: data.status !== 1 }">{{ data.name }}</span>
-            <el-tag v-if="data.status !== 1" type="info" size="small" disable-transitions>停用</el-tag>
-            <span v-if="data.spuCount > 0" class="node-count tnum">{{ data.spuCount }} 件商品</span>
+      <template v-else>
+        <!-- 表头。树没法真做成 el-table，但把这一条加上，读起来就是后台那一套表格 -->
+        <div class="panel-head">
+          <span>类目</span>
+          <span class="head-actions">操作</span>
+        </div>
 
-            <div class="node-actions">
-              <el-button
-                v-if="data.level < MAX_CATEGORY_LEVEL"
-                link
-                type="primary"
-                size="small"
-                @click.stop="openCreate(data)"
-              >
-                新增子类目
-              </el-button>
-              <el-button link type="primary" size="small" @click.stop="openEdit(data)">编辑</el-button>
-              <el-button link type="primary" size="small" @click.stop="openMove(data)">移动</el-button>
-              <el-button link type="danger" size="small" @click.stop="onDelete(data)">删除</el-button>
+        <el-tree
+          class="cat-tree"
+          :data="tree"
+          node-key="id"
+          default-expand-all
+          :expand-on-click-node="false"
+          :indent="18"
+        >
+          <template #default="{ data }">
+            <div class="node">
+              <span class="node-name" :class="{ off: data.status !== 1 }">{{ data.name }}</span>
+              <el-tag v-if="data.status !== 1" type="info" size="small" effect="plain" disable-transitions>
+                停用
+              </el-tag>
+              <el-tag v-if="data.spuCount > 0" size="small" effect="plain" disable-transitions>
+                <span class="tnum">{{ data.spuCount }}</span> 件商品
+              </el-tag>
+
+              <div class="node-actions">
+                <el-button
+                  v-if="data.level < MAX_CATEGORY_LEVEL"
+                  class="act-create"
+                  link
+                  type="primary"
+                  size="small"
+                  @click.stop="openCreate(data)"
+                >
+                  新增子类目
+                </el-button>
+                <el-button class="act-edit" link type="primary" size="small" @click.stop="openEdit(data)">
+                  编辑
+                </el-button>
+                <el-button class="act-move" link type="primary" size="small" @click.stop="openMove(data)">
+                  移动
+                </el-button>
+                <el-button class="act-del" link type="danger" size="small" @click.stop="onDelete(data)">
+                  删除
+                </el-button>
+              </div>
             </div>
-          </div>
-        </template>
-      </el-tree>
+          </template>
+        </el-tree>
+      </template>
     </div>
 
     <!-- 新建 -->
@@ -358,7 +376,8 @@ onMounted(load)
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  padding: var(--space-1) 0;
+  /* 内边距交给表头和行自己，这里留 0，行分隔线才能通到两侧 */
+  padding: 0;
 }
 
 .panel :deep(.el-empty) {
@@ -374,17 +393,43 @@ onMounted(load)
 /* --------------------------------------------------------------------------
  * 类目树
  *
- * 行内操作常显而不是 hover 才出现：这三四个动作是这一页的全部功能，
- * 藏起来会让"这页能干什么"变得不明显。
+ * 后台其它页都是 el-table：表头、带分隔线的行、悬停高亮、一致的行高。
+ * 树在结构上不是表格，但把这四样凑齐，读起来就还是同一套东西 ——
+ * 之前"看着不整齐"主要就缺在这里。
  * ------------------------------------------------------------------------*/
 
-.cat-tree {
-  padding: var(--space-2) var(--space-3) var(--space-3);
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
 }
 
+/* 与下面四个操作槽位的总宽一致，「操作」二字才正好压在按钮上方 */
+.head-actions {
+  width: calc(78px + 42px * 3);
+  text-align: right;
+}
+
+.cat-tree {
+  /* 最后一行底下留一点，免得它的分隔线与 panel 的边框贴成一条粗线 */
+  padding-bottom: var(--space-1);
+}
+
+/* 左内边距与表头一致，根类目才能和「类目」二字对齐 */
 .cat-tree :deep(.el-tree-node__content) {
-  height: 34px;
-  border-radius: var(--radius-sm);
+  height: 44px;
+  padding-left: var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  border-radius: 0;
+}
+
+.cat-tree :deep(.el-tree-node__content:hover) {
+  background: var(--color-bg-hover);
 }
 
 .node {
@@ -392,7 +437,7 @@ onMounted(load)
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  padding-right: var(--space-2);
+  padding-right: var(--space-4);
 }
 
 .node-name {
@@ -405,19 +450,39 @@ onMounted(load)
   color: var(--color-text-placeholder);
 }
 
-.node-count {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-}
-
+/*
+ * 四个操作各占一个**固定槽位**。
+ *
+ * ★ 不能只靠右对齐：三级类目没有「新增子类目」，缺这一个按钮，后面三个就会整体
+ *   右移 —— 一列行看下来按钮的左边缘参差不齐，这正是这一页显得不整齐的主因。
+ *   用 grid 显式指定列，缺的那个位置空着即可。
+ */
 .node-actions {
   margin-left: auto;
-  display: flex;
-  align-items: center;
   flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: 78px 42px 42px 42px;
+  align-items: center;
+  justify-items: end;
 }
 
-/* Element Plus 给相邻按钮加了 margin-left，这里改用 gap 控制间距 */
+.node-actions :deep(.act-create) {
+  grid-column: 1;
+}
+
+.node-actions :deep(.act-edit) {
+  grid-column: 2;
+}
+
+.node-actions :deep(.act-move) {
+  grid-column: 3;
+}
+
+.node-actions :deep(.act-del) {
+  grid-column: 4;
+}
+
+/* Element Plus 默认给相邻按钮加 margin-left，网格里要清掉 */
 .node-actions :deep(.el-button) {
   margin-left: 0;
 }
