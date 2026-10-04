@@ -103,8 +103,15 @@ function onReset(): void {
   void load(true)
 }
 
-function openDetail(spu: SpuCard): void {
-  void router.push({ name: 'product-detail', params: { spuId: spu.id } })
+/**
+ * 商品卡片一律在**新标签页**打开（照淘宝的做法）。
+ *
+ * 详情页会顶掉列表页，用户看完一款想再看别款就得靠浏览器后退 ——
+ * 新标签页让列表始终留在原处，"返回上一级"这个问题就不存在了。
+ * 卡片是真 `<a>`，于是中键 / Ctrl+点击这些浏览器原生行为也都跟着有。
+ */
+function detailHref(spu: SpuCard): string {
+  return router.resolve({ name: 'product-detail', params: { spuId: spu.id } }).href
 }
 
 onMounted(async () => {
@@ -163,13 +170,13 @@ onMounted(async () => {
       <el-empty v-if="searched && items.length === 0" description="没有找到符合条件的商品" />
 
       <div v-else class="shelf">
-        <article
+        <a
           v-for="item in items"
           :key="item.id"
           class="card"
-          tabindex="0"
-          @click="openDetail(item)"
-          @keyup.enter="openDetail(item)"
+          :href="detailHref(item)"
+          target="_blank"
+          rel="noopener"
         >
           <div class="card-media">
             <img :src="item.mainImage" :alt="item.title" loading="lazy" @error="onImageError" />
@@ -182,7 +189,7 @@ onMounted(async () => {
               <span v-if="item.reviewCount > 0" class="tnum">{{ item.avgScore.toFixed(1) }} 分</span>
             </div>
           </div>
-        </article>
+        </a>
       </div>
 
       <div v-if="hasMore" class="more">
@@ -289,6 +296,9 @@ onMounted(async () => {
   border-radius: var(--card-radius);
   overflow: hidden;
   cursor: pointer;
+  /* 卡片是 <a>，把链接的默认样式抹掉 */
+  text-decoration: none;
+  color: inherit;
   transition:
     border-color var(--dur) var(--ease-out),
     box-shadow var(--dur) var(--ease-out),

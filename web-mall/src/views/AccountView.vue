@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { nextTick, onMounted, ref } from 'vue'
+import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 
 import * as authApi from '@/api/auth'
 import type { Address, AddressInput } from '@/api/auth'
-import { isBizError } from '@/api/errors'
+import { ErrorCode, isBizError } from '@/api/errors'
 import { post } from '@/api/http'
 import { useAuthStore } from '@/stores/auth'
 
@@ -14,6 +14,7 @@ const loading = ref(false)
 const shopLoading = ref(false)
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
+const formRef = ref<FormInstance>()
 
 const emptyForm = (): AddressInput => ({
   receiverName: '',
@@ -29,6 +30,64 @@ const emptyForm = (): AddressInput => ({
 
 const form = ref<AddressInput>(emptyForm())
 
+/** 与后端 `account/schemas.py` 的 PHONE_PATTERN 保持一致 */
+const PHONE_PATTERN = /^1[3-9]\d{9}$/
+const REGION_CODE_PATTERN = /^\d{6}$/
+
+/**
+ * 省市区是三格输入、一个表单项。
+ *
+ * 后端把三者都设为必填，这里必须一起判 —— 否则用户填了省市漏了区，
+ * 照样只会在提交后收到一句「参数错误」。
+ */
+function validateRegion(
+  _rule: unknown,
+  _value: unknown,
+  callback: (error?: Error) => void,
+): void {
+  const { province, city, district } = form.value
+  if (province.trim() && city.trim() && district.trim()) callback()
+  else callback(new Error('请填写完整的省、市、区'))
+}
+
+const rules: FormRules = {
+  receiverName: [{ required: true, message: '请填写收货人', trigger: 'blur' }],
+  phone: [
+    { required: true, message: '请填写手机号', trigger: 'blur' },
+    { pattern: PHONE_PATTERN, message: '手机号格式不对，应为 1 开头的 11 位数字', trigger: 'blur' },
+  ],
+  province: [{ required: true, validator: validateRegion, trigger: 'blur' }],
+  detail: [{ required: true, message: '请填写详细地址', trigger: 'blur' }],
+  regionCode: [
+    { required: true, message: '请填写区划码', trigger: 'blur' },
+    { pattern: REGION_CODE_PATTERN, message: '区划码是 6 位数字，如 310115', trigger: 'blur' },
+  ],
+}
+
+/** 后端字段名 → 中文，用于兜底提示 */
+const FIELD_LABELS: Record<string, string> = {
+  receiverName: '收货人',
+  phone: '手机号',
+  province: '省份',
+  city: '城市',
+  district: '区县',
+  detail: '详细地址',
+  regionCode: '区划码',
+}
+
+/**
+ * 前端规则已经挡掉了绝大多数情况；万一还是被后端拒了，
+ * 至少说清是哪个字段，别再只弹一句「参数错误」。
+ */
+function saveErrorMessage(e: unknown): string {
+  if (isBizError(e, ErrorCode.VALIDATION_ERROR)) {
+    const errors = (e.data as { errors?: { field?: string }[] } | null)?.errors
+    const field = errors?.[0]?.field
+    if (field && FIELD_LABELS[field]) return `${FIELD_LABELS[field]}填写有误，请检查`
+  }
+  return isBizError(e) ? e.message : '保存失败'
+}
+
 async function load(): Promise<void> {
   loading.value = true
   try {
@@ -40,10 +99,16 @@ async function load(): Promise<void> {
   }
 }
 
+function openDialog(): void {
+  dialogVisible.value = true
+  // 上一次留下的红色提示不该跟着带到这一次
+  void nextTick(() => formRef.value?.clearValidate())
+}
+
 function openCreate(): void {
   editingId.value = null
   form.value = emptyForm()
-  dialogVisible.value = true
+  openDialog()
 }
 
 function openEdit(address: Address): void {
@@ -59,10 +124,13 @@ function openEdit(address: Address): void {
     tag: address.tag,
     isDefault: address.isDefault,
   }
-  dialogVisible.value = true
+  openDialog()
 }
 
 async function onSubmit(): Promise<void> {
+  const valid = await formRef.value?.validate().catch(() => false)
+  if (!valid) return
+
   try {
     if (editingId.value) {
       await authApi.updateAddress(editingId.value, form.value)
@@ -74,7 +142,7 @@ async function onSubmit(): Promise<void> {
     dialogVisible.value = false
     await load()
   } catch (e) {
-    ElMessage.error(isBizError(e) ? e.message : '保存失败')
+    ElMessage.error(saveErrorMessage(e))
   }
 }
 
@@ -178,25 +246,30 @@ onMounted(() => {
       </el-table>
     </el-card>
 
-    <el-dialog v-model="dialogVisible" :title="editingId ? '编辑地址' : '新增地址'" width="520px">
-      <el-form :model="form" label-width="90px">
-        <el-form-item label="收货人">
+    <el-dialog
+      v-model="dialogVisible"
+      :title="editingId ? '编辑地址' : '新增地址'"
+      width="520px"
+      :close-on-click-modal="false"
+    >
+      <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
+        <el-form-item label="收货人" prop="receiverName">
           <el-input v-model="form.receiverName" maxlength="64" />
         </el-form-item>
-        <el-form-item label="手机号">
+        <el-form-item label="手机号" prop="phone">
           <el-input v-model="form.phone" maxlength="11" />
         </el-form-item>
-        <el-form-item label="省市区">
+        <el-form-item label="省市区" prop="province">
           <div class="region">
             <el-input v-model="form.province" placeholder="省" />
             <el-input v-model="form.city" placeholder="市" />
             <el-input v-model="form.district" placeholder="区" />
           </div>
         </el-form-item>
-        <el-form-item label="详细地址">
+        <el-form-item label="详细地址" prop="detail">
           <el-input v-model="form.detail" maxlength="255" />
         </el-form-item>
-        <el-form-item label="区划码">
+        <el-form-item label="区划码" prop="regionCode">
           <el-input v-model="form.regionCode" placeholder="如 310115，运费计算用" maxlength="16" />
         </el-form-item>
         <el-form-item label="设为默认">
