@@ -3,8 +3,9 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
-import { isBizError } from '@/api/errors'
+import { fetchShop, type ShopInfo } from '@/api/auth'
 import { addToCart } from '@/api/cart'
+import { isBizError } from '@/api/errors'
 import { fetchSkuStock } from '@/api/inventory'
 import { fetchSpu, type SkuDetail, type SpuDetail } from '@/api/product'
 import {
@@ -29,6 +30,8 @@ const auth = useAuthStore()
 const cart = useCartStore()
 
 const spu = ref<SpuDetail | null>(null)
+/** 卖这件商品的店铺。匿名可读，拉不到就不显示这一块 */
+const shop = ref<ShopInfo | null>(null)
 const loading = ref(false)
 const notFound = ref(false)
 const quantity = ref(1)
@@ -184,16 +187,32 @@ async function onAddToCart(): Promise<void> {
   }
 }
 
+/**
+ * 拉店铺信息。
+ *
+ * ★ 这一块是**锦上添花**，拉不到不能影响商品页本身：店铺被删、接口 404，
+ *   都只是不显示，不弹错。所以这里自己吞掉异常。
+ */
+async function loadShop(shopId: string): Promise<void> {
+  try {
+    shop.value = await fetchShop(shopId)
+  } catch {
+    shop.value = null
+  }
+}
+
 async function load(): Promise<void> {
   loading.value = true
   notFound.value = false
   selected.value = {}
   quantity.value = 1
+  shop.value = null
   try {
     spu.value = await fetchSpu(spuId.value)
     selectFirstAvailable()
     // 上面已经选满一组；这里兜住"某个组一个可选值都没有"的畸形 SKU 矩阵
     autoSelectSingleOptions()
+    await loadShop(spu.value.shopId)
     await loadReviews(true)
   } catch (e) {
     spu.value = null
@@ -337,6 +356,16 @@ watch(spuId, load)
           >
             加入购物车
           </el-button>
+
+          <!-- 卖家是谁。店铺接口匿名可读，没登录也看得到 -->
+          <div v-if="shop" class="shop">
+            <img v-if="shop.logo" :src="shop.logo" class="shop-logo" alt="" @error="onImageError" />
+            <span v-else class="shop-logo shop-logo-fallback">{{ shop.name.slice(0, 1) }}</span>
+            <div class="shop-text">
+              <div class="shop-name">{{ shop.name }}</div>
+              <div v-if="shop.description" class="shop-desc">{{ shop.description }}</div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -613,6 +642,57 @@ watch(spuId, load)
 
 .buy {
   width: 200px;
+}
+
+/* --------------------------------------------------------------------------
+ * 店铺
+ *
+ * 放在购买区下面：先让人把东西买了，再回答"这是哪家店"。
+ * ------------------------------------------------------------------------*/
+
+.shop {
+  margin-top: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.shop-logo {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  flex: 0 0 auto;
+}
+
+img.shop-logo {
+  object-fit: cover;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-inset);
+}
+
+/* 店铺没传 logo 时用店名首字当字母头像 —— 比一块灰方块像样得多 */
+.shop-logo-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-bg-subtle);
+  color: var(--color-text-secondary);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+}
+
+.shop-name {
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
+}
+
+.shop-desc {
+  margin-top: 2px;
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
 }
 
 @media (max-width: 768px) {

@@ -290,9 +290,7 @@ async def create_shop(session: AsyncSession, user_id: int, req: ShopCreateReques
         await repo.update_user_fields(session, user_id, {"role": "merchant"})
 
     logger.info("店铺创建成功", extra={"userId": user_id, "shopId": shop.id})
-    return ShopOut(
-        id=shop.id, name=shop.name, logo=shop.logo, description=shop.description, status=shop.status
-    )
+    return _to_shop_out(shop)
 
 
 async def get_shop_id(session: AsyncSession, user_id: int) -> int | None:
@@ -308,6 +306,27 @@ async def get_my_shop(session: AsyncSession, user_id: int) -> ShopOut:
     shop = await repo.get_shop_by_owner(session, user_id)
     if shop is None:
         raise BizError(ErrorCode.NOT_FOUND, "你还没有店铺")
+    return _to_shop_out(shop)
+
+
+async def get_public_shop(session: AsyncSession, shop_id: int) -> ShopOut:
+    """按 ID 取店铺的**公开**信息，商品详情页用来显示"这件商品是哪家店的"。
+
+    ★ 刻意做成 account 自己的公开接口，而不是让 product 直接读 account：
+      docs/01 §2 的依赖图里没有 product → account 这条边，商品模块的 repository
+      也声明了"只碰 product schema"。由前端把「商品」和「店铺」两个请求拼起来，
+      两边都不越界 —— 而且顺带能拿到 logo 与简介，不只是一个店名。
+
+    返回的就是 ShopOut（id / 名称 / logo / 简介 / 状态），这几个本来就是对外的字段，
+    不含 owner_user_id 之类。
+    """
+    shop = await repo.get_shop_by_id(session, shop_id)
+    if shop is None:
+        raise BizError(ErrorCode.NOT_FOUND, "店铺不存在")
+    return _to_shop_out(shop)
+
+
+def _to_shop_out(shop: Shop) -> ShopOut:
     return ShopOut(
         id=shop.id, name=shop.name, logo=shop.logo, description=shop.description, status=shop.status
     )

@@ -132,6 +132,18 @@ async def delete_address(address_id: int, user: CurrentUserDep, session: DbSessi
 
 
 # ============================================================
+# 店铺（公开只读）
+# ============================================================
+@router.get("/api/shops/{shop_id}", response_model=ApiResponse[ShopOut], summary="店铺公开信息")
+async def get_shop(shop_id: int, session: DbSession) -> ApiResponse[ShopOut]:
+    """不需要登录：商品详情页要显示"这件商品是哪家店的"。
+
+    和下面的 /api/merchant/shop 分开 —— 那条是"我的店铺"，要登录且只返回自己的。
+    """
+    return ApiResponse.ok(await service.get_public_shop(session, shop_id))
+
+
+# ============================================================
 # 店铺（商家端）
 # ============================================================
 @router.post("/api/merchant/shop", response_model=ApiResponse[ShopOut], summary="开店")

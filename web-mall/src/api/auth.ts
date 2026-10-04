@@ -66,3 +66,19 @@ export const updateAddress = (id: string, payload: AddressInput) =>
   put<Address>(`/me/addresses/${id}`, payload)
 
 export const deleteAddress = (id: string) => del<null>(`/me/addresses/${id}`)
+
+/**
+ * 店铺的公开信息 —— 商品详情页要显示"这件商品是哪家店的"。
+ *
+ * 放在这里是因为它和 `/me`、地址同属 account 域。接口**匿名可读**，
+ * 所以没登录的买家也能看到店铺。
+ */
+export interface ShopInfo {
+  id: string
+  name: string
+  logo: string | null
+  description: string | null
+  status: number
+}
+
+export const fetchShop = (shopId: string) => get<ShopInfo>(`/shops/${shopId}`)

@@ -317,3 +317,28 @@ async def test_cannot_create_second_shop(client: AsyncClient) -> None:
 
     resp = await client.post("/api/merchant/shop", json={"name": "第二个店"}, headers=headers)
     assert resp.status_code == 400
+
+
+async def test_public_shop_info_needs_no_login(client: AsyncClient) -> None:
+    """商品详情页要显示店铺，但买家未必登录 —— 这条必须匿名可读。"""
+    tokens = await register(client)
+    shop = (
+        await client.post(
+            "/api/merchant/shop",
+            json={"name": "演示旗舰店", "description": "只卖好东西"},
+            headers=auth_header(tokens["accessToken"]),
+        )
+    ).json()["data"]
+
+    resp = await client.get(f"/api/shops/{shop['id']}")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["name"] == "演示旗舰店"
+    assert data["description"] == "只卖好东西"
+    # ★ 别把店主 ID 这类内部字段漏出去
+    assert "ownerUserId" not in data
+
+
+async def test_public_shop_info_unknown_id_404(client: AsyncClient) -> None:
+    resp = await client.get("/api/shops/999999999")
+    assert resp.status_code == 404
