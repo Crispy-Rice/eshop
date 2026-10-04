@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 
 import {
   REFUND_CLOSED,
@@ -29,7 +29,25 @@ const acting = ref(false)
 
 const returnVisible = ref(false)
 const returnForm = ref({ expressCompany: '', expressNo: '' })
+const returnFormRef = ref<FormInstance>()
 const CARRIERS = ['顺丰速运', '中通快递', '圆通速递', '韵达快递', '京东物流', '邮政EMS']
+
+/**
+ * 与后端 `RefundReturnRequest` 对齐：快递公司 2~32 位、快递单号 4~64 位。
+ *
+ * ★ 这两条必须在前端有。后端只回一句「参数错误」，用户填了个 3 位的单号
+ *   根本不知道自己错在哪 —— 跟收货地址那边是同一个毛病。
+ */
+const returnRules: FormRules = {
+  expressCompany: [
+    { required: true, message: '请选择或填写快递公司', trigger: 'change' },
+    { min: 2, max: 32, message: '快递公司名称 2~32 个字符', trigger: 'blur' },
+  ],
+  expressNo: [
+    { required: true, message: '请填写快递单号', trigger: 'blur' },
+    { min: 4, max: 64, message: '快递单号至少 4 位', trigger: 'blur' },
+  ],
+}
 
 const refundNo = computed(() => String(route.params.refundNo ?? ''))
 
@@ -76,10 +94,9 @@ function openReturn(): void {
 }
 
 async function submitReturn(): Promise<void> {
-  if (!returnForm.value.expressCompany || !returnForm.value.expressNo.trim()) {
-    ElMessage.warning('请填写快递公司与快递单号')
-    return
-  }
+  const valid = await returnFormRef.value?.validate().catch(() => false)
+  if (!valid) return
+
   acting.value = true
   try {
     await fillReturnExpress(refundNo.value, {
@@ -253,14 +270,24 @@ onMounted(load)
       </footer>
     </template>
 
-    <el-dialog v-model="returnVisible" title="填写退货物流" width="420px">
-      <el-form label-width="76px">
-        <el-form-item label="快递公司">
-          <el-select v-model="returnForm.expressCompany" placeholder="选择或输入" filterable allow-create>
+    <el-dialog
+      v-model="returnVisible"
+      title="填写退货物流"
+      width="420px"
+      :close-on-click-modal="false"
+    >
+      <el-form ref="returnFormRef" :model="returnForm" :rules="returnRules" label-width="76px">
+        <el-form-item label="快递公司" prop="expressCompany">
+          <el-select
+            v-model="returnForm.expressCompany"
+            placeholder="选择或输入"
+            filterable
+            allow-create
+          >
             <el-option v-for="c in CARRIERS" :key="c" :label="c" :value="c" />
           </el-select>
         </el-form-item>
-        <el-form-item label="快递单号">
+        <el-form-item label="快递单号" prop="expressNo">
           <el-input v-model="returnForm.expressNo" placeholder="如 SF1234567890" maxlength="64" />
         </el-form-item>
       </el-form>

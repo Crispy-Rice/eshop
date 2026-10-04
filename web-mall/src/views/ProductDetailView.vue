@@ -101,6 +101,23 @@ function pickValue(groupId: string, valueId: string): void {
   }
 }
 
+/**
+ * 进页面时默认选中一组规格。
+ *
+ * 逐组挑"当前还可选"的第一个值，**每选一个就重算后面几组的可选性** ——
+ * 之所以不能简单取各组第一个，是因为那可能落到"原色钛 + 512G"这种根本没生产的
+ * 组合上，页面一进来就是"该组合不可选"，比不预选还糟。
+ *
+ * 这样贪心选出来的组合必定对应一个真实 SKU：每一步的候选值都被某个同时含
+ * 之前所有已选值的 SKU 见证，归纳下去最后一组也有同一个 SKU 兜住。
+ */
+function selectFirstAvailable(): void {
+  for (const group of spu.value?.specGroups ?? []) {
+    const first = group.values.find((v) => isValueAvailable(group.id, v.id))
+    if (first) selected.value[group.id] = first.id
+  }
+}
+
 const displayPrice = computed(() => {
   if (currentSku.value) return `¥${formatYuan(currentSku.value.price)}`
   if (!spu.value) return ''
@@ -174,6 +191,8 @@ async function load(): Promise<void> {
   quantity.value = 1
   try {
     spu.value = await fetchSpu(spuId.value)
+    selectFirstAvailable()
+    // 上面已经选满一组；这里兜住"某个组一个可选值都没有"的畸形 SKU 矩阵
     autoSelectSingleOptions()
     await loadReviews(true)
   } catch (e) {
