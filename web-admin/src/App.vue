@@ -20,6 +20,16 @@ const isAdmin = computed(() => auth.user?.role === 'admin' || auth.user?.role ==
  */
 const isPlatformAdmin = computed(() => auth.user?.role === 'admin')
 
+/**
+ * 有没有店铺 —— 商家菜单的判据用**这个**，不用 role。
+ *
+ * ★ 后端 `/api/merchant/*` 一律按**店铺归属**判权（CurrentShopIdDep 查库），
+ *   前端用同一个信号，才不会出现"菜单看得见、点进去弹『请先开通店铺』"。
+ *   平台运营账号没有店铺，于是自然看不到那一批商家菜单 —— 那正是对的：
+ *   运营维护的是平台数据（类目、营销），不该假装能管某个店的库存和运费。
+ */
+const hasShop = computed(() => Boolean(auth.user?.shopId))
+
 setUnauthorizedHandler(() => {
   auth.clearLocal()
   ElMessage.warning('登录已过期，请重新登录')
@@ -45,15 +55,18 @@ async function onLogout(): Promise<void> {
         </RouterLink>
 
         <nav v-if="auth.isLoggedIn" class="nav">
-          <RouterLink to="/" class="nav-link">我的商品</RouterLink>
-          <RouterLink to="/products/new" class="nav-link">发布商品</RouterLink>
-          <RouterLink to="/orders" class="nav-link">订单</RouterLink>
-          <RouterLink to="/aftersales" class="nav-link">售后</RouterLink>
-          <RouterLink to="/reviews" class="nav-link">评价</RouterLink>
+          <!-- 商家菜单：判据是"有没有店铺"，和后端 /api/merchant/* 的判权方式一致。
+               平台运营点进去只会弹「请先开通店铺」，索性不给看。 -->
+          <RouterLink v-if="hasShop" to="/" class="nav-link">我的商品</RouterLink>
+          <RouterLink v-if="hasShop" to="/products/new" class="nav-link">发布商品</RouterLink>
+          <RouterLink v-if="hasShop" to="/orders" class="nav-link">订单</RouterLink>
+          <RouterLink v-if="hasShop" to="/aftersales" class="nav-link">售后</RouterLink>
+          <!-- 评价两边都能看：商家看本店、运营看审核队列，页面内部自己分会话 -->
+          <RouterLink v-if="hasShop || isAdmin" to="/reviews" class="nav-link">评价</RouterLink>
           <RouterLink v-if="isPlatformAdmin" to="/categories" class="nav-link">类目</RouterLink>
           <RouterLink v-if="isAdmin" to="/promotions" class="nav-link">营销</RouterLink>
-          <RouterLink to="/inventory" class="nav-link">库存</RouterLink>
-          <RouterLink to="/freight" class="nav-link">运费</RouterLink>
+          <RouterLink v-if="hasShop" to="/inventory" class="nav-link">库存</RouterLink>
+          <RouterLink v-if="hasShop" to="/freight" class="nav-link">运费</RouterLink>
         </nav>
 
         <div class="spacer" />
