@@ -397,6 +397,16 @@ async def list_items_of_main(session: AsyncSession, order_main_no: str) -> list[
     )
 
 
+async def spu_has_order_items(session: AsyncSession, spu_id: int) -> bool:
+    """这个商品有没有任何订单项。
+
+    给 product 模块判"规格还能不能改"用：已成交的商品不该再被改规格。
+    走 ``exists`` 而不是 ``count`` —— 只要有一个就够，不必数完。
+    """
+    found = await session.scalar(select(OrderItem.id).where(OrderItem.spu_id == spu_id).limit(1))
+    return found is not None
+
+
 async def list_items_of_mains(
     session: AsyncSession, main_nos: Sequence[str]
 ) -> list[OrderItem]:

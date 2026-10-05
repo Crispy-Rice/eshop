@@ -259,6 +259,19 @@ async def refresh_main_pay_status(session: AsyncSession, order_main_no: str) -> 
 
 
 # ============================================================
+# 给其它模块的只读查询
+# ============================================================
+async def spu_has_order_items(session: AsyncSession, spu_id: int) -> bool:
+    """这个商品有没有任何订单项（不限订单状态）。
+
+    ★ 供 product 判"规格还能不能改"。订单在 trade 域，所以这个查询由 trade 暴露 ——
+      product 自己不能反过来 import trade（``trade`` → ``inventory``/``promotion``
+      → ``product``，反向即环，见 docs/01 §2）。
+    """
+    return await repo.spu_has_order_items(session, spu_id)
+
+
+# ============================================================
 # 下单
 # ============================================================
 async def create_order(

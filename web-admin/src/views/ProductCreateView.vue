@@ -1,15 +1,31 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 
 import { fetchCategoryTree, type Category } from '@/api/category'
 import { isBizError } from '@/api/errors'
-import { createSpu, type SkuIn, type SpuCreateInput } from '@/api/product'
+import {
+  createSpu,
+  fetchMySpu,
+  replaceSpuSpecs,
+  type SkuIn,
+  type SpuCreateInput,
+} from '@/api/product'
 import ImageUploader from '@/components/ImageUploader.vue'
 import { formatYuan, yuanToFen } from '@/utils/money'
 
+const route = useRoute()
 const router = useRouter()
+
+/**
+ * 有 ``spuId`` 路由参数就是**替换规格**模式 —— 这一个组件两种用途。
+ *
+ * ★ 替换模式只换规格与 SKU；标题 / 类目 / 主图拉出来是为了给商家上下文，
+ *   提交时**不发**（那些走编辑页的「保存基本信息」）。
+ */
+const replaceSpuId = computed(() => (route.params.spuId ? String(route.params.spuId) : null))
+const isReplace = computed(() => replaceSpuId.value !== null)
 
 let seq = 0
 const uid = (): string => `k${Date.now().toString(36)}${(seq++).toString(36)}`
@@ -18,6 +34,12 @@ interface ValueRow {
   key: string
   value: string
   image: string
+  /**
+   * 这个规格值在服务端的 id。**只有"替换规格"预填时才有** ——
+   * 用它把已有 SKU 反查回它属于哪个规格组合（前端的 ``key`` 是现场生成的，
+   * 跟服务端 id 没有关系，光看 key 认不出来）。
+   */
+  specValueId?: string
 }
 interface GroupRow {
   key: string
@@ -42,6 +64,7 @@ const MAX_SKUS = 200
 
 const categories = ref<Category[]>([])
 const submitting = ref(false)
+const loading = ref(false)
 const formRef = ref<FormInstance>()
 
 const form = reactive({
@@ -289,13 +312,84 @@ async function onSubmit(): Promise<void> {
 
   submitting.value = true
   try {
-    const created = await createSpu(payload)
-    ElMessage.success('商品已保存为草稿，去列表页提交审核')
-    await router.push({ name: 'product-edit', params: { spuId: created.id } })
+    if (replaceSpuId.value) {
+      // 只发规格那两段 —— 标题 / 类目 / 主图不归这里改
+      await replaceSpuSpecs(replaceSpuId.value, {
+        specGroups: payload.specGroups,
+        skus: payload.skus,
+      })
+      ElMessage.success('规格已替换')
+      await router.push({ name: 'product-edit', params: { spuId: replaceSpuId.value } })
+    } else {
+      const created = await createSpu(payload)
+      ElMessage.success('商品已保存为草稿，去列表页提交审核')
+      await router.push({ name: 'product-edit', params: { spuId: created.id } })
+    }
   } catch (e) {
-    ElMessage.error(isBizError(e) ? e.message : '发布失败')
+    ElMessage.error(isBizError(e) ? e.message : isReplace.value ? '替换失败' : '发布失败')
   } finally {
     submitting.value = false
+  }
+}
+
+/**
+ * 替换模式：把商品现有的标题 / 类目 / 主图、**规格组与取值**、
+ * **以及每个 SKU 的价格 / 重量 / 编码 / 封面**预填进来。
+ *
+ * ★ 每个规格值都要**重新生成前端 key**：``comboKey`` 依赖前端生成的 key，
+ *   而服务端返回的是雪花 id，两者没有关系。为了把已有 SKU 认回它属于哪个组合，
+ *   这里把服务端 id 记在 ``ValueRow.specValueId`` 上再做反查 ——
+ *   **不能靠顺序猜**，服务端返回 id 的次序没有承诺。
+ */
+async function loadForReplace(spuId: string): Promise<void> {
+  loading.value = true
+  try {
+    const spu = await fetchMySpu(spuId)
+    form.categoryId = spu.categoryId
+    form.title = spu.title
+    form.subTitle = spu.subTitle ?? ''
+    form.mainImage = spu.mainImage
+    groups.value = spu.specGroups.map((group) => ({
+      key: uid(),
+      name: group.name,
+      values: group.values.map((value) => ({
+        key: uid(),
+        value: value.value,
+        image: value.image ?? '',
+        specValueId: value.id,
+      })),
+    }))
+
+    // 把 SKU 认回各自的组合：每个规格组里找出"它的 id 在该 SKU 的 specValueIds 里"
+    // 的那个取值。某个规格组找不到就整行丢弃 —— 宁可让商家重填，也不编造一个组合。
+    const seeded: Record<string, SkuRow> = {}
+    for (const sku of spu.skus) {
+      const ids = new Set(sku.specValueIds)
+      const keys = groups.value.map(
+        (group) => group.values.find((v) => v.specValueId !== undefined && ids.has(v.specValueId))?.key,
+      )
+      if (keys.some((k) => k === undefined)) continue
+      const comboKey = (keys as string[]).join('|')
+      seeded[comboKey] = {
+        comboKey,
+        // label 会被下面那个 watch 用新算出来的文案覆盖，这里只是占位
+        label: sku.specText,
+        keys: keys as string[],
+        enabled: true,
+        skuCode: sku.skuCode,
+        price: sku.price / 100, // 分 → 元
+        coverImage: sku.coverImage,
+        weightG: sku.weightG,
+      }
+    }
+    // ★ 顺序：先给 groups、再给 skuRows。上面那个 watch 是异步刷新的，
+    //   等它跑的时候两边都已就位，于是按 comboKey 把预填值保留下来。
+    skuRows.value = seeded
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '加载商品失败')
+    void router.replace({ name: 'products' })
+  } finally {
+    loading.value = false
   }
 }
 
@@ -305,18 +399,28 @@ onMounted(async () => {
   } catch {
     ElMessage.error('加载类目失败，请确认后端已启动且平台已建好类目')
   }
+  if (replaceSpuId.value) await loadForReplace(replaceSpuId.value)
 })
 </script>
 
 <template>
-  <div class="page">
+  <div v-loading="loading" class="page">
     <el-card shadow="never">
       <template #header>
         <div class="card-header">
-          <span>发布商品</span>
+          <span>{{ isReplace ? '修改规格' : '发布商品' }}</span>
           <el-button @click="router.push('/')">返回列表</el-button>
         </div>
       </template>
+
+      <!-- 替换模式：把"会发生什么"说在前面。下面那几项只做上下文展示，不提交 -->
+      <el-alert v-if="isReplace" type="warning" :closable="false" class="mb16">
+        <template #title>
+          保存后会整体替换这个商品的规格与 SKU，原来的规格组合作废；
+          标题、类目、主图不受影响。规格与价格已按现状填好，改完直接保存即可
+          （新加的组合要自己填价格与重量）。
+        </template>
+      </el-alert>
 
       <el-form ref="formRef" :model="form" :rules="rules" label-width="100px">
         <el-form-item label="末级类目" prop="categoryId">
@@ -325,18 +429,19 @@ onMounted(async () => {
             :options="categories"
             :props="cascaderProps"
             placeholder="只能选到末级类目"
+            :disabled="isReplace"
             class="w360"
           />
         </el-form-item>
         <el-form-item label="商品标题" prop="title">
-          <el-input v-model="form.title" maxlength="120" show-word-limit />
+          <el-input v-model="form.title" maxlength="120" show-word-limit :disabled="isReplace" />
         </el-form-item>
         <el-form-item label="副标题">
-          <el-input v-model="form.subTitle" maxlength="255" />
+          <el-input v-model="form.subTitle" maxlength="255" :disabled="isReplace" />
         </el-form-item>
         <el-form-item label="主图" prop="mainImage">
           <div class="image-row">
-            <ImageUploader v-model="form.mainImage" biz="products" />
+            <ImageUploader v-model="form.mainImage" biz="products" :disabled="isReplace" />
             <span class="inline-hint">
               建议正方形。长边超过 1280px 会自动压缩，带 GPS 的元数据会被剔除
             </span>
@@ -410,6 +515,7 @@ onMounted(async () => {
             <el-input
               v-model="row.skuCode"
               size="small"
+              placeholder="选填"
               :disabled="!row.enabled"
               maxlength="64"
               :class="{ 'is-invalid': cellError(row, 'skuCode') }"
@@ -469,7 +575,7 @@ onMounted(async () => {
     <div class="submit-bar">
       <el-button size="large" @click="router.push('/')">取消</el-button>
       <el-button type="primary" size="large" :loading="submitting" @click="onSubmit">
-        保存为草稿
+        {{ isReplace ? '保存规格' : '保存为草稿' }}
       </el-button>
     </div>
   </div>

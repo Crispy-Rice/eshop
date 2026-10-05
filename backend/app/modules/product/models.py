@@ -17,6 +17,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     ForeignKey,
     Index,
@@ -161,7 +162,16 @@ class Sku(Base):
 
     __tablename__ = "sku"
     __table_args__ = (
-        UniqueConstraint("spu_id", "sku_code", name="uk_sku_spu_code"),
+        # 商家编码在同一商品内唯一，但**已软删的 SKU 不占位** —— 换了规格之后想复用
+        # 同一个编码，不该被一条已退役的行挡住。用 partial unique index 表达
+        # （先例：inventory/models.py:76 的 uk_warehouse_default）。
+        Index(
+            "uk_sku_spu_code",
+            "spu_id",
+            "sku_code",
+            unique=True,
+            postgresql_where=text("NOT deleted"),
+        ),
         Index("idx_sku_spu_status", "spu_id", "status"),
         Index("idx_sku_shop", "shop_id"),
         CheckConstraint("price > 0", name="price_positive"),
@@ -186,6 +196,13 @@ class Sku(Base):
     weight_g: Mapped[int] = mapped_column(Integer, nullable=False, comment="物流重量（克），运费计算用")
     status: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, server_default=text("1"), comment="1上架 2下架"
+    )
+    # 软删。规格被整体替换时，旧 SKU 走这里退役 —— 不物理删除，因为
+    # inventory.sku_stock 还在，删了会让那段库存流水从商家列表里消失
+    # （list_flows 用 INNER JOIN sku_stock 取 shop_id）。
+    # ★ 软删必须**同时**置 status=2：购物车与下单是按 status 过滤的，不看这一列。
+    deleted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false"), comment="软删标记"
     )
     created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())

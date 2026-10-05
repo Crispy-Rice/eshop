@@ -22,6 +22,15 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
+    // 替换规格：**复用发布页**那个编辑器（规格组/取值/笛卡尔积那一套），
+    // 同一组件靠 route.params.spuId 有无来区分"新建"与"替换"。
+    // 不复用 /products/new 加 query —— 那会和"创建后跳编辑页"的逻辑打架。
+    path: '/products/:spuId/specs',
+    name: 'product-specs',
+    component: () => import('@/views/ProductCreateView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/inventory',
     name: 'inventory',
     component: () => import('@/views/InventoryView.vue'),

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import Numeric, Select, delete, func, select, tuple_, update
+from sqlalchemy import Numeric, Select, delete, func, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.product.models import Category, Sku, SkuSpec, SpecGroup, SpecValue, Spu
@@ -316,12 +316,21 @@ async def get_sku(session: AsyncSession, sku_id: int) -> Sku | None:
 async def list_skus_by_ids(session: AsyncSession, sku_ids: Sequence[int]) -> list[Sku]:
     if not sku_ids:
         return []
-    result = await session.scalars(select(Sku).where(Sku.id.in_(sku_ids)))
+    # 排除已软删的 SKU —— 购物车/结算走这条路，退役的 SKU 不该还能被买
+    result = await session.scalars(
+        select(Sku).where(Sku.id.in_(sku_ids), Sku.deleted.is_(False))
+    )
     return list(result)
 
 
 async def list_skus_by_spu(session: AsyncSession, spu_id: int) -> list[Sku]:
-    result = await session.scalars(select(Sku).where(Sku.spu_id == spu_id).order_by(Sku.price, Sku.id))
+    # ★ 商品详情走这里。必须排掉已软删的 SKU，否则"替换规格"之后
+    #   旧 SKU 还会挂在详情页上（写侧把它们退役了，读侧要认账）。
+    result = await session.scalars(
+        select(Sku)
+        .where(Sku.spu_id == spu_id, Sku.deleted.is_(False))
+        .order_by(Sku.price, Sku.id)
+    )
     return list(result)
 
 
@@ -329,13 +338,15 @@ async def list_skus_by_spus(session: AsyncSession, spu_ids: Sequence[int]) -> li
     if not spu_ids:
         return []
     result = await session.scalars(
-        select(Sku).where(Sku.spu_id.in_(spu_ids)).order_by(Sku.spu_id, Sku.price, Sku.id)
+        select(Sku)
+        .where(Sku.spu_id.in_(spu_ids), Sku.deleted.is_(False))
+        .order_by(Sku.spu_id, Sku.price, Sku.id)
     )
     return list(result)
 
 
 async def list_skus_by_shop(session: AsyncSession, shop_id: int, *, limit: int = 500) -> list[Sku]:
-    """按店铺列 SKU —— **不含已软删商品**的 SKU。
+    """按店铺列 SKU —— **不含已软删商品、也不含已软删 SKU**。
 
     给 inventory 用：商家发布商品后要在库存页看到它，而库存页是按 SKU 驱动的，
     所以需要"这个店铺有哪些 SKU"这个查询。加上限避免店铺很大时一次拉爆。
@@ -350,7 +361,7 @@ async def list_skus_by_shop(session: AsyncSession, shop_id: int, *, limit: int =
     result = await session.scalars(
         select(Sku)
         .join(Spu, Spu.id == Sku.spu_id)
-        .where(Sku.shop_id == shop_id, Spu.deleted.is_(False))
+        .where(Sku.shop_id == shop_id, Spu.deleted.is_(False), Sku.deleted.is_(False))
         .order_by(Sku.id)
         .limit(limit)
     )
@@ -358,11 +369,14 @@ async def list_skus_by_shop(session: AsyncSession, shop_id: int, *, limit: int =
 
 
 async def list_deleted_sku_ids(session: AsyncSession, shop_id: int) -> list[int]:
-    """**已软删商品**下面的 SKU id。
+    """**已成废的** SKU id —— 两种来源：商品被软删，或 SKU 自己被软删。
 
     给别的模块的读侧做过滤用：软删不动别的 schema，所以 ``inventory.sku_stock``、
     ``freight.sku_freight_bind`` 里可能还留着这些 SKU 的行。行不能删（见
     ``soft_delete_spu``），但也不该再出现在商家的操作界面上。
+
+    ★ 第二个来源（``Sku.deleted``）是"替换规格"引入的：旧 SKU 退役后库存行仍在
+      （删了会让库存流水从列表里消失），所以同样靠这里把它们从商家的界面上排掉。
 
     走 id 列表而不是让调用方自己 join ``product`` 的表 —— 别的模块不许碰 product
     schema（docs/01 §2），这里是那扇门。
@@ -370,7 +384,26 @@ async def list_deleted_sku_ids(session: AsyncSession, shop_id: int) -> list[int]
     result = await session.scalars(
         select(Sku.id)
         .join(Spu, Spu.id == Sku.spu_id)
-        .where(Sku.shop_id == shop_id, Spu.deleted.is_(True))
+        .where(Sku.shop_id == shop_id, or_(Spu.deleted.is_(True), Sku.deleted.is_(True)))
+    )
+    return list(result)
+
+
+async def soft_delete_skus_of_spu(session: AsyncSession, spu_id: int) -> list[int]:
+    """把某 SPU 下还没退役的 SKU 全部软删，返回它们的 id。
+
+    ★ **同时置 ``status = 2``（下架）**，这是必须的：购物车与下单路径按 ``status``
+      过滤、不看 ``deleted``。只置 ``deleted`` 的话，这些 SKU 仍然能被加购、
+      仍然能下单 —— 换了规格等于没换。
+
+    物理删除是另一条路，但会连带删掉 ``inventory.sku_stock``，而那会让
+    ``list_flows`` 的 INNER JOIN 落空、库存流水从商家列表里消失。
+    """
+    result = await session.scalars(
+        update(Sku)
+        .where(Sku.spu_id == spu_id, Sku.deleted.is_(False))
+        .values(deleted=True, status=2)
+        .returning(Sku.id)
     )
     return list(result)
 

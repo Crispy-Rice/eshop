@@ -54,6 +54,13 @@ export interface SpuDetail {
   auditRemark: string | null
   specGroups: SpecGroup[]
   skus: SkuDetail[]
+  /**
+   * 能不能整体替换规格与 SKU。
+   *
+   * 只有**商家详情**接口会算它（要看该商品有没有订单），且要求状态不是
+   * 在售 / 待审核。买家与平台视角恒为 false。
+   */
+  specEditable: boolean
 }
 
 export interface SpuList {
@@ -153,6 +160,18 @@ export const updateSpu = (
   spuId: string,
   body: { title?: string; subTitle?: string | null; mainImage?: string; sortWeight?: number },
 ) => put<SpuDetail>(`/merchant/spus/${spuId}`, body)
+
+/** 替换规格的请求体：就是新建那两段，标题 / 类目 / 主图不在这里改 */
+export type SpuSpecsReplaceInput = Pick<SpuCreateInput, 'specGroups' | 'skus'>
+
+/**
+ * 整体替换规格与 SKU。
+ *
+ * **只允许没有订单的商品**（后端会查 trade 的订单项），否则 400。
+ * `spu_id` 不变 —— 购物车行和外部链接都不受影响。
+ */
+export const replaceSpuSpecs = (spuId: string, body: SpuSpecsReplaceInput) =>
+  put<SpuDetail>(`/merchant/spus/${spuId}/specs`, body)
 
 export const auditSpu = (spuId: string, approved: boolean, remark?: string) =>
   post<null>(`/admin/spus/${spuId}/audit`, { approved, remark: remark ?? null })

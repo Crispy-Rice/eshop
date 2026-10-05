@@ -134,18 +134,18 @@ class SkuIn(CamelModel):
         return value.strip() or None
 
 
-class SpuCreateRequest(CamelModel):
-    category_id: SnowflakeId
-    title: str = Field(min_length=1, max_length=120)
-    sub_title: str | None = Field(default=None, max_length=255)
-    # 可空：允许"先发布、后补图"。空值由展示层兜底成占位图，
-    # 但不能反过来把占位图当真实图片存进来（那会一路传染到购物车和订单快照）
-    main_image: str = Field(default="", max_length=255)
+class SpuSpecsPayload(CamelModel):
+    """规格组 + SKU 集合 —— 新建与"替换规格"共用的那一段。
+
+    ★ 对应关系的校验只写在这里。``SpuCreateRequest`` 与 ``SpuSpecsReplaceRequest``
+      都继承它，就不可能出现"新建校验得严、替换校验得松"这种两边慢慢漂移的情况。
+    """
+
     spec_groups: list[SpecGroupIn] = Field(min_length=1, max_length=MAX_SPEC_GROUPS)
     skus: list[SkuIn] = Field(min_length=1, max_length=MAX_SKUS)
 
     @model_validator(mode="after")
-    def _validate_skus(self) -> SpuCreateRequest:
+    def _validate_skus(self) -> SpuSpecsPayload:
         """校验 SKU 与规格的对应关系。
 
         允许"无效组合"不存在 —— 比如颜色 {黑,白} × 容量 {256G,512G} 只有
@@ -192,6 +192,23 @@ class SpuCreateRequest(CamelModel):
                 codes.add(sku.sku_code)
 
         return self
+
+
+class SpuCreateRequest(SpuSpecsPayload):
+    category_id: SnowflakeId
+    title: str = Field(min_length=1, max_length=120)
+    sub_title: str | None = Field(default=None, max_length=255)
+    # 可空：允许"先发布、后补图"。空值由展示层兜底成占位图，
+    # 但不能反过来把占位图当真实图片存进来（那会一路传染到购物车和订单快照）
+    main_image: str = Field(default="", max_length=255)
+
+
+class SpuSpecsReplaceRequest(SpuSpecsPayload):
+    """整体替换规格与 SKU。
+
+    标题 / 副标题 / 主图 / 类目**不在这里改** —— 那些走 ``SpuUpdateRequest``。
+    这里只处理"规格错了要重做"这一件事。
+    """
 
 
 class SpuUpdateRequest(CamelModel):
@@ -266,6 +283,9 @@ class SpuDetailOut(CamelModel):
     audit_remark: str | None = None
     spec_groups: list[SpecGroupOut]
     skus: list[SkuDetailOut]
+    # 能不能整体替换规格与 SKU。product service 判断不了（要看 trade 的订单），
+    # 由商家详情路由填（见 product/router.py），其余视角恒为 False。
+    spec_editable: bool = False
 
 
 class SpuCardOut(CamelModel):

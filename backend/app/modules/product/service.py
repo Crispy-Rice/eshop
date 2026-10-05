@@ -48,6 +48,8 @@ from app.modules.product.schemas import (
     SpuCreateRequest,
     SpuDetailOut,
     SpuListOut,
+    SpuSpecsPayload,
+    SpuSpecsReplaceRequest,
     SpuUpdateRequest,
 )
 
@@ -346,12 +348,16 @@ async def _build_search_text(
 # ============================================================
 # 商家：发布商品
 # ============================================================
-async def create_spu(session: AsyncSession, shop_id: int, req: SpuCreateRequest) -> SpuDetailOut:
-    category = await _resolve_category(session, req.category_id)
+def _build_spec_rows(
+    req: SpuSpecsPayload, spu_id: int, shop_id: int
+) -> tuple[list[SpecGroup], list[SpecValue], list[Sku], list[SkuSpec], list[str]]:
+    """把请求里的规格组 / 取值 / SKU 展开成待落库的行。
 
-    spu_id = next_id()
+    **纯计算，不碰数据库** —— ``create_spu``（新建）与 ``replace_specs``（替换规格）
+    共用这一段，免得两处各写一遍、慢慢漂移。
 
-    # ---------- 规格组与规格值 ----------
+    最后一项 ``spec_texts`` 是给调用方重算 ``search_text`` 的（见 ``_build_search_text``）。
+    """
     # 先把 key → 生成好的 ID 映射建起来，SKU 用它引用规格值
     key_to_value_id: dict[str, int] = {}
     key_to_group_id: dict[str, int] = {}
@@ -377,7 +383,6 @@ async def create_spu(session: AsyncSession, shop_id: int, req: SpuCreateRequest)
                 )
             )
 
-    # ---------- SKU ----------
     sku_rows: list[Sku] = []
     sku_spec_rows: list[SkuSpec] = []
     spec_texts: list[str] = []
@@ -405,10 +410,25 @@ async def create_spu(session: AsyncSession, shop_id: int, req: SpuCreateRequest)
         )
         for key in ordered_keys:
             sku_spec_rows.append(
-                SkuSpec(sku_id=sku_id, spec_group_id=key_to_group_id[key], spec_value_id=key_to_value_id[key])
+                SkuSpec(
+                    sku_id=sku_id,
+                    spec_group_id=key_to_group_id[key],
+                    spec_value_id=key_to_value_id[key],
+                )
             )
         spec_texts.extend(value_text_by_key[k] for k in ordered_keys)
 
+    return group_rows, value_rows, sku_rows, sku_spec_rows, spec_texts
+
+
+async def create_spu(session: AsyncSession, shop_id: int, req: SpuCreateRequest) -> SpuDetailOut:
+    category = await _resolve_category(session, req.category_id)
+
+    spu_id = next_id()
+
+    group_rows, value_rows, sku_rows, sku_spec_rows, spec_texts = _build_spec_rows(
+        req, spu_id, shop_id
+    )
     prices = [s.price for s in sku_rows]
 
     # ---------- SPU ----------
@@ -436,6 +456,74 @@ async def create_spu(session: AsyncSession, shop_id: int, req: SpuCreateRequest)
     await repo.insert_sku_specs(session, sku_spec_rows)
 
     logger.info("商品创建成功", extra={"spuId": spu_id, "shopId": shop_id, "skuCount": len(sku_rows)})
+    return await get_spu_detail(session, spu_id, owner_shop_id=shop_id)
+
+
+async def replace_specs(
+    session: AsyncSession, shop_id: int, spu_id: int, req: SpuSpecsReplaceRequest
+) -> SpuDetailOut:
+    """整体替换规格组与 SKU 集合。spu_id 不变（购物车与链接都不受影响）。
+
+    ★ **只允许没有订单的商品**。这个判据由调用方（路由层）先查 ——
+      product 不能 import trade（``trade/service.py`` → ``inventory/service.py`` →
+      ``product/service.py``，反向即环，见 docs/01 §2）。
+
+      真正怕的不是"订单显示不出来"（``order_item`` 自带 title/spec/price 快照），
+      而是**售后补库存**：退货质检通过时会往 SKU 的库存行里回补，那个 SKU 要是
+      已经退役，库存就补进了一条没人看得见的行。
+
+    ★ 旧 SKU **软删**（``deleted=True`` 且 ``status=2``）而不是物理删除：
+      ``inventory.sku_stock`` 的行还挂着它们，删了会让 ``list_flows`` 的
+      INNER JOIN 落空、那段库存流水从商家列表里消失。软删还有个副作用是好的 ——
+      商家编码可以复用（唯一索引带 ``WHERE NOT deleted``）。
+    """
+    spu = await _get_owned_spu(session, shop_id, spu_id)
+    # 在售的可能正被人下单，审核中的运营正在看 —— 都先别动，与 delete_spu 同口径
+    if spu.status == SPU_ON_SHELF:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "商品在售，请先下架再改规格")
+    if spu.status == SPU_PENDING_AUDIT:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "商品审核中，请等审核结果出来再改规格")
+
+    category = await _resolve_category(session, spu.category_id)
+
+    # 旧的一套整体退役：SKU 软删；规格组 / 值 / sku_spec 硬删
+    # （它们只被 sku_spec 引用，而 sku_spec 已随行一起删掉）
+    retired_sku_ids = await repo.soft_delete_skus_of_spu(session, spu_id)
+    await repo.delete_specs_of_spu(session, spu_id)
+
+    group_rows, value_rows, sku_rows, sku_spec_rows, spec_texts = _build_spec_rows(
+        req, spu_id, shop_id
+    )
+    await repo.insert_spec_groups(session, group_rows)
+    await repo.insert_spec_values(session, value_rows)
+    await repo.insert_skus(session, sku_rows)
+    await repo.insert_sku_specs(session, sku_spec_rows)
+
+    # 价格区间与 search_text 都要重算 —— search_text 里拼了 spec_texts，
+    # 只改价格会让搜索命中旧规格的词
+    prices = [s.price for s in sku_rows]
+    search_text = await _build_search_text(
+        session,
+        title=spu.title,
+        sub_title=spu.sub_title,
+        category=category,
+        spec_texts=spec_texts,
+    )
+    await repo.update_spu_fields(
+        session,
+        spu_id,
+        {"price_min": min(prices), "price_max": max(prices), "search_text": search_text},
+    )
+
+    logger.info(
+        "商品规格已替换",
+        extra={
+            "spuId": spu_id,
+            "shopId": shop_id,
+            "retired": len(retired_sku_ids),
+            "skuCount": len(sku_rows),
+        },
+    )
     return await get_spu_detail(session, spu_id, owner_shop_id=shop_id)
 
 

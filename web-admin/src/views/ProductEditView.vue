@@ -38,6 +38,23 @@ const saving = ref(false)
  */
 const rejected = computed(() => spu.value?.status === 6)
 
+/**
+ * 规格为什么不能改 —— 按状态把原因说具体。
+ *
+ * ★ 后端只回一个布尔 ``specEditable``（算它要看订单，而 product service 不感知
+ *   trade，所以只能由路由层给）。这里用前端已有的 status 补齐那句"为什么"——
+ *   只说"不能改"，商家不知道下一步该干什么。
+ */
+const specLockReason = computed(() => {
+  if (!spu.value) return ''
+  if (spu.value.status === 2) return '商品在售，先下架才能改规格。'
+  if (spu.value.status === 5) return '商品审核中，等审核结果出来再改规格。'
+  return (
+    '这个商品已经有订单，规格不能再改 —— 订单里存的是 SKU 快照，' +
+    '改了会让历史订单指向不存在的商品。需要不同规格请新建一个商品。'
+  )
+})
+
 const form = reactive({ title: '', subTitle: '', mainImage: '' })
 /** skuId → 正在编辑的价格/重量（元 / 克） */
 const skuDraft = reactive<Record<string, { price: number | undefined; weightG: number | undefined; coverImage: string }>>({})
@@ -208,11 +225,24 @@ onMounted(load)
         </template>
       </el-alert>
 
-      <el-alert type="warning" :closable="false" class="mb16">
+      <!-- 能不能改规格由后端算（要同时看订单与状态），前端只负责把它说清楚。
+           说清"为什么不能改"很重要 —— 否则商家只会看到一句"不能改"，不知道该干什么。 -->
+      <el-alert v-if="spu.specEditable" type="info" :closable="false" class="mb16">
         <template #title>
-          规格组合与 SKU 集合创建后不可修改 —— 订单里存的是 SKU 快照，
-          增减 SKU 会让历史订单指向不存在的商品。需要不同规格请新建商品。
+          <div class="spec-action">
+            <span>这个商品还没有订单，规格可以整体替换。</span>
+            <el-button
+              type="primary"
+              size="small"
+              @click="router.push({ name: 'product-specs', params: { spuId } })"
+            >
+              修改规格
+            </el-button>
+          </div>
         </template>
+      </el-alert>
+      <el-alert v-else type="warning" :closable="false" class="mb16">
+        <template #title>{{ specLockReason }}</template>
       </el-alert>
 
       <el-form :model="form" label-width="100px">
@@ -257,7 +287,13 @@ onMounted(load)
           </template>
         </el-table-column>
         <el-table-column prop="specText" label="规格" min-width="150" />
-        <el-table-column prop="skuCode" label="商家编码" width="170" />
+        <el-table-column label="商家编码" width="170">
+          <template #default="{ row }">
+            <!-- 编码是选填的，空着是常态，用破折号而不是留白（留白看着像加载失败） -->
+            <span v-if="row.skuCode">{{ row.skuCode }}</span>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="原价" width="110">
           <template #default="{ row }">¥{{ formatYuan(row.price) }}</template>
         </el-table-column>
@@ -366,6 +402,15 @@ onMounted(load)
   font-size: var(--text-sm);
   line-height: 1.6;
   color: var(--color-text-secondary);
+}
+
+/* 规格可改时那条提示：一句话 + 一个按钮，横排 */
+.spec-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
 }
 
 .mr8 {

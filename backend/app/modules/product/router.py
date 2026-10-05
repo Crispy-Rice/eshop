@@ -11,10 +11,11 @@ from fastapi import APIRouter, Depends, Query
 
 from app.core.context import CurrentUser
 from app.core.deps import DbSession, require_role
+from app.core.errors import BizError, ErrorCode
 from app.core.response import ApiResponse
 from app.modules.account.deps import CurrentShopIdDep
 from app.modules.product import service
-from app.modules.product.models import SPU_REJECTED
+from app.modules.product.models import SPU_ON_SHELF, SPU_PENDING_AUDIT, SPU_REJECTED
 from app.modules.product.schemas import (
     AdminCategoryTreeOut,
     CategoryCreateRequest,
@@ -29,8 +30,10 @@ from app.modules.product.schemas import (
     SpuCreateRequest,
     SpuDetailOut,
     SpuListOut,
+    SpuSpecsReplaceRequest,
     SpuUpdateRequest,
 )
+from app.modules.trade import service as trade_service
 
 router = APIRouter()
 
@@ -123,7 +126,33 @@ async def list_my_spus(
     "/api/merchant/spus/{spu_id}", response_model=ApiResponse[SpuDetailOut], summary="商品详情（商家）"
 )
 async def get_my_spu(spu_id: int, shop_id: CurrentShopIdDep, session: DbSession) -> ApiResponse[SpuDetailOut]:
-    return ApiResponse.ok(await service.get_spu_detail(session, spu_id, owner_shop_id=shop_id))
+    detail = await service.get_spu_detail(session, spu_id, owner_shop_id=shop_id)
+    # 「能不能改规格」只有这一层算得出来：它同时看得见 product 与 trade，
+    # 而 product 不能反过来 import trade（会成环，见 docs/01 §2）。
+    detail.spec_editable = detail.status not in (
+        SPU_ON_SHELF,
+        SPU_PENDING_AUDIT,
+    ) and not await trade_service.spu_has_order_items(session, spu_id)
+    return ApiResponse.ok(detail)
+
+
+@router.put(
+    "/api/merchant/spus/{spu_id}/specs",
+    response_model=ApiResponse[SpuDetailOut],
+    summary="替换规格与 SKU",
+)
+async def replace_spu_specs(
+    spu_id: int, body: SpuSpecsReplaceRequest, shop_id: CurrentShopIdDep, session: DbSession
+) -> ApiResponse[SpuDetailOut]:
+    """整体替换规格组与 SKU 集合（``spu_id`` 不变，购物车与链接都不受影响）。
+
+    ★ **只允许没有订单的商品**。判据在 trade 域，所以在这里先查再交给 product ——
+      这是本文件唯一一处跨模块调用（product 不能反向 import trade）。
+      在售 / 审核中的商品由 service 再挡一道（与 ``delete_spu`` 同口径）。
+    """
+    if await trade_service.spu_has_order_items(session, spu_id):
+        raise BizError(ErrorCode.VALIDATION_ERROR, "该商品已有订单，规格不能再改")
+    return ApiResponse.ok(await service.replace_specs(session, shop_id, spu_id, body))
 
 
 @router.put("/api/merchant/spus/{spu_id}", response_model=ApiResponse[SpuDetailOut], summary="编辑商品")
@@ -132,8 +161,8 @@ async def update_spu(
 ) -> ApiResponse[SpuDetailOut]:
     """只能改标题、副标题、主图、类目、排序权重。
 
-    规格组合与 SKU 集合创建后不可变 —— 订单里存的是 SKU 快照，
-    增减 SKU 会让历史订单指向不存在的商品。
+    规格与 SKU 不在这里改 —— 它们走 ``PUT /merchant/spus/{id}/specs`` 整体替换，
+    且只在该商品**没有订单**时允许（见 ``replace_spu_specs``）。
     """
     return ApiResponse.ok(await service.update_spu(session, shop_id, spu_id, body))
 

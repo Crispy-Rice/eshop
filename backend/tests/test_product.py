@@ -1516,3 +1516,176 @@ async def test_create_product_without_images(client: AsyncClient, session) -> No
         await session.scalar(text("SELECT count(*) FROM product.sku WHERE cover_image LIKE 'data:%'"))
         == 0
     )
+
+
+# ============================================================
+# 替换规格（只在商品没有订单时允许）
+# ============================================================
+
+
+async def _make_draft_spu(
+    client: AsyncClient, session, phone: str = "13800138022"
+) -> dict:
+    """造一个草稿商品，返回 {headers, spuId, oldSkuIds, shopId, adminToken}。"""
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "手机")
+    merchant = await register(client, phone=phone)
+    await open_shop(client, merchant["accessToken"])
+    headers = auth_header(merchant["accessToken"])
+
+    spu_id = await _create_spu(client, headers, category)
+    detail = (await client.get(f"/api/merchant/spus/{spu_id}", headers=headers)).json()["data"]
+    return {
+        "headers": headers,
+        "spuId": spu_id,
+        "oldSkuIds": [s["id"] for s in detail["skus"]],
+        "shopId": detail["shopId"],
+        "adminToken": admin["accessToken"],
+    }
+
+
+async def _insert_order_item(session, *, spu_id: str, sku_id: str, shop_id: str) -> None:
+    """直接塞一条订单项，制造"这个商品有订单"。
+
+    ★ 走 SQL 而不是完整下单链路：那条链路要备货、绑运费、建地址、算价，而
+      "能不能改规格"的判据只是一个 exists 查询 —— 不值得为它搭一整套。
+      ``trade.order_item`` 没有外键（跨模块只存裸 id），塞进来就能被查到。
+    """
+    key = int(sku_id)
+    await session.execute(
+        text(
+            "INSERT INTO trade.order_item ("
+            "  id, order_main_no, order_sub_no, shop_id, spu_id, sku_id,"
+            "  spu_title_snap, sku_spec_snap, cover_image_snap, unit_price_snap, weight_g_snap,"
+            "  num, item_amount, payable_amount"
+            ") VALUES ("
+            "  :id, :no, :no, :shop, :spu, :sku, '标题快照', '规格快照', '', 100, 100, 1, 100, 100"
+            ")"
+        ),
+        {
+            "id": key + 1,
+            "no": f"TEST{key}",
+            "shop": int(shop_id),
+            "spu": int(spu_id),
+            "sku": key,
+        },
+    )
+    # ★ 必须 commit：``session`` fixture 是独立连接，不提交的话
+    #   接口那次请求（自己的事务）根本看不到这一行，守卫就不会触发
+    await session.commit()
+
+
+def _replace_payload() -> dict:
+    """把「颜色 × 容量（3 个 SKU）」换成「版本（2 个 SKU）」。"""
+    return {
+        "specGroups": [
+            {
+                "name": "版本",
+                "values": [{"key": "v1", "value": "标准版"}, {"key": "v2", "value": "尊享版"}],
+            }
+        ],
+        "skus": [
+            # ★ 故意复用旧编码 IP16-B-256：唯一索引带 WHERE NOT deleted，软删后该放行
+            {
+                "skuCode": "IP16-B-256",
+                "specValueKeys": ["v1"],
+                "price": 100000,
+                "coverImage": "",
+                "weightG": 100,
+            },
+            {
+                "skuCode": "NEW-2",
+                "specValueKeys": ["v2"],
+                "price": 200000,
+                "coverImage": "",
+                "weightG": 100,
+            },
+        ],
+    }
+
+
+async def test_replace_specs_when_no_orders(client: AsyncClient, session) -> None:
+    """★ 没有订单的商品，规格可以整体替换，且 spu_id 不变。"""
+    ctx = await _make_draft_spu(client, session)
+    spu_id, headers = ctx["spuId"], ctx["headers"]
+    assert len(ctx["oldSkuIds"]) == 3
+
+    resp = await client.put(
+        f"/api/merchant/spus/{spu_id}/specs", json=_replace_payload(), headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    detail = resp.json()["data"]
+
+    assert detail["id"] == spu_id  # spu_id 不变 —— 购物车与链接都不受影响
+    assert len(detail["skus"]) == 2
+    assert {s["skuCode"] for s in detail["skus"]} == {"IP16-B-256", "NEW-2"}
+    assert [g["name"] for g in detail["specGroups"]] == ["版本"]
+    assert (detail["priceMin"], detail["priceMax"]) == (100000, 200000)
+    assert detail["status"] == 1  # 状态不变，商家自己再点提交审核
+
+    # 旧 SKU：软删 **且** 下架。下架那一半挡住购物车/下单（它们按 status 过滤），
+    # 软删那一半挡住库存页/运费页（它们按 list_deleted_sku_ids 过滤）
+    rows = await session.execute(
+        text("SELECT deleted, status FROM product.sku WHERE id = ANY(:ids)"),
+        {"ids": [int(s) for s in ctx["oldSkuIds"]]},
+    )
+    assert [(bool(d), st) for d, st in rows] == [(True, 2)] * 3
+
+    # 购物车/结算走的那条批量取 SKU，已经取不到它们
+    briefs = (
+        await client.post("/api/skus/batch", json={"skuIds": ctx["oldSkuIds"]})
+    ).json()["data"]
+    assert briefs == []
+
+    # search_text 要重算 —— 里面拼了规格词，只改价格会让搜索命中旧规格
+    search_text = await session.scalar(
+        text("SELECT search_text FROM product.spu WHERE id = :id"), {"id": int(spu_id)}
+    )
+    assert "256G" not in search_text
+    assert "标准版" in search_text
+
+
+async def test_replace_specs_blocked_when_has_orders(client: AsyncClient, session) -> None:
+    """有订单的商品不能再改规格。"""
+    ctx = await _make_draft_spu(client, session, phone="13800138023")
+    await _insert_order_item(
+        session, spu_id=ctx["spuId"], sku_id=ctx["oldSkuIds"][0], shop_id=ctx["shopId"]
+    )
+
+    resp = await client.put(
+        f"/api/merchant/spus/{ctx['spuId']}/specs", json=_replace_payload(), headers=ctx["headers"]
+    )
+    assert resp.status_code == 400
+    assert "订单" in resp.json()["message"]
+
+    # 详情里也要明确说"不能改"，否则前端会摆一个点了就报错的按钮
+    detail = (
+        await client.get(f"/api/merchant/spus/{ctx['spuId']}", headers=ctx["headers"])
+    ).json()["data"]
+    assert detail["specEditable"] is False
+
+
+async def test_replace_specs_blocked_when_on_shelf_or_pending(client: AsyncClient, session) -> None:
+    """在售 / 审核中的商品不能改规格 —— 与删除商品同口径。"""
+    ctx = await _make_draft_spu(client, session, phone="13800138024")
+    spu_id, headers = ctx["spuId"], ctx["headers"]
+
+    # 提交 → 待审核
+    assert (await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=headers)).status_code == 200
+    pending = await client.put(
+        f"/api/merchant/spus/{spu_id}/specs", json=_replace_payload(), headers=headers
+    )
+    assert pending.status_code == 400
+    assert "审核中" in pending.json()["message"]
+
+    # 审核通过 → 在售
+    await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": True},
+        headers=auth_header(ctx["adminToken"]),
+    )
+    on_shelf = await client.put(
+        f"/api/merchant/spus/{spu_id}/specs", json=_replace_payload(), headers=headers
+    )
+    assert on_shelf.status_code == 400
+    assert "先下架" in on_shelf.json()["message"]
