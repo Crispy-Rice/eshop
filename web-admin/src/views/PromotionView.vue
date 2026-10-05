@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 
 import { fetchCategoryTree, type Category } from '@/api/category'
@@ -34,8 +34,10 @@ import {
   issueCoupon,
   listCouponTemplates,
   listPromoActivities,
+  lookupUserByPhone,
   type AdminCouponTemplate,
   type AdminPromoActivity,
+  type UserLookup,
 } from '@/api/promotion'
 import { useAuthStore } from '@/stores/auth'
 import { formatDateTime, formatYuan, yuanToFen } from '@/utils/money'
@@ -271,29 +273,63 @@ async function submitActivity(): Promise<void> {
 
 // ============================================================
 // 定向发券
+//
+// ★ 入口是**手机号**，不是 userId。运营拿不到用户的雪花 ID ——
+//   原来那个"填 18 位数字"的输入框，实际没人填得出来。用户报手机号才是
+//   真实场景，所以流程改成：先按手机号查人 → 确认没找错 → 再发券。
+//   发券是**给钱**的动作，多这一步值得。
 // ============================================================
 const issueVisible = ref(false)
 const issueTarget = ref<AdminCouponTemplate | null>(null)
-const issueForm = reactive({ userId: '', count: 1 })
+const issueForm = reactive({ phone: '', count: 1 })
+/** 手机号查到的收件人。为空就发不出去 */
+const issueUser = ref<UserLookup | null>(null)
+const looking = ref(false)
 
 function openIssue(row: AdminCouponTemplate): void {
   issueTarget.value = row
-  issueForm.userId = ''
+  issueForm.phone = ''
   issueForm.count = 1
+  issueUser.value = null
   issueVisible.value = true
+}
+
+// 手机号一改，之前查到的那个人就作废 —— 否则可能把券发给上一个查到的人
+watch(
+  () => issueForm.phone,
+  () => {
+    issueUser.value = null
+  },
+)
+
+async function lookupIssueUser(): Promise<void> {
+  const phone = issueForm.phone.trim()
+  if (!/^1\d{10}$/.test(phone)) {
+    ElMessage.warning('请填 11 位手机号')
+    return
+  }
+  looking.value = true
+  try {
+    issueUser.value = await lookupUserByPhone(phone)
+  } catch (e) {
+    issueUser.value = null
+    ElMessage.error(isBizError(e) ? e.message : '没查到这个手机号')
+  } finally {
+    looking.value = false
+  }
 }
 
 async function submitIssue(): Promise<void> {
   if (!issueTarget.value) return
-  if (!issueForm.userId.trim()) {
-    ElMessage.warning('要填用户 ID')
+  if (!issueUser.value) {
+    ElMessage.warning('请先点「查询」确认发给谁')
     return
   }
   acting.value = true
   try {
     const codes = await issueCoupon({
       templateId: issueTarget.value.id,
-      userId: issueForm.userId.trim(),
+      userId: issueUser.value.userId,
       count: issueForm.count,
     })
     ElMessage.success(`已发 ${codes.length} 张`)
@@ -768,8 +804,23 @@ onMounted(async () => {
     <el-dialog v-model="issueVisible" title="定向发券" width="460px">
       <p v-if="issueTarget" class="dlg-quote">{{ issueTarget.name }}</p>
       <el-form :model="issueForm" label-width="80px">
-        <el-form-item label="用户 ID">
-          <el-input v-model="issueForm.userId" placeholder="雪花 ID，如 99123412462473216" />
+        <el-form-item label="手机号">
+          <div class="phone-row">
+            <el-input
+              v-model="issueForm.phone"
+              placeholder="11 位手机号"
+              maxlength="11"
+              class="phone-input"
+              @keyup.enter="lookupIssueUser"
+            />
+            <el-button :loading="looking" @click="lookupIssueUser">查询</el-button>
+          </div>
+        </el-form-item>
+        <!-- 查到才显示收件人；这也是"确认发券"能不能点的前提 -->
+        <el-form-item v-if="issueUser" label="收件人">
+          <span class="issue-user">
+            {{ issueUser.nickname }}（{{ issueUser.phoneMasked }}）
+          </span>
         </el-form-item>
         <el-form-item label="张数">
           <el-input-number v-model="issueForm.count" :min="1" :max="100" :controls="false" />
@@ -783,7 +834,9 @@ onMounted(async () => {
       />
       <template #footer>
         <el-button @click="issueVisible = false">取消</el-button>
-        <el-button type="primary" :loading="acting" @click="submitIssue">确认发券</el-button>
+        <el-button type="primary" :loading="acting" :disabled="!issueUser" @click="submitIssue">
+          确认发券
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -876,5 +929,23 @@ onMounted(async () => {
   background: var(--color-bg-subtle);
   font-size: var(--text-sm);
   color: var(--color-text-secondary);
+}
+
+/* 手机号 + 查询按钮横排 */
+.phone-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.phone-input {
+  width: 180px;
+}
+
+/* 查到的收件人 —— 这是"确认发给谁"的唯一依据，给点份量 */
+.issue-user {
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
 }
 </style>

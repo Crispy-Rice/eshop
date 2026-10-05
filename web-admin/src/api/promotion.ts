@@ -168,13 +168,25 @@ export interface PromoActivityInput {
   priority?: number
 }
 
-/** 补发的券。后端**只支持单个 userId**，没有批量也没有用户搜索。 */
+/** 补发的券。后端**只支持单个收件人**，没有批量。 */
 export interface IssuedCoupon {
   id: string
   code: string
   name: string
   validStart: string
   validEnd: string
+}
+
+/**
+ * 按手机号定位到的用户 —— 定向发券前用来确认"发给谁"。
+ *
+ * ★ 运营拿不到用户的雪花 ID，所以发券入口必须能先把手机号换成 userId；
+ *   ``nickname`` + ``phoneMasked`` 是给运营核对"没找错人"的。
+ */
+export interface UserLookup {
+  userId: string
+  nickname: string
+  phoneMasked: string
 }
 
 // ============================================================
@@ -201,6 +213,15 @@ export function issueCoupon(payload: {
   count?: number
 }): Promise<IssuedCoupon[]> {
   return post<IssuedCoupon[]>('/admin/coupons/issue', payload)
+}
+
+/**
+ * 把运营手上的手机号换成一个 ``userId``（定向发券用）。
+ *
+ * 查不到会 404 并给出明确文案，而不是返回空 —— 免得运营拿着一个空值继续往下发。
+ */
+export function lookupUserByPhone(phone: string): Promise<UserLookup> {
+  return get<UserLookup>('/admin/users/lookup', { params: { phone } })
 }
 
 export function listPromoActivities(params: {

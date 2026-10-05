@@ -243,6 +243,18 @@ class AdminIssueRequest(CamelModel):
     count: int = Field(default=1, ge=1, le=100)
 
 
+class UserLookupOut(CamelModel):
+    """按手机号定位到的用户 —— 定向发券前用来让运营确认"发给谁"。
+
+    只含定位与确认所需的最少字段：运营手上有的是**手机号**，需要换回 ``userId``
+    才能发券；昵称与打码号用来核对没找错人。
+    """
+
+    user_id: SnowflakeId
+    nickname: str
+    phone_masked: str
+
+
 class PromoActivityCreateRequest(CamelModel):
     name: str = Field(min_length=2, max_length=64)
     level: int = Field(ge=0, le=2, description="0单品 1店铺 2平台")

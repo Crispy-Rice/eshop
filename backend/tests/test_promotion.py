@@ -784,3 +784,63 @@ async def test_banner_admin_endpoints_are_role_guarded(client: AsyncClient, sess
     assert resp.status_code == 403
     # 公开接口不带令牌也通
     assert (await client.get("/api/banners")).status_code == 200
+
+
+# ============================================================
+# 定向发券：按手机号定位用户
+# ============================================================
+
+
+async def test_lookup_user_by_phone(client: AsyncClient, session) -> None:
+    """★ 运营手上只有手机号，必须能换回 userId —— 雪花 ID 他拿不到。
+
+    这个接口存在的唯一理由就是那件事，所以返回的三样都要能用：
+    ``userId`` 拿去发券，昵称 + 打码号拿去核对没找错人。
+    """
+    buyer = await register(client, phone=BUYER_PHONE)
+    buyer_id = (
+        await client.get("/api/me", headers=auth_header(buyer["accessToken"]))
+    ).json()["data"]["id"]
+    admin = await _admin(client, session)
+
+    resp = await client.get(
+        "/api/admin/users/lookup",
+        params={"phone": BUYER_PHONE},
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["userId"] == buyer_id
+    assert data["nickname"]
+    assert data["phoneMasked"] == "139****9011"
+
+
+async def test_lookup_user_by_phone_not_found(client: AsyncClient, session) -> None:
+    """查不到要明确报错，不能返回空让运营去猜。"""
+    admin = await _admin(client, session)
+    resp = await client.get(
+        "/api/admin/users/lookup",
+        params={"phone": "13900139999"},
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert resp.status_code == 404
+    assert "手机号" in resp.json()["message"]
+
+
+async def test_issue_rejects_unknown_user(client: AsyncClient, session) -> None:
+    """★ 给不存在的用户发券要拦住。
+
+    以前不校验 —— 运营手抄错一位数字就会静静地发出一张永远没人能领的券：
+    库里多了记录、模板上多了券，但谁都不会发现。
+    """
+    admin = await _admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    tpl_id = await _create_template_via_api(client, headers)
+
+    resp = await client.post(
+        "/api/admin/coupons/issue",
+        json={"templateId": tpl_id, "userId": str(next_id()), "count": 1},
+        headers=headers,
+    )
+    assert resp.status_code == 404
+    assert "用户" in resp.json()["message"]

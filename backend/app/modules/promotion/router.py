@@ -18,6 +18,7 @@ from app.core.deps import CurrentUserDep, DbSession, IdempotencyKeyDep, client_i
 from app.core.errors import BizError, ErrorCode
 from app.core.response import ApiResponse
 from app.core.snowflake import next_id
+from app.modules.account import service as account_service
 from app.modules.promotion import checkout, service
 from app.modules.promotion import repository as repo
 from app.modules.promotion.models import (
@@ -52,6 +53,7 @@ from app.modules.promotion.schemas import (
     MyCouponOut,
     PromoActivityCreateRequest,
     ReceivableCouponOut,
+    UserLookupOut,
 )
 
 router = APIRouter()
@@ -319,6 +321,32 @@ async def create_template(
     return ApiResponse.ok(_to_tpl_out(tpl))
 
 
+@router.get(
+    "/api/admin/users/lookup",
+    response_model=ApiResponse[UserLookupOut],
+    summary="按手机号定位用户（定向发券用）",
+)
+async def lookup_user(
+    admin: AdminDep,
+    session: DbSession,
+    phone: str = Query(min_length=11, max_length=11, description="11 位手机号"),
+) -> ApiResponse[UserLookupOut]:
+    """把运营手上的**手机号**换成一个 ``userId``，供定向发券使用。
+
+    ★ 运营拿不到用户的雪花 ID —— 那个对话框原来要求手填 18 位数字，实际没人填得出来。
+      "用户报手机号"才是真实场景，而 ``account`` 注册时就写好了可查的 ``phone_hash``。
+
+    查不到就 404：宁可让运营回去核对号码，也不要猜一个 ID 发出去。
+    """
+    found = await account_service.find_user_by_phone(session, phone)
+    if found is None:
+        raise BizError(ErrorCode.NOT_FOUND, "该手机号没有对应的注册用户")
+    user_id, nickname, phone_masked = found
+    return ApiResponse.ok(
+        UserLookupOut(user_id=user_id, nickname=nickname, phone_masked=phone_masked)
+    )
+
+
 @router.post(
     "/api/admin/coupons/issue",
     response_model=ApiResponse[list[CouponReceiveOut]],
@@ -328,7 +356,13 @@ async def admin_issue(
     session: DbSession, body: AdminIssueRequest, admin: AdminDep
 ) -> ApiResponse[list[CouponReceiveOut]]:
     """手工补发。**不消耗活动库存**（``issued_count`` 不变）——
-    补发是平台欠用户的，不该挤占其他用户的名额（docs/04 §11）。"""
+    补发是平台欠用户的，不该挤占其他用户的名额（docs/04 §11）。
+
+    ★ 先校验收件人存在。以前不校验 —— 运营手抄错一位数字，就会给一个不存在的
+      用户静静地发券：券码进了库，但永远没人能领到，也没人会发现。
+    """
+    if not await account_service.user_exists(session, int(body.user_id)):
+        raise BizError(ErrorCode.NOT_FOUND, "该用户不存在，请核对后重试")
     codes = await service.issue_by_admin(
         session,
         tpl_id=int(body.template_id),

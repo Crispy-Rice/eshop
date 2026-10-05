@@ -405,6 +405,26 @@ async def list_user_profiles(
     return {u.id: (u.nickname, u.avatar) for u in users}
 
 
+async def find_user_by_phone(session: AsyncSession, phone: str) -> tuple[int, str, str] | None:
+    """按手机号定位用户，返回 ``(userId, 昵称, 打码手机号)``；查不到返回 None。
+
+    给运营侧的"定向发券"用：那个场景下运营手上只有**用户报出来的手机号**，
+    拿不到雪花 ID —— 所以入口必须能按手机号找人。
+
+    ★ 只回这三个字段。手机号是加密存的，但"昵称 + 打码号"已经够运营确认
+      "发给谁"，不必（也不该）把整行 ``User`` 漏给别的模块。
+    """
+    user = await repo.get_user_by_phone_hash(session, phone_hash(phone))
+    if user is None:
+        return None
+    return user.id, user.nickname, user.phone_masked or ""
+
+
+async def user_exists(session: AsyncSession, user_id: int) -> bool:
+    """用户是否存在。给别的模块的写入口做存在性校验用。"""
+    return await repo.get_user_by_id(session, user_id) is not None
+
+
 # ============================================================
 # 收货地址
 # ============================================================
