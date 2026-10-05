@@ -805,7 +805,7 @@ async def list_stock_out(
                 # 已软删商品的 SKU 上面就被排掉了，取不到只可能是数据异常
                 # （SKU 指向了不存在的 SPU）。标题留空，前端会退回显示 skuId，
                 # 比整行静默消失强 —— 那种情况商家会以为库存丢了。
-                sku_code=sku.sku_code if sku else "",
+                sku_code=(sku.sku_code or "") if sku else "",
                 spec_text=sku.spec_text if sku else "",
                 spu_title=sku.title if sku else "",
                 total=row.total,

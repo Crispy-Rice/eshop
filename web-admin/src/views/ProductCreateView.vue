@@ -221,9 +221,9 @@ const skuErrors = computed<Record<string, { skuCode?: string; price?: string; we
     const map: Record<string, { skuCode?: string; price?: string; weightG?: string }> = {}
     for (const row of enabledSkus.value) {
       const errs: { skuCode?: string; price?: string; weightG?: string } = {}
+      // ★ 编码是**选填**的：空着不算错，只有"填了却和别的行撞了"才标红
       const code = row.skuCode.trim()
-      if (!code) errs.skuCode = '请填商家编码'
-      else if (dupCodes.value.has(code)) errs.skuCode = '编码重复'
+      if (code && dupCodes.value.has(code)) errs.skuCode = '编码重复'
       if (row.price === undefined || row.price <= 0) errs.price = '要大于 0'
       // 重量是运费唯一的输入（运费引擎按首重 / 续重计费），这一格不能空
       if (!row.weightG || row.weightG <= 0) errs.weightG = '要大于 0'
@@ -278,7 +278,8 @@ async function onSubmit(): Promise<void> {
       values: g.values.map((v) => ({ key: v.key, value: v.value.trim(), image: v.image || null })),
     })),
     skus: enabledSkus.value.map<SkuIn>((row) => ({
-      skuCode: row.skuCode.trim(),
+      // 空编码发 null 而不是空串：后端把空串归一成 NULL，这里显式传 null 更直白
+      skuCode: row.skuCode.trim() || null,
       specValueKeys: row.keys,
       price: yuanToFen(row.price ?? 0),
       coverImage: row.coverImage.trim(),

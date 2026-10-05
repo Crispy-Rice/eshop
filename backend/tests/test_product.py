@@ -643,6 +643,36 @@ async def test_publish_flow_makes_product_visible(client: AsyncClient, session) 
     assert [i["id"] for i in search.json()["data"]["items"]] == [spu_id]
 
 
+async def test_sku_code_is_optional(client: AsyncClient, session) -> None:
+    """商家编码是选填的：不传 / 传空串 / 传纯空白，都算"没填"，都能发布。
+
+    ★ 这条盯的是**空值存 NULL 而不是空串**。唯一约束 ``(spu_id, sku_code)`` 里
+      PostgreSQL 认为每个 NULL 互不相同，所以同一个商品下能有多个没编码的 SKU；
+      写入侧要是把空值归一成空串，第二个 SKU 就会撞约束。
+    """
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "手机")
+    merchant = await register(client, phone="13800138021")
+    await open_shop(client, merchant["accessToken"])
+    headers = auth_header(merchant["accessToken"])
+
+    payload = _spu_payload(category)
+    payload["title"] = "无编码商品"
+    for sku, variant in zip(payload["skus"], (None, "", "   "), strict=True):
+        if variant is None:
+            sku.pop("skuCode")  # 完全不传
+        else:
+            sku["skuCode"] = variant
+
+    resp = await client.post("/api/merchant/spus", json=payload, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    detail = resp.json()["data"]
+    assert len(detail["skus"]) == 3
+    # 读侧统一成空串（不是 null）：消费方不必逐个处理 None
+    assert all(s["skuCode"] == "" for s in detail["skus"])
+
+
 async def test_off_shelf_hides_from_search(client: AsyncClient, session) -> None:
     spu_id, merchant = await _create_and_publish(client, session)
     headers = auth_header(merchant["accessToken"])

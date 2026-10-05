@@ -809,7 +809,9 @@ async def get_spu_detail(
         skus=[
             SkuDetailOut(
                 id=s.id,
-                sku_code=s.sku_code,
+                # 编码是选填的，库里可能是 NULL；对外统一成空串，免得每个消费方
+                # 都要处理 None（读侧契约保持 "字符串，可能为空"）
+                sku_code=s.sku_code or "",
                 spec_text=s.spec_text,
                 price=s.price,
                 cover_image=s.cover_image,
@@ -853,7 +855,7 @@ async def batch_get_skus(
                 spu_id=sku.spu_id,
                 shop_id=sku.shop_id,
                 title=spu.title,
-                sku_code=sku.sku_code,
+                sku_code=sku.sku_code or "",
                 spec_text=sku.spec_text,
                 price=sku.price,
                 # ★ SKU 没单独设封面就退回商品主图。商家的习惯是只传一张主图，
@@ -927,7 +929,10 @@ async def get_sku_for_order(session: AsyncSession, sku_id: int) -> tuple[Sku, Sp
         raise BizError(ErrorCode.SKU_OFF_SHELF, "商品不存在")
     spu = await repo.get_spu(session, sku.spu_id)
     if spu is None or spu.status != SPU_ON_SHELF or sku.status != 1:
-        raise BizError(ErrorCode.SKU_OFF_SHELF, f"商品「{spu.title if spu else sku.sku_code}」已下架")
+        raise BizError(
+            ErrorCode.SKU_OFF_SHELF,
+            f"商品「{spu.title if spu else (sku.sku_code or '该商品')}」已下架",
+        )
     return sku, spu
 
 

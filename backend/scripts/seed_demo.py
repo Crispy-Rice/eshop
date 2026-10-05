@@ -293,7 +293,9 @@ def upload_banner_image(
     return unwrap(resp)["url"]
 
 
-# SKU 编码带时间戳，避免和之前跑出来的商品撞码
+# SKU 编码后缀，作用只是让重复 seed 出来的编码彼此不雷同。
+# ★ 它**不是**"防撞码"用的：唯一约束是 (spu_id, sku_code)，只在单个商品内生效，
+#   不同商品之间本来就撞不了（旧注释说反了）。
 SUFFIX = str(int(time.time()))[-6:]
 
 # (类目名, 上级类目名)

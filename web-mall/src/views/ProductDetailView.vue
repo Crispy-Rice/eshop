@@ -157,7 +157,13 @@ watch(currentSku, async (sku) => {
 })
 
 const skuHint = computed(() => {
-  if (currentSku.value) return `已选：${currentSku.value.specText}（${currentSku.value.skuCode}）`
+  if (currentSku.value) {
+    // 商家编码是选填的，没填就别拼出「已选：8G+256G（）」这种空括号
+    const code = currentSku.value.skuCode
+    return code
+      ? `已选：${currentSku.value.specText}（${code}）`
+      : `已选：${currentSku.value.specText}`
+  }
   if (allSelected.value) return '该规格组合暂不可售，请换一个组合'
   return `请选择 ${spu.value?.specGroups.map((g) => g.name).join(' / ') ?? ''}`
 })

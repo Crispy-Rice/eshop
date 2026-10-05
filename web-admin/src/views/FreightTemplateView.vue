@@ -595,7 +595,9 @@ onMounted(load)
           <el-table-column label="商品" min-width="240">
             <template #default="{ row }">
               <div class="cell-title">{{ row.spuTitle }}</div>
-              <div class="cell-sub">{{ row.specText }} · {{ row.skuCode }}</div>
+              <div class="cell-sub">
+                {{ row.specText }}<template v-if="row.skuCode"> · {{ row.skuCode }}</template>
+              </div>
             </template>
           </el-table-column>
           <el-table-column prop="warehouseName" label="仓库" width="110" />

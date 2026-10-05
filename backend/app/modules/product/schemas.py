@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.core.schemas import CamelModel, SnowflakeId
 
@@ -101,7 +101,17 @@ class SpecGroupIn(CamelModel):
 
 
 class SkuIn(CamelModel):
-    sku_code: str = Field(min_length=1, max_length=64, description="商家编码，同一 SPU 内唯一")
+    """发布时的单个 SKU。
+
+    ``sku_code`` 是**选填**的：它是给商家自己对接 ERP / 打发货单用的钥匙，
+    平台内部一律走雪花 ID —— 没有任何查询按它过滤。没有自建系统的商家
+    不该被逼着为每一行编一个号。发布页的「按标题生成编码」按钮还在，
+    需要时一键填。
+    """
+
+    sku_code: str | None = Field(
+        default=None, max_length=64, description="商家编码（选填），填了就要在同一 SPU 内唯一"
+    )
     spec_value_keys: list[str] = Field(
         min_length=1, max_length=MAX_SPEC_GROUPS, description="每个规格组各选一个值"
     )
@@ -109,6 +119,19 @@ class SkuIn(CamelModel):
     # 可空：SKU 不单独设图时，展示层回落商品主图（product.service.batch_get_skus）
     cover_image: str = Field(default="", max_length=255)
     weight_g: Weight
+
+    @field_validator("sku_code")
+    @classmethod
+    def _normalize_sku_code(cls, value: str | None) -> str | None:
+        """空串 / 纯空白一律归一成 ``None``。
+
+        ★ 必须是 ``None`` 而不是 ``""``：唯一约束是 ``(spu_id, sku_code)``，
+        而 PostgreSQL 认为**每个 NULL 互不相同**，所以一个商品下可以有很多
+        个没填编码的 SKU；换成空串，第二个就会撞唯一约束。
+        """
+        if value is None:
+            return None
+        return value.strip() or None
 
 
 class SpuCreateRequest(CamelModel):
@@ -143,25 +166,30 @@ class SpuCreateRequest(CamelModel):
 
         seen_combos: set[frozenset[str]] = set()
         codes: set[str] = set()
-        for sku in self.skus:
+        for index, sku in enumerate(self.skus, start=1):
+            # 编码是选填的，报错时拿它当标识；没填就退回行号 —— 否则消息里会出现 "None"
+            label = sku.sku_code or f"#{index}"
             if len(sku.spec_value_keys) != len(self.spec_groups):
-                raise ValueError(f"SKU「{sku.sku_code}」需要为 {len(self.spec_groups)} 个规格组各选一个值")
+                raise ValueError(f"SKU「{label}」需要为 {len(self.spec_groups)} 个规格组各选一个值")
             for key in sku.spec_value_keys:
                 if key not in key_to_group:
-                    raise ValueError(f"SKU「{sku.sku_code}」引用了不存在的规格值 key「{key}」")
+                    raise ValueError(f"SKU「{label}」引用了不存在的规格值 key「{key}」")
 
             groups_of_sku = {key_to_group[k] for k in sku.spec_value_keys}
             if len(groups_of_sku) != len(self.spec_groups):
-                raise ValueError(f"SKU「{sku.sku_code}」在某个规格组下选了多个值")
+                raise ValueError(f"SKU「{label}」在某个规格组下选了多个值")
 
             combo = frozenset(sku.spec_value_keys)
             if combo in seen_combos:
-                raise ValueError(f"SKU「{sku.sku_code}」与其他 SKU 的规格组合重复")
+                raise ValueError(f"SKU「{label}」与其他 SKU 的规格组合重复")
             seen_combos.add(combo)
 
-            if sku.sku_code in codes:
-                raise ValueError(f"商家编码「{sku.sku_code}」重复")
-            codes.add(sku.sku_code)
+            # ★ 空编码不参与查重：没填编码的 SKU 之间不算"互相重复"，
+            #   它们落库时是 NULL，本来就允许共存
+            if sku.sku_code is not None:
+                if sku.sku_code in codes:
+                    raise ValueError(f"商家编码「{sku.sku_code}」重复")
+                codes.add(sku.sku_code)
 
         return self
 

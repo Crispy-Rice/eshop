@@ -72,7 +72,7 @@ def _to_item_out(row: CartItem, sku: SkuBriefOut | None, available: int) -> Cart
         title=sku.title if sku else "（商品已下架）",
         spec_text=sku.spec_text if sku else "",
         cover_image=sku.cover_image if sku else "",
-        sku_code=sku.sku_code if sku else "",
+        sku_code=(sku.sku_code or "") if sku else "",
         num=row.num,
         selected=row.selected,
         price=price,

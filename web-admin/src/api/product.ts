@@ -78,7 +78,8 @@ export interface SpecGroupIn {
 }
 
 export interface SkuIn {
-  skuCode: string
+  /** 商家编码，**选填**；不填就传 null。填了要在同一个商品内唯一 */
+  skuCode?: string | null
   /** 每个规格组各选一个值，顺序不限 */
   specValueKeys: string[]
   price: number

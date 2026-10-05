@@ -191,7 +191,13 @@ onMounted(async () => {
               <div class="cell-text">
                 <div class="cell-title">{{ row.spuTitle }}</div>
                 <div class="cell-sub">{{ row.specText || '—' }}</div>
-                <div class="cell-code tnum">{{ row.skuCode || row.skuId }}</div>
+                <div class="cell-code tnum">
+                  <template v-if="row.skuCode">{{ row.skuCode }}</template>
+                  <!-- 编码是选填的。没填时只有"取不到商品"那种异常行才退回 skuId 当线索 ——
+                       正常行显示一串 19 位雪花 ID 只是噪音 -->
+                  <template v-else-if="!row.spuTitle">{{ row.skuId }}</template>
+                  <template v-else>—</template>
+                </div>
               </div>
             </div>
           </template>

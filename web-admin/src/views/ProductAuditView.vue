@@ -364,7 +364,13 @@ onMounted(load)
           <h4 class="detail-h">SKU（{{ detail.skus.length }}）</h4>
           <el-table :data="detail.skus" size="small">
             <el-table-column label="规格" prop="specText" min-width="130" />
-            <el-table-column label="编码" prop="skuCode" min-width="130" />
+            <el-table-column label="编码" min-width="130">
+              <template #default="{ row }">
+                <!-- 商家编码是选填的，没填就显示破折号 -->
+                <span v-if="row.skuCode">{{ row.skuCode }}</span>
+                <span v-else class="muted">—</span>
+              </template>
+            </el-table-column>
             <el-table-column label="价格" width="110" align="right">
               <template #default="{ row }">
                 <span class="tnum price">{{ formatYuan(row.price) }}</span>

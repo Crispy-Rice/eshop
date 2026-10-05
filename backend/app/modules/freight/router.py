@@ -254,7 +254,7 @@ async def list_template_binds(
         rows.append(
             SkuBindOut(
                 sku_id=b.sku_id,
-                sku_code=sku.sku_code,
+                sku_code=sku.sku_code or "",
                 spu_title=sku.title,
                 spec_text=sku.spec_text,
                 warehouse_id=b.warehouse_id,

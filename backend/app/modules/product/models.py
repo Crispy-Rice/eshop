@@ -172,7 +172,12 @@ class Sku(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     spu_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("product.spu.id"), nullable=False)
     shop_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="冗余，下单/拆单时免 join")
-    sku_code: Mapped[str] = mapped_column(String(64), nullable=False, comment="商家编码")
+    # 选填。空值一律存 NULL 而不是空串 —— 唯一约束 uk_sku_spu_code 里
+    # PostgreSQL 认为每个 NULL 互不相同，所以一个商品下能有多个没编码的 SKU；
+    # 存空串的话第二个就会撞约束。
+    sku_code: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment="商家编码（选填），同一 SPU 内唯一"
+    )
     spec_text: Mapped[str] = mapped_column(
         String(255), nullable=False, comment='规格摘要，如"暗夜黑;256G"，写入订单快照'
     )
