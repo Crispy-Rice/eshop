@@ -189,23 +189,65 @@ const pricePreview = computed(() => {
   return text
 })
 
-// ---------- 提交 ----------
-function validateSpecs(): string | null {
+// ---------- 校验 ----------
+//
+// ★ 逐格的问题（编码 / 价格 / 重量）**就地标红**，不再攒成一条顶部 toast。
+//   原来那版一次只报第一处，而且只说"哪个规格组合"、不说哪一格 —— 商家还得自己低头
+//   在十几个输入框里找。现在每一格自己的问题就写在那格下面。
+//
+//   整页层面的问题（没有规格组、没有 SKU）仍然走顶部提示：它们在表格里没有落脚的一格。
+
+/** 首次点保存之后才开始标红 —— 否则一进页面整张表就是红的 */
+const submitted = ref(false)
+
+/** 出现超过一次的商家编码。跨行的问题，但落在每一行自己的编码格上 */
+const dupCodes = computed(() => {
+  const seen = new Map<string, number>()
+  for (const row of enabledSkus.value) {
+    const code = row.skuCode.trim()
+    if (code) seen.set(code, (seen.get(code) ?? 0) + 1)
+  }
+  return new Set([...seen].filter(([, n]) => n > 1).map(([code]) => code))
+})
+
+/**
+ * 每个 SKU 行的问题，按 comboKey 索引。
+ *
+ * 用 computed 而不是"手动 set / clear"：改好一格，那格的红色立刻自己消失，不用额外写
+ * 清理逻辑，也不会留下过期的错误。
+ */
+const skuErrors = computed<Record<string, { skuCode?: string; price?: string; weightG?: string }>>(
+  () => {
+    const map: Record<string, { skuCode?: string; price?: string; weightG?: string }> = {}
+    for (const row of enabledSkus.value) {
+      const errs: { skuCode?: string; price?: string; weightG?: string } = {}
+      const code = row.skuCode.trim()
+      if (!code) errs.skuCode = '请填商家编码'
+      else if (dupCodes.value.has(code)) errs.skuCode = '编码重复'
+      if (row.price === undefined || row.price <= 0) errs.price = '要大于 0'
+      // 重量是运费唯一的输入（运费引擎按首重 / 续重计费），这一格不能空
+      if (!row.weightG || row.weightG <= 0) errs.weightG = '要大于 0'
+      map[row.comboKey] = errs
+    }
+    return map
+  },
+)
+
+/** 表格里还有没有没填好的格子 */
+const hasSkuErrors = computed(() =>
+  Object.values(skuErrors.value).some((e) => e.skuCode || e.price || e.weightG),
+)
+
+function cellError(row: SkuRow, field: 'skuCode' | 'price' | 'weightG'): string | undefined {
+  return submitted.value ? skuErrors.value[row.comboKey]?.[field] : undefined
+}
+
+/** 整页层面的问题：表格里没有对应的一格，只能顶部提示 */
+function validatePage(): string | null {
   if (effectiveGroups.value.length === 0) return '至少需要一个填好的规格组'
   if (skuTable.value.length === 0) return '没有生成任何 SKU'
   if (skuTable.value.length > MAX_SKUS) return `SKU 数量不能超过 ${MAX_SKUS}`
   if (enabledSkus.value.length === 0) return '至少要上架一个 SKU'
-
-  for (const row of enabledSkus.value) {
-    if (!row.skuCode.trim()) return `「${row.label}」缺少商家编码`
-    if (row.price === undefined || row.price <= 0) return `「${row.label}」的价格必须大于 0`
-    // 规格封面是选填的：不传时商城会用商品主图（后端 batch_get_skus 里回落）
-    if (!row.weightG || row.weightG <= 0) return `「${row.label}」的重量必须大于 0`
-  }
-
-  const codes = enabledSkus.value.map((r) => r.skuCode.trim())
-  if (new Set(codes).size !== codes.length) return '商家编码有重复'
-
   return null
 }
 
@@ -213,9 +255,16 @@ async function onSubmit(): Promise<void> {
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) return
 
-  const error = validateSpecs()
-  if (error) {
-    ElMessage.warning(error)
+  const pageError = validatePage()
+  if (pageError) {
+    ElMessage.warning(pageError)
+    return
+  }
+
+  // 点了保存才让格子里的问题显形，然后让它们自己说明问题，不再攒成一条 toast
+  submitted.value = true
+  if (hasSkuErrors.value) {
+    ElMessage.warning('SKU 明细里有标红的格子，补齐后再保存')
     return
   }
 
@@ -357,7 +406,16 @@ onMounted(async () => {
         <el-table-column prop="label" label="规格组合" min-width="180" />
         <el-table-column label="商家编码" width="200">
           <template #default="{ row }">
-            <el-input v-model="row.skuCode" size="small" :disabled="!row.enabled" maxlength="64" />
+            <el-input
+              v-model="row.skuCode"
+              size="small"
+              :disabled="!row.enabled"
+              maxlength="64"
+              :class="{ 'is-invalid': cellError(row, 'skuCode') }"
+            />
+            <div v-if="cellError(row, 'skuCode')" class="cell-error">
+              {{ cellError(row, 'skuCode') }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="价格（元）" width="140">
@@ -370,7 +428,11 @@ onMounted(async () => {
               :controls="false"
               :disabled="!row.enabled"
               class="w110"
+              :class="{ 'is-invalid': cellError(row, 'price') }"
             />
+            <div v-if="cellError(row, 'price')" class="cell-error">
+              {{ cellError(row, 'price') }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="重量（克）" width="130">
@@ -383,7 +445,11 @@ onMounted(async () => {
               :controls="false"
               :disabled="!row.enabled"
               class="w110"
+              :class="{ 'is-invalid': cellError(row, 'weightG') }"
             />
+            <div v-if="cellError(row, 'weightG')" class="cell-error">
+              {{ cellError(row, 'weightG') }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="封面图" width="110" align="center">
@@ -487,6 +553,18 @@ onMounted(async () => {
 
 .w110 {
   width: 110px;
+}
+
+/* 行内校验：出问题的那一格描红，原因就写在那格下面，不用回头找是哪一行 */
+.is-invalid :deep(.el-input__wrapper) {
+  box-shadow: 0 0 0 1px var(--color-danger) inset;
+}
+
+.cell-error {
+  margin-top: 2px;
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  color: var(--color-danger);
 }
 
 .w180 {

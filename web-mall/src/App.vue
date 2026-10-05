@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
 import PromoStrip from '@/components/PromoStrip.vue'
+import ProfileEditDialog from '@/components/ProfileEditDialog.vue'
 import { setUnauthorizedHandler } from '@/api/http'
 import { useTheme } from '@/composables/useTheme'
 import { useAuthStore } from '@/stores/auth'
@@ -16,6 +17,7 @@ const cart = useCartStore()
 const router = useRouter()
 const route = useRoute()
 const { theme, themes, setTheme } = useTheme()
+const profileVisible = ref(false)
 
 /**
  * 后台入口。只给真进得去的人显示 —— 买家点「商家后台」只会撞 403，
@@ -43,6 +45,15 @@ onMounted(async () => {
   // 角标要在登录态恢复之后再拉，否则未登录时白跑一次
   await cart.refresh()
 })
+
+/** 昵称下拉：个人资料 / 退出登录 —— 和后台是同一套（菜单直接开弹窗，不跳页） */
+function onUserCommand(command: 'profile' | 'logout'): void {
+  if (command === 'logout') {
+    void onLogout()
+    return
+  }
+  profileVisible.value = true
+}
 
 async function onLogout(): Promise<void> {
   await auth.logout()
@@ -99,18 +110,28 @@ async function onLogout(): Promise<void> {
             <a v-if="backendEntry" :href="backendEntry.url" class="jump-link">
               {{ backendEntry.label }}
             </a>
-            <!-- 用户胶囊：头像 + 名字，点进个人中心 -->
-            <RouterLink to="/account" class="user-chip" title="个人中心">
-              <img
-                v-if="auth.user?.avatar"
-                class="chip-avatar"
-                :src="auth.user.avatar"
-                alt="头像"
-                @error="onImageError"
-              />
-              <span class="chip-name">{{ auth.user?.nickname }}</span>
-            </RouterLink>
-            <el-button link type="primary" @click="onLogout">退出</el-button>
+            <!-- 用户胶囊：头像 + 名字，点开是下拉 —— 和后台同一套交互。
+                 以前它是直接跳 /account，右边还并排挂着一个独立的「退出」按钮：
+                 头像旁边贴着两个性质不同的按钮，既挤又容易点错。
+                 落地页移到菜单里的「个人中心」，所以这里不再是 RouterLink。 -->
+            <el-dropdown trigger="click" @command="onUserCommand">
+              <span class="user-chip" title="个人中心">
+                <img
+                  v-if="auth.user?.avatar"
+                  class="chip-avatar"
+                  :src="auth.user.avatar"
+                  alt="头像"
+                  @error="onImageError"
+                />
+                <span class="chip-name">{{ auth.user?.nickname }}</span>
+              </span>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="profile">个人资料</el-dropdown-item>
+                  <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
           </template>
           <RouterLink v-else to="/login">
             <el-button type="primary" size="small">登录 / 注册</el-button>
@@ -124,6 +145,9 @@ async function onLogout(): Promise<void> {
     <main class="content">
       <RouterView />
     </main>
+
+    <!-- 个人资料弹窗挂在应用壳上：导航里的「个人资料」直接开它，不跳页（与后台一致） -->
+    <ProfileEditDialog v-model="profileVisible" />
   </div>
 </template>
 
@@ -316,7 +340,9 @@ async function onLogout(): Promise<void> {
   color: var(--color-accent);
 }
 
-/* 用户胶囊：头像 + 名字，整体是个通往个人中心的按钮 */
+/* 用户胶囊：头像 + 名字，整体是通往个人中心的下拉触发器。
+   ★ cursor 和 outline 都要自己写：它以前是 RouterLink（<a>），浏览器自带手型光标，
+     换成 <span> 之后没了；el-dropdown 还会给触发器套一层焦点轮廓。 */
 .user-chip {
   display: inline-flex;
   align-items: center;
@@ -324,6 +350,8 @@ async function onLogout(): Promise<void> {
   padding: var(--space-1) var(--space-3);
   border-radius: var(--radius-pill);
   background: var(--color-bg-subtle);
+  cursor: pointer;
+  outline: none;
   transition: background-color var(--dur-fast) var(--ease-out);
 }
 

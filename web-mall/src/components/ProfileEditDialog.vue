@@ -65,7 +65,7 @@ async function submit(): Promise<void> {
 </script>
 
 <template>
-  <el-dialog v-model="visible" title="编辑资料" width="440px">
+  <el-dialog v-model="visible" title="个人资料" width="440px">
     <el-form label-width="72px">
       <el-form-item label="头像">
         <AvatarUploader v-model="form.avatar" />

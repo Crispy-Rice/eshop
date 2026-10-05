@@ -14,6 +14,7 @@ from app.core.deps import DbSession, require_role
 from app.core.response import ApiResponse
 from app.modules.account.deps import CurrentShopIdDep
 from app.modules.product import service
+from app.modules.product.models import SPU_REJECTED
 from app.modules.product.schemas import (
     AdminCategoryTreeOut,
     CategoryCreateRequest,
@@ -98,7 +99,9 @@ async def create_spu(
 async def list_my_spus(
     shop_id: CurrentShopIdDep,
     session: DbSession,
-    status: int | None = Query(default=None, ge=1, le=5),
+    # ★ 上界跟着 SPU_REJECTED 走，别写死数字 —— 加了状态却忘了改这里，
+    #   商家那个筛选 tab 会静默 422（前端拿到错误什么都不显示，最难查的一种坏法）。
+    status: int | None = Query(default=None, ge=1, le=SPU_REJECTED),
     keyword: str | None = Query(default=None, max_length=60),
     cursor: str | None = Query(default=None, max_length=200),
     limit: int = Query(default=20, ge=1, le=60),
@@ -234,7 +237,9 @@ async def delete_category(category_id: int, admin: AdminDep, session: DbSession)
 async def list_admin_spus(
     admin: AdminDep,
     session: DbSession,
-    status: int | None = Query(default=None, ge=1, le=5),
+    # ★ 上界跟着 SPU_REJECTED 走，别写死数字 —— 加了状态却忘了改这里，
+    #   商家那个筛选 tab 会静默 422（前端拿到错误什么都不显示，最难查的一种坏法）。
+    status: int | None = Query(default=None, ge=1, le=SPU_REJECTED),
     keyword: str | None = Query(default=None, max_length=60),
     cursor: str | None = Query(default=None, max_length=200),
     limit: int = Query(default=20, ge=1, le=60),
@@ -250,6 +255,21 @@ async def list_admin_spus(
             session, status=status, keyword=keyword, cursor=cursor, limit=limit
         )
     )
+
+
+@router.get(
+    "/api/admin/spus/{spu_id}",
+    response_model=ApiResponse[SpuDetailOut],
+    summary="商品详情（平台）",
+)
+async def get_admin_spu(admin: AdminDep, session: DbSession, spu_id: int) -> ApiResponse[SpuDetailOut]:
+    """平台视角的商品详情：**任何店铺、任何状态**都看得到。
+
+    ★ 补这个接口是因为审核页原来只有一个缩略图和标题，**看不见商品本身就要点"通过"**。
+      既有的两条路径都不通：``/api/merchant/spus/{id}`` 按店铺归属判权（运营没有店铺，必 403），
+      公开的 ``/api/spus/{id}`` 只出已上架的 —— 而审核队列里全是**待审核**的。
+    """
+    return ApiResponse.ok(await service.get_spu_detail(session, spu_id, as_platform=True))
 
 
 @router.post("/api/admin/spus/{spu_id}/audit", response_model=ApiResponse[None], summary="商品审核")

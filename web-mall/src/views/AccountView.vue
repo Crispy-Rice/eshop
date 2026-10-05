@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
+import { codeToText, regionData } from 'element-china-area-data'
 
 import * as authApi from '@/api/auth'
 import type { Address, AddressInput } from '@/api/auth'
@@ -62,9 +63,46 @@ const emptyForm = (): AddressInput => ({
 
 const form = ref<AddressInput>(emptyForm())
 
+/**
+ * 省市区三级联动的选中路径（省码 / 市码 / 区码）。
+ *
+ * ★ 它是一个**独立的 UI 状态**，不属于表单：表单里存的是"名字 + 区划码"
+ *   （后端要的形状），而级联控件要的是路径。两者靠下面两个函数来回翻译。
+ */
+const regionPath = ref<string[]>([])
+
+/**
+ * 区划码 → 级联路径。
+ *
+ * 行政区划码（GB/T 2260）是**前缀结构**：``310115``（浦东新区）的前 2 位是上海市、
+ * 前 4 位是上海市辖区。所以拿着区码就能反推出省市两级，不必另存一份路径。
+ * 运费那边的区域匹配用的正是同一条性质（``freight/calculator.region_matches``）。
+ */
+function pathFromCode(code: string): string[] {
+  if (code.length === 6) return [code.slice(0, 2), code.slice(0, 4), code]
+  if (code.length === 4) return [code.slice(0, 2), code]
+  return code ? [code] : []
+}
+
+/**
+ * 选中即带出名字与区划码。
+ *
+ * ★ 用户**全程看不到那串数字**，也就不可能填错 —— 原来那栏
+ *   「区划码，如 310115，运费计算用」只有开发者看得懂，填错了也不报错，
+ *   只会在结算时匹配不到运费规则。
+ */
+function onRegionChange(codes: string[] | null): void {
+  const path = codes ?? []
+  const [province, city, district] = path
+  form.value.province = province ? (codeToText[province] ?? '') : ''
+  form.value.city = city ? (codeToText[city] ?? '') : ''
+  form.value.district = district ? (codeToText[district] ?? '') : ''
+  // 取最细一级做区划码。运费是按前缀匹配的，省码也能用，但能细就细
+  form.value.regionCode = path[path.length - 1] ?? ''
+}
+
 /** 与后端 `account/schemas.py` 的 PHONE_PATTERN 保持一致 */
 const PHONE_PATTERN = /^1[3-9]\d{9}$/
-const REGION_CODE_PATTERN = /^\d{6}$/
 
 /**
  * 收货手机号的实时指示：绿勾 / 红叉。
@@ -79,9 +117,9 @@ const phoneState = computed<'idle' | 'ok' | 'bad'>(() => {
 })
 
 /**
- * 省市区是三格输入、一个表单项。
+ * 省市区是**一个**表单项（三级联动的结果）。
  *
- * 后端把三者都设为必填，这里必须一起判 —— 否则用户填了省市漏了区，
+ * 后端把三者都设为必填，这里必须一起判 —— 只选到市没选到区，
  * 照样只会在提交后收到一句「参数错误」。
  */
 function validateRegion(
@@ -91,7 +129,7 @@ function validateRegion(
 ): void {
   const { province, city, district } = form.value
   if (province.trim() && city.trim() && district.trim()) callback()
-  else callback(new Error('请填写完整的省、市、区'))
+  else callback(new Error('请选择完整的省、市、区'))
 }
 
 const rules: FormRules = {
@@ -100,12 +138,10 @@ const rules: FormRules = {
     { required: true, message: '请填写手机号', trigger: 'blur' },
     { pattern: PHONE_PATTERN, message: '手机号格式不对，应为 1 开头的 11 位数字', trigger: 'blur' },
   ],
-  province: [{ required: true, validator: validateRegion, trigger: 'blur' }],
+  // 触发时机是 change 不是 blur：值来自级联控件的选择，没有"失焦"这个动作
+  province: [{ required: true, validator: validateRegion, trigger: 'change' }],
   detail: [{ required: true, message: '请填写详细地址', trigger: 'blur' }],
-  regionCode: [
-    { required: true, message: '请填写区划码', trigger: 'blur' },
-    { pattern: REGION_CODE_PATTERN, message: '区划码是 6 位数字，如 310115', trigger: 'blur' },
-  ],
+  // ★ regionCode 没有规则：它由选中的区县带出来，用户碰不到，也就无所谓校验
 }
 
 /** 后端字段名 → 中文，用于兜底提示 */
@@ -152,6 +188,7 @@ function openDialog(): void {
 function openCreate(): void {
   editingId.value = null
   form.value = emptyForm()
+  regionPath.value = []
   openDialog()
 }
 
@@ -168,6 +205,8 @@ function openEdit(address: Address): void {
     tag: address.tag,
     isDefault: address.isDefault,
   }
+  // 编辑时手上只有区码（库里没存省市各自的码），靠前缀规则反推，级联控件才回显
+  regionPath.value = pathFromCode(address.regionCode)
   openDialog()
 }
 
@@ -329,17 +368,20 @@ onMounted(() => {
           </el-input>
         </el-form-item>
         <el-form-item label="省市区" prop="province">
-          <div class="region">
-            <el-input v-model="form.province" placeholder="省" />
-            <el-input v-model="form.city" placeholder="市" />
-            <el-input v-model="form.district" placeholder="区" />
-          </div>
+          <!-- 三级联动。**区划码由选中的区县带出来，用户不填也看不见** ——
+               原来那一栏「区划码，如 310115，运费计算用」只有开发者看得懂，
+               而且填错了不会报错，只会在结算时匹配不到运费规则。 -->
+          <el-cascader
+            v-model="regionPath"
+            class="w-full"
+            :options="regionData"
+            :props="{ value: 'value', label: 'label' }"
+            placeholder="请选择省 / 市 / 区"
+            @change="onRegionChange"
+          />
         </el-form-item>
         <el-form-item label="详细地址" prop="detail">
           <el-input v-model="form.detail" maxlength="255" />
-        </el-form-item>
-        <el-form-item label="区划码" prop="regionCode">
-          <el-input v-model="form.regionCode" placeholder="如 310115，运费计算用" maxlength="16" />
         </el-form-item>
         <el-form-item label="设为默认">
           <el-switch v-model="form.isDefault" />
@@ -412,9 +454,8 @@ onMounted(() => {
   color: var(--color-text-tertiary);
 }
 
-.region {
-  display: flex;
-  gap: var(--space-2);
+/* 级联控件默认只有内容宽，撑满才和上面的输入框对齐 */
+.w-full {
   width: 100%;
 }
 </style>

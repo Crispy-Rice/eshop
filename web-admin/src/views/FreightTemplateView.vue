@@ -27,6 +27,7 @@ import {
 } from '@/api/inventory'
 import { isBizError } from '@/api/errors'
 import { formatYuan } from '@/utils/money'
+import { regionData } from 'element-china-area-data'
 
 const templates = ref<FreightTemplate[]>([])
 const loading = ref(false)
@@ -54,6 +55,68 @@ const form = reactive({
 /** 区域规则与排除区：编辑时在同一个弹窗里维护 */
 const regions = ref<RegionRuleInput[]>([])
 const excludes = ref<{ regionCode: string; reason?: string }[]>([])
+
+// ---------------------------------------------------------------------------
+// 区域选择
+//
+// 原来这两处都让商家**手填行政区划码**（「0 或 310115」「如 65（新疆）」）——
+// 他得先知道自己的区叫 310115 才填得出来；填错了也不报错，只会在买家结算时
+// 匹配不到规则、被「该地区不配送」拦住。现在改成选省/市/区，码由选择带出来。
+// ---------------------------------------------------------------------------
+
+/** 「全国默认」不是真实地区，只能挂在级联的最顶层 */
+const REGION_ALL = '0'
+
+const regionOptions = [{ value: REGION_ALL, label: '全国默认' }, ...regionData]
+
+/**
+ * 区域码 → 级联路径。
+ *
+ * 行政区划码（GB/T 2260）是**前缀结构**：``310115``（浦东新区）前 4 位是上海市辖区、
+ * 前 2 位是上海市。所以拿着码就能反推出整条路径，不必另存一份。
+ * 运费匹配用的就是这条性质（`freight/calculator.region_matches` 按前缀 startswith）。
+ */
+function pathOf(code: string): string[] {
+  if (!code) return []
+  if (code === REGION_ALL) return [REGION_ALL]
+  if (code.length === 6) return [code.slice(0, 2), code.slice(0, 4), code]
+  if (code.length === 4) return [code.slice(0, 2), code]
+  return [code]
+}
+
+/**
+ * 码本身带层级：长度 2/4/6 就是省/市/区。
+ *
+ * ★ ``region_level`` 后端存了、也回传，但**匹配时根本没用** ——
+ *   择优看的是 ``len(region_code)``（见 `calculator.pick_region_rule`）。
+ *   既然它只是个记录字段，就该从码推导，而不是让商家再选一次：
+ *   填了区码却把层级选成"省"这种矛盾，压根不该有机会出现。
+ */
+function levelOf(code: string): number {
+  if (code.length >= 6) return 3
+  if (code.length >= 4) return 2
+  return 1
+}
+
+/** 层级的展示文案（只读）。空码返回空串，行里不留占位 */
+function levelText(code: string): string {
+  if (code === REGION_ALL) return '全国'
+  if (!code) return ''
+  return ['', '省', '市', '区'][levelOf(code)] ?? ''
+}
+
+/** 区域规则：写入码，层级跟着推导出来 */
+function onRegionPick(row: RegionRuleInput, codes: unknown): void {
+  const path = Array.isArray(codes) ? (codes as string[]) : []
+  row.regionCode = path[path.length - 1] ?? ''
+  row.regionLevel = levelOf(row.regionCode)
+}
+
+/** 排除区没有层级字段，只写码 */
+function onExcludePick(row: { regionCode: string }, codes: unknown): void {
+  const path = Array.isArray(codes) ? (codes as string[]) : []
+  row.regionCode = path[path.length - 1] ?? ''
+}
 
 async function load(): Promise<void> {
   loading.value = true
@@ -394,23 +457,29 @@ onMounted(load)
 
       <el-divider>区域规则</el-divider>
       <p class="section-hint">
-        配置了区域规则就必须保留一条「全国默认」（区域码填 <code>0</code>），
-        否则其他地区一条规则都匹配不到，买家会被「该地区不配送」拦住。
+        配置了区域规则就必须保留一条「全国默认」，否则其他地区一条规则都匹配不到，
+        买家会被「该地区不配送」拦住。规则可以配到省 / 市 / 区任意一级，
+        越具体越优先。
       </p>
 
       <el-table :data="regions" size="small" class="mini-table">
-        <el-table-column label="区域码" width="140">
+        <el-table-column label="区域" width="240">
           <template #default="{ row }">
-            <el-input v-model="row.regionCode" size="small" placeholder="0 或 310115" />
+            <!-- check-strictly：允许停在任意一级（省 / 市 / 区都能当一条规则） -->
+            <el-cascader
+              size="small"
+              class="w-full"
+              :model-value="pathOf(row.regionCode)"
+              :options="regionOptions"
+              :props="{ checkStrictly: true, value: 'value', label: 'label' }"
+              placeholder="选省 / 市 / 区"
+              @change="(codes: unknown) => onRegionPick(row, codes)"
+            />
           </template>
         </el-table-column>
-        <el-table-column label="层级" width="110">
+        <el-table-column label="层级" width="70">
           <template #default="{ row }">
-            <el-select v-model="row.regionLevel" size="small">
-              <el-option :value="1" label="省" />
-              <el-option :value="2" label="市" />
-              <el-option :value="3" label="区" />
-            </el-select>
+            <span class="muted">{{ levelText(row.regionCode) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="首重" width="110">
@@ -443,9 +512,18 @@ onMounted(load)
 
       <el-divider>不发货区域</el-divider>
       <el-table :data="excludes" size="small" class="mini-table">
-        <el-table-column label="区域码" width="180">
+        <el-table-column label="区域" width="240">
           <template #default="{ row }">
-            <el-input v-model="row.regionCode" size="small" placeholder="如 65（新疆）" />
+            <!-- 同样允许停在任意一级：整个省不发货是最常见的配法 -->
+            <el-cascader
+              size="small"
+              class="w-full"
+              :model-value="pathOf(row.regionCode)"
+              :options="regionData"
+              :props="{ checkStrictly: true, value: 'value', label: 'label' }"
+              placeholder="选省 / 市 / 区"
+              @change="(codes: unknown) => onExcludePick(row, codes)"
+            />
           </template>
         </el-table-column>
         <el-table-column label="原因">
@@ -601,6 +679,11 @@ onMounted(load)
 .muted {
   color: var(--color-text-tertiary);
   font-size: var(--text-sm);
+}
+
+/* 级联控件默认只有内容宽，表格里要撑满它那一列 */
+.w-full {
+  width: 100%;
 }
 
 .form {

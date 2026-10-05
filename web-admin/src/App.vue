@@ -78,10 +78,13 @@ async function onLogout(): Promise<void> {
       <div class="header-inner">
         <RouterLink to="/" class="brand">
           <span class="brand-mark">eshop</span>
-          <span class="brand-sub">商家后台</span>
+          <span class="brand-sub">商家/平台后台</span>
         </RouterLink>
 
         <nav v-if="auth.isLoggedIn" class="nav">
+          <!-- 商品审核排第一：它是平台运营每天要处理的入口，比别的都常用。
+               商家账号看不到这一项（v-if="isPlatformAdmin"），所以对商家的菜单顺序没有影响。 -->
+          <RouterLink v-if="isPlatformAdmin" to="/audits" class="nav-link">商品审核</RouterLink>
           <!-- 商家菜单：判据是"有没有店铺"，和后端 /api/merchant/* 的判权方式一致。
                平台运营点进去只会弹「请先开通店铺」，索性不给看。 -->
           <RouterLink v-if="hasShop" to="/" class="nav-link">我的商品</RouterLink>
@@ -90,7 +93,6 @@ async function onLogout(): Promise<void> {
           <RouterLink v-if="hasShop" to="/aftersales" class="nav-link">售后</RouterLink>
           <!-- 评价两边都能看：商家看本店、运营看审核队列，页面内部自己分会话 -->
           <RouterLink v-if="hasShop || isAdmin" to="/reviews" class="nav-link">评价</RouterLink>
-          <RouterLink v-if="isPlatformAdmin" to="/audits" class="nav-link">商品审核</RouterLink>
           <RouterLink v-if="isPlatformAdmin" to="/categories" class="nav-link">类目</RouterLink>
           <RouterLink v-if="isAdmin" to="/promotions" class="nav-link">营销</RouterLink>
           <RouterLink v-if="isAdmin" to="/banners" class="nav-link">轮播图</RouterLink>

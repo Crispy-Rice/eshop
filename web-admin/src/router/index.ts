@@ -115,11 +115,26 @@ router.beforeEach(async (to) => {
   const auth = useAuthStore()
   if (auth.user === null) await auth.restore()
 
+  /**
+   * 平台运营账号没有店铺，`/`（我的商品）永远是空的 —— 一登录就看到一个空壳页面。
+   * 直接落到审核队列，它才是运营每天要处理的入口。
+   *
+   * ★ 只对 admin 生效：`/audits` 依赖后端的 `/api/admin/spus`，那条只放给 admin
+   *   （不含 finance），把财务也送过去只会撞 403。
+   * ★ 带 `!shopId` 是双保险：平台账号本来就禁止开店，正常不会命中，
+   *   但真出现"既是 admin 又有店铺"的账号时，不该把它从自己的商品页赶走。
+   */
+  const platformOnly = auth.user?.role === 'admin' && !auth.user?.shopId
+
   if (to.meta.requiresAuth && !auth.isLoggedIn) {
     return { name: 'login', query: { redirect: to.fullPath } }
   }
   if (to.meta.guestOnly && auth.isLoggedIn) {
-    return { name: 'products' }
+    return platformOnly ? { name: 'product-audits' } : { name: 'products' }
+  }
+  // 点 logo、手敲 "/"、或登录后的默认跳转，都会走到这里
+  if (to.name === 'products' && platformOnly) {
+    return { name: 'product-audits' }
   }
   return true
 })

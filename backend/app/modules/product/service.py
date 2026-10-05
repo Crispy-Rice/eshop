@@ -18,9 +18,12 @@ from app.modules.files import storage
 from app.modules.product import repository as repo
 from app.modules.product.models import (
     SPU_DRAFT,
+    SPU_NOT_APPROVED,
     SPU_OFF_SHELF,
     SPU_ON_SHELF,
     SPU_PENDING_AUDIT,
+    SPU_REJECTED,
+    SPU_SUBMITTABLE,
     Category,
     Sku,
     SkuSpec,
@@ -510,17 +513,19 @@ async def update_sku(session: AsyncSession, shop_id: int, sku_id: int, req: SkuU
 
 async def submit_for_audit(session: AsyncSession, shop_id: int, spu_id: int) -> None:
     spu = await _get_owned_spu(session, shop_id, spu_id)
-    if spu.status != SPU_DRAFT:
-        raise BizError(ErrorCode.VALIDATION_ERROR, "只有草稿状态的商品可以提交审核")
+    if spu.status not in SPU_SUBMITTABLE:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "只有草稿或被驳回的商品可以提交审核")
     await repo.update_spu_fields(session, spu_id, {"status": SPU_PENDING_AUDIT})
 
 
 async def audit_spu(session: AsyncSession, spu_id: int, req: SpuAuditRequest) -> None:
-    """平台审核。通过 → 上架；不通过 → 退回草稿，商家修改后可再次提交。
+    """平台审核。通过 → 上架；不通过 → 转「已驳回」，商家修改后可再次提交。
 
     ★ 审核意见**落库**（``audit_remark``）：驳回时写理由、通过时清空。
       这个接口从第一天就收 ``remark``，但一直没有存 —— 驳回后商品只是悄悄回到
       "草稿"，商家不知道要改什么。现在理由会显示在商家自己的商品详情里。
+    ★ 驳回落到 ``SPU_REJECTED`` 而不是 ``SPU_DRAFT``：两者对商家的含义完全不同 ——
+      一个是"我还没写完"，一个是"平台让我改"。
     """
     spu = await repo.get_spu(session, spu_id)
     if spu is None:
@@ -533,7 +538,7 @@ async def audit_spu(session: AsyncSession, spu_id: int, req: SpuAuditRequest) ->
         session,
         spu_id,
         {
-            "status": SPU_ON_SHELF if req.approved else SPU_DRAFT,
+            "status": SPU_ON_SHELF if req.approved else SPU_REJECTED,
             # 通过时清空：否则商家改完再提交，详情里还挂着上一次的驳回理由
             "audit_remark": None if req.approved else remark,
         },
@@ -545,7 +550,7 @@ async def on_shelf(session: AsyncSession, shop_id: int, spu_id: int) -> None:
     spu = await _get_owned_spu(session, shop_id, spu_id)
     if spu.status == SPU_ON_SHELF:
         return
-    if spu.status in (SPU_DRAFT, SPU_PENDING_AUDIT):
+    if spu.status in SPU_NOT_APPROVED:
         raise BizError(ErrorCode.VALIDATION_ERROR, "商品尚未通过审核")
     await repo.update_spu_fields(session, spu_id, {"status": SPU_ON_SHELF})
     await repo.update_sku_status_by_spu(session, spu_id, 1)
@@ -571,7 +576,7 @@ async def delete_spu(session: AsyncSession, shop_id: int, spu_id: int) -> None:
     - **审核中的不让删**：平台运营正在看这条商品，删掉之后那条审核接口会拿到
       404，运营那边只看到"商品不存在"，根本不知道发生了什么。
 
-    允许删的是：草稿、已下架、违规下架。
+    允许删的是：草稿、已驳回、已下架、违规下架。
     """
     spu = await _get_owned_spu(session, shop_id, spu_id)
 
@@ -734,16 +739,24 @@ async def list_admin_spus(
 
 
 async def get_spu_detail(
-    session: AsyncSession, spu_id: int, *, owner_shop_id: int | None = None
+    session: AsyncSession,
+    spu_id: int,
+    *,
+    owner_shop_id: int | None = None,
+    as_platform: bool = False,
 ) -> SpuDetailOut:
-    """商品详情。
+    """商品详情。**三个视角，访问控制就在下面那几行里**：
 
-    访问控制由 ``owner_shop_id`` 决定：
-    - 传了 shop_id：商家看自己的商品，**必须是自己的**，状态不限
-    - 没传：买家视角，只能看已上架的
+    - 买家（两个都不传）：只能看已上架的
+    - 商家（传 ``owner_shop_id``）：看自己的商品，状态不限
+    - 平台（``as_platform=True``）：看**任何店铺、任何状态**的商品 ——
+      审核要能看到"待审核"的，而那个状态恰恰是最看不到的
 
     ★ 不要用 "require_on_shelf=False 就跳过校验" 这种写法 —— 那等于
-    给任何登录商家开了查看别家未上架商品的权限。
+    给任何登录商家开了查看别家未上架商品的权限。三个视角各写一条明确的判断，
+    比一个布尔开关更容易看住。
+
+    ``as_platform`` 与 ``owner_shop_id`` 互斥（路由层只会传一个）。
 
     返回的 specGroups + skus 就是前端规格选择器需要的全部数据：
     每个 SKU 带着它的 specValueIds，前端据此推导"哪些规格值可选"
@@ -753,11 +766,14 @@ async def get_spu_detail(
     if spu is None:
         raise BizError(ErrorCode.NOT_FOUND, "商品不存在")
 
-    if owner_shop_id is not None:
-        if spu.shop_id != owner_shop_id:
-            # 一律 404：不区分"不存在"和"不是你的"，避免被用来探测商品
-            raise BizError(ErrorCode.NOT_FOUND, "商品不存在")
-    elif spu.status != SPU_ON_SHELF:
+    if as_platform:
+        visible = True
+    elif owner_shop_id is not None:
+        visible = spu.shop_id == owner_shop_id
+    else:
+        visible = spu.status == SPU_ON_SHELF
+    if not visible:
+        # 一律 404：不区分"不存在"和"不是你的"，避免被用来探测商品
         raise BizError(ErrorCode.NOT_FOUND, "商品不存在")
 
     groups = await repo.list_spec_groups(session, spu_id)
@@ -785,8 +801,8 @@ async def get_spu_detail(
         price_max=spu.price_max,
         total_sold=spu.total_sold,
         status=spu.status,
-        # ★ 只给店主看。买家视角下"图片太模糊，驳回"这种内部流程说明毫无意义
-        audit_remark=spu.audit_remark if owner_shop_id is not None else None,
+        # ★ 只给店主和平台看。买家视角下"图片太模糊，驳回"这种内部流程说明毫无意义
+        audit_remark=spu.audit_remark if (owner_shop_id is not None or as_platform) else None,
         spec_groups=[
             SpecGroupOut(id=g.id, name=g.name, values=values_by_group.get(g.id, [])) for g in groups
         ],

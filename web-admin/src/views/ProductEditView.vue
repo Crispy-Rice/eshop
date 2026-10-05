@@ -14,6 +14,7 @@ import {
   updateSpu,
   SPU_STATUS_TEXT,
   SPU_STATUS_TYPE,
+  SUBMITTABLE_STATUSES,
   type SkuDetail,
   type SpuDetail,
 } from '@/api/product'
@@ -28,6 +29,14 @@ const spuId = computed(() => String(route.params.spuId))
 const spu = ref<SpuDetail | null>(null)
 const loading = ref(false)
 const saving = ref(false)
+
+/**
+ * 是否处于「被平台驳回、等商家改」的状态。
+ *
+ * ★ 后端把驳回落在独立状态 6 上（不再复用草稿），所以这里就是一个等值判断。
+ *   以前靠"草稿 + 有审核意见"推导，是因为那时两者共用同一个状态值。
+ */
+const rejected = computed(() => spu.value?.status === 6)
 
 const form = reactive({ title: '', subTitle: '', mainImage: '' })
 /** skuId → 正在编辑的价格/重量（元 / 克） */
@@ -159,7 +168,13 @@ onMounted(load)
           </div>
           <div class="actions">
             <el-button @click="router.push('/')">返回列表</el-button>
-            <el-button v-if="spu.status === 1" type="primary" @click="act('submit')">提交审核</el-button>
+            <el-button
+              v-if="SUBMITTABLE_STATUSES.includes(spu.status)"
+              type="primary"
+              @click="act('submit')"
+            >
+              提交审核
+            </el-button>
             <el-button v-if="spu.status === 3" type="success" @click="act('on')">上架</el-button>
             <el-button v-if="spu.status === 2" type="warning" @click="act('off')">下架</el-button>
             <!-- 在售的要先下架、审核中的要等结果；后端也会挡，这里先不给点 -->
@@ -175,17 +190,22 @@ onMounted(load)
         </div>
       </template>
 
-      <!-- 被驳回的商品会退回草稿，这里把平台的驳回理由原样告诉商家 ——
-           否则商品只是悄悄回到"草稿"，商家不知道该改什么。
-           理由在通过审核时会被清空，所以只会出现在草稿态。 -->
-      <el-alert
-        v-if="spu.status === 1 && spu.auditRemark"
-        type="error"
-        :closable="false"
-        class="mb16"
-        show-icon
-      >
-        <template #title>平台驳回：{{ spu.auditRemark }}</template>
+      <!-- 驳回意见：这是商家在这一页**最需要看到**的东西，所以给它一块独立的版式。
+           原来把理由塞进 alert 的标题里（"平台驳回：xxx"），理由读起来像是标题的
+           后半句，而且没人告诉你改完该怎么办。现在：标题说发生了什么，
+           正文用大一号的字写**理由本身**，最后一行说下一步做什么。 -->
+      <el-alert v-if="rejected" type="error" :closable="false" show-icon class="reject mb16">
+        <template #title>审核未通过</template>
+        <template #default>
+          <!-- 后端允许"驳回但没写理由"（remark 为空时落 null），UI 会校验必填，
+               但真遇到空值时给一句话，好过留一块空白的红框 -->
+          <p class="reject-reason">
+            {{ spu.auditRemark || '平台没有写明具体理由，建议联系平台确认后再提交。' }}
+          </p>
+          <p class="reject-tip">
+            按上面的意见修改后，重新点右上角「提交审核」。审核通过后这条意见会自动清除。
+          </p>
+        </template>
       </el-alert>
 
       <el-alert type="warning" :closable="false" class="mb16">
@@ -324,6 +344,28 @@ onMounted(load)
 
 .mb16 {
   margin-bottom: var(--space-4);
+}
+
+/* 驳回意见：理由用正文尺寸 + 中等字重，比辅助说明更显眼 ——
+   它是这一页唯一"平台对你说的话"，不该和"长边超过 1280px 会压缩"一个分量。 */
+.reject {
+  /* 内容可能有两行以上，图标要顶对齐而不是跟着居中 */
+  align-items: flex-start;
+}
+
+.reject-reason {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  line-height: 1.6;
+  color: var(--color-text);
+}
+
+.reject-tip {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
 }
 
 .mr8 {

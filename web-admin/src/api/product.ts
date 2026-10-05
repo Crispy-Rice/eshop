@@ -95,13 +95,14 @@ export interface SpuCreateInput {
   skus: SkuIn[]
 }
 
-/** SPU 状态：1草稿 2上架 3下架 4违规下架 5待审核 */
+/** SPU 状态：1草稿 2上架 3下架 4违规下架 5待审核 6已驳回 */
 export const SPU_STATUS_TEXT: Record<number, string> = {
   1: '草稿',
   2: '已上架',
   3: '已下架',
   4: '违规下架',
   5: '待审核',
+  6: '已驳回',
 }
 
 export const SPU_STATUS_TYPE: Record<number, 'info' | 'success' | 'warning' | 'danger'> = {
@@ -110,7 +111,14 @@ export const SPU_STATUS_TYPE: Record<number, 'info' | 'success' | 'warning' | 'd
   3: 'warning',
   4: 'danger',
   5: 'warning',
+  6: 'danger',
 }
+
+/**
+ * 商家可以提交审核的状态：新建的草稿（1）和平台打回待改的（6）。
+ * 对应后端的 `models.SPU_SUBMITTABLE`，改一处要跟着改另一处。
+ */
+export const SUBMITTABLE_STATUSES: readonly number[] = [1, 6]
 
 // ---------- 接口 ----------
 
@@ -174,3 +182,12 @@ export const searchProducts = (params: { keyword?: string; limit?: number }) =>
 
 /** 公开的商品详情。用来把已配好的 `/products/<id>` 反查成商品名显示出来 */
 export const fetchPublicSpu = (spuId: string) => get<SpuDetail>(`/spus/${spuId}`)
+
+/**
+ * 平台视角的商品详情。**任何店铺、任何状态**都看得到，`auditRemark` 也给。
+ *
+ * ★ 审核页必须用它：`fetchMySpu`（`/merchant/spus/{id}`）按店铺归属判权，
+ *   平台运营没有店铺，必 403；`fetchPublicSpu` 只出已上架的，
+ *   而审核队列里全是**待审核**的。
+ */
+export const fetchAdminSpu = (spuId: string) => get<SpuDetail>(`/admin/spus/${spuId}`)

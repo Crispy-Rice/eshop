@@ -895,7 +895,7 @@ async def test_update_spu_title_rebuilds_search_text(client: AsyncClient, sessio
 # ============================================================
 
 
-async def test_audit_rejection_returns_product_to_draft(client: AsyncClient, session) -> None:
+async def test_audit_rejection_marks_product_rejected(client: AsyncClient, session) -> None:
     admin = await make_admin(client, session)
     category = await _make_category(client, admin["accessToken"], "手机")
     merchant = await register(client, phone="13800138010")
@@ -915,8 +915,122 @@ async def test_audit_rejection_returns_product_to_draft(client: AsyncClient, ses
     assert resp.status_code == 200
 
     detail = (await client.get(f"/api/merchant/spus/{spu_id}", headers=headers)).json()["data"]
-    assert detail["status"] == 1  # 退回草稿，商家可以改了再提交
+    # ★ 6 而不是 1：被驳回要和"从没提交过的草稿"分开，否则商家列表里两种货色长得一样
+    assert detail["status"] == 6
     assert (await client.get(f"/api/spus/{spu_id}")).status_code == 404
+
+
+async def test_rejected_product_can_resubmit_but_not_skip_audit(client: AsyncClient, session) -> None:
+    """被驳回的商品：改完能重新提交，但**不能跳过审核直接上架**。
+
+    ★ 「已驳回」独立成状态 6 之后，这两条边界必须盯住 ——
+      ``submit_for_audit`` 漏了 6，商家改完就卡死；``on_shelf`` 漏了 6，
+      等于驳回没有约束力。
+    """
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "手机")
+    merchant = await register(client, phone="13800138019")
+    await open_shop(client, merchant["accessToken"])
+    merchant_headers = auth_header(merchant["accessToken"])
+    admin_headers = auth_header(admin["accessToken"])
+
+    spu_id = (
+        await client.post(
+            "/api/merchant/spus", json=_spu_payload(category), headers=merchant_headers
+        )
+    ).json()["data"]["id"]
+    await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=merchant_headers)
+    await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": False, "remark": "价格不对"},
+        headers=admin_headers,
+    )
+
+    # 没过审核，不给直接上架
+    refused = await client.post(f"/api/merchant/spus/{spu_id}/on-shelf", headers=merchant_headers)
+    assert refused.status_code == 400
+
+    # 但可以重新提交审核
+    again = await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=merchant_headers)
+    assert again.status_code == 200, again.text
+    detail = (await client.get(f"/api/merchant/spus/{spu_id}", headers=merchant_headers)).json()["data"]
+    assert detail["status"] == 5
+
+
+async def test_merchant_list_can_filter_by_rejected_status(client: AsyncClient, session) -> None:
+    """★ 商家列表要能按「已驳回」筛。
+
+    这条盯的是**路由层的 status 上界**（``Query(le=...)``）。加了新状态却忘了放宽上界，
+    接口会直接 422 —— 前端拿到错误只会渲染一个空列表，看不出是坏了还是真没有，
+    是最难查的一种坏法。
+    """
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "手机")
+    merchant = await register(client, phone="13800138020")
+    await open_shop(client, merchant["accessToken"])
+    merchant_headers = auth_header(merchant["accessToken"])
+
+    spu_id = (
+        await client.post(
+            "/api/merchant/spus", json=_spu_payload(category), headers=merchant_headers
+        )
+    ).json()["data"]["id"]
+    await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=merchant_headers)
+    await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": False, "remark": "类目挂错了"},
+        headers=auth_header(admin["accessToken"]),
+    )
+
+    rejected = await client.get("/api/merchant/spus", params={"status": 6}, headers=merchant_headers)
+    assert rejected.status_code == 200, rejected.text
+    assert spu_id in [i["id"] for i in rejected.json()["data"]["items"]]
+
+    # 也不能同时挂在「草稿」下 —— 两档必须是分开的
+    drafts = await client.get("/api/merchant/spus", params={"status": 1}, headers=merchant_headers)
+    assert spu_id not in [i["id"] for i in drafts.json()["data"]["items"]]
+
+
+async def test_admin_can_view_pending_product_detail(client: AsyncClient, session) -> None:
+    """★ 平台要能看**待审核**商品的详情 —— 否则审核页只有一个缩略图就要点"通过"。
+
+    既有的两条路径都到不了这里：``/api/merchant/spus/{id}`` 按店铺归属判权
+    （运营没有店铺，必 403），公开的 ``/api/spus/{id}`` 只出已上架的。
+    """
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "手机")
+    merchant = await register(client, phone="13800138012")
+    await open_shop(client, merchant["accessToken"])
+    headers = auth_header(merchant["accessToken"])
+
+    spu_id = (await client.post("/api/merchant/spus", json=_spu_payload(category), headers=headers)).json()[
+        "data"
+    ]["id"]
+    await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=headers)
+
+    # 提交后就该看到，不必先审
+    detail = (await client.get(f"/api/admin/spus/{spu_id}", headers=auth_header(admin["accessToken"]))).json()
+    assert detail["code"] == "OK", detail
+    data = detail["data"]
+    assert data["status"] == 5, "审核队列里的就是这个状态"
+    assert len(data["skus"]) == 3, "审核要看得到全部 SKU，不是只有标题和缩略图"
+    assert data["specGroups"], "规格组也要能看到"
+
+    # 对照：同一件商品，买家那条路走不通
+    assert (await client.get(f"/api/spus/{spu_id}")).status_code == 404
+
+    # 非平台角色不能走这条接口 —— 它不做归属过滤，放给商家等于能看别家的商品
+    denied = await client.get(f"/api/admin/spus/{spu_id}", headers=headers)
+    assert denied.status_code == 403, denied.text
+
+    # 驳回后再看：平台自己写的理由要能看到（复提交时是审核的上下文）
+    await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": False, "remark": "主图太模糊"},
+        headers=auth_header(admin["accessToken"]),
+    )
+    again = (await client.get(f"/api/admin/spus/{spu_id}", headers=auth_header(admin["accessToken"]))).json()
+    assert again["data"]["auditRemark"] == "主图太模糊"
 
 
 async def test_cannot_shelf_before_audit(client: AsyncClient, session) -> None:
@@ -1289,7 +1403,7 @@ async def test_reject_reason_reaches_merchant(client: AsyncClient, session) -> N
             f"/api/merchant/spus/{spu_id}", headers=auth_header(merchant["accessToken"])
         )
     ).json()["data"]
-    assert detail["status"] == 1  # 回到草稿，改完可以再交
+    assert detail["status"] == 6  # 转「已驳回」，改完可以再交
     assert detail["auditRemark"] == "主图太模糊，换一张"
 
 

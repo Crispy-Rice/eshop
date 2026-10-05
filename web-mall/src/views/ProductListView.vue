@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
@@ -89,6 +89,45 @@ async function loadShopNames(list: SpuCard[]): Promise<void> {
   }
 }
 
+/**
+ * 一页铺几行。**页大小 = 列数 × 这个值**，不是写死的。
+ *
+ * ★ 列数是响应式的（`repeat(auto-fill, minmax(200px, 1fr))`）：宽屏 5 列、中等 4 列、
+ *   窄屏 3 列。写死一个数字，必然在某些宽度上剩半行 —— 原来写 12，
+ *   偏偏在 **5 列的宽屏上剩 2 张吊在最后一行**，而桌面默认就是 5 列。
+ *   取「列数 × 行数」之后，除了最后一页（总数本来就不整除），每一页都是整行。
+ */
+const SHELF_ROWS = 3
+
+/** 首次挂载还没量过列数，先用一个安全值，量完立刻覆盖 */
+const pageSize = ref(12)
+const shelfEl = ref<HTMLElement | null>(null)
+
+/** 网格当前几列。视口一变就变，所以每次现测，不能缓存 */
+function shelfColumns(): number {
+  const el = shelfEl.value
+  if (!el) return 0
+  return getComputedStyle(el).gridTemplateColumns.split(' ').filter(Boolean).length
+}
+
+/** 按当前列数定页大小。返回是否发生了变化 */
+function syncPageSize(): boolean {
+  const cols = shelfColumns()
+  if (!cols) return false
+  const next = cols * SHELF_ROWS
+  if (next === pageSize.value) return false
+  pageSize.value = next
+  return true
+}
+
+/**
+ * 列数变了要**重新取第一页** —— 页大小是"整行"的依据，旧的分页不再成立。
+ * 连续 resize 只会触发一次：列数不变时 `syncPageSize` 直接返回 false。
+ */
+function onResize(): void {
+  if (syncPageSize()) void load(true)
+}
+
 async function load(reset: boolean): Promise<void> {
   if (reset) {
     loading.value = true
@@ -106,7 +145,7 @@ async function load(reset: boolean): Promise<void> {
       priceTo: filters.priceTo === undefined ? undefined : yuanToFen(filters.priceTo),
       sort: filters.sort,
       cursor: reset ? null : nextCursor.value,
-      limit: 12,
+      limit: pageSize.value,
     })
 
     items.value = reset ? result.items : [...items.value, ...result.items]
@@ -231,6 +270,10 @@ onMounted(async () => {
   const fromQuery = route.query.categoryId
   if (typeof fromQuery === 'string') filters.categoryId = fromQuery
 
+  // ★ 页大小要在**第一次请求之前**定下来，否则第一页取错数量、还得再重来一次
+  syncPageSize()
+  window.addEventListener('resize', onResize)
+
   try {
     categories.value = await fetchCategoryTree()
   } catch {
@@ -238,6 +281,8 @@ onMounted(async () => {
   }
   await load(true)
 })
+
+onBeforeUnmount(() => window.removeEventListener('resize', onResize))
 </script>
 
 <template>
@@ -320,7 +365,9 @@ onMounted(async () => {
     <div v-loading="loading" class="shelf-wrap">
       <el-empty v-if="searched && items.length === 0" description="没有找到符合条件的商品" />
 
-      <div v-else class="shelf">
+      <!-- v-show 而不是 v-else：网格要**一直在 DOM 里**才量得到列数。
+           挂载时 searched 还是 false，所以这一刻它是可见的、量得准 -->
+      <div v-show="!(searched && items.length === 0)" ref="shelfEl" class="shelf">
         <a
           v-for="item in items"
           :key="item.id"

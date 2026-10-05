@@ -50,6 +50,9 @@ const noShopHint = computed(() =>
 const statusTabs = [
   { label: '全部', value: undefined },
   { label: '草稿', value: 1 },
+  // 已驳回单独一档：它和草稿是两件事 —— 一个是"我还没写完"，
+  // 一个是"平台打回来了，等我改"。混在一起商家不知道先动哪个。
+  { label: '已驳回', value: 6 },
   { label: '待审核', value: 5 },
   { label: '已上架', value: 2 },
   { label: '已下架', value: 3 },

@@ -33,12 +33,24 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base import TS, Base
 
-# SPU 状态。审核不通过会退回草稿（4 是平台强制下架的违规商品，与审核无关）
+# SPU 状态。4 是平台强制下架的违规商品，与审核无关。
 SPU_DRAFT = 1
 SPU_ON_SHELF = 2
 SPU_OFF_SHELF = 3
 SPU_BANNED = 4
 SPU_PENDING_AUDIT = 5
+# 平台驳回：商家按审核意见改完可以再提交。
+# ★ 以前驳回是复用 SPU_DRAFT 的，于是"从没提交过"和"打回来待改"在商家列表里
+#   长得一模一样 —— 商家分不清哪些是自己没写完的、哪些是等着他动手改的。
+SPU_REJECTED = 6
+
+# 商家可以提交审核的状态：新建的草稿，和被打回待修改的。
+# ★ 用具名集合而不是散落的 ``status in (1, 6)``：以后再加一个"可提交"的状态时，
+#   只改这里，不会漏掉某个分支。
+SPU_SUBMITTABLE = (SPU_DRAFT, SPU_REJECTED)
+
+# 还没通过平台审核的状态 —— 不允许直接上架，必须先走审核。
+SPU_NOT_APPROVED = (SPU_DRAFT, SPU_PENDING_AUDIT, SPU_REJECTED)
 
 # SKU 状态：只跟随 SPU，单独下架某个 SKU 用不到（下架 SPU 即可）
 SKU_OFF_SHELF = 2
@@ -126,7 +138,7 @@ class Spu(Base):
         SmallInteger,
         nullable=False,
         server_default=text("1"),
-        comment="1草稿 2上架 3下架 4违规下架 5待审核",
+        comment="1草稿 2上架 3下架 4违规下架 5待审核 6已驳回",
     )
     # 最近一次审核意见。驳回时写理由、通过时清空 —— 商家要在自己的商品上看到它，
     # 否则商品只是悄悄回到"草稿"，商家不知道改什么（接口一直收 remark，但原先没存）
