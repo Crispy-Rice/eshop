@@ -15,6 +15,8 @@ export interface SpuCard {
   categoryId: string
   title: string
   mainImage: string
+  /** 640 中间档。卡片用它渲染；缺失时回退到 mainImage */
+  mainImageMid: string
   priceMin: number
   priceMax: number
   totalSold: number
@@ -66,6 +68,8 @@ export interface SpuList {
   items: SpuCard[]
   hasMore: boolean
   nextCursor: string | null
+  /** 符合条件的总数。**只有第一页给**（翻页时是 null），拿不到就退回"已显示 N 件" */
+  total: number | null
 }
 
 export type SearchSort = 'relevance' | 'sales' | 'newest' | 'price_asc' | 'price_desc'

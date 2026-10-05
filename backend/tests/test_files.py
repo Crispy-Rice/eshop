@@ -53,7 +53,7 @@ def _exif_with_gps() -> bytes:
 # ============================================================
 def test_normalises_long_edge() -> None:
     """长边归一化到 1280（原图直出可能两三 MB 一张）。"""
-    full, _thumb, width, height = storage.process_image(_image_bytes(size=(3000, 1500)))
+    full, _mid, _thumb, width, height = storage.process_image(_image_bytes(size=(3000, 1500)))
     assert max(width, height) == storage.LONG_EDGE
     out = Image.open(BytesIO(full))
     assert out.format == "WEBP"
@@ -62,18 +62,29 @@ def test_normalises_long_edge() -> None:
 
 def test_small_image_is_not_upscaled() -> None:
     """小图不放大 —— 放大只会变糊并浪费存储。"""
-    _full, _thumb, width, height = storage.process_image(_image_bytes(size=(300, 200)))
+    _full, _mid, _thumb, width, height = storage.process_image(_image_bytes(size=(300, 200)))
     assert (width, height) == (300, 200)
 
 
 def test_thumbnail_is_200px() -> None:
-    _full, thumb, _w, _h = storage.process_image(_image_bytes(size=(3000, 1500)))
+    _full, _mid, thumb, _w, _h = storage.process_image(_image_bytes(size=(3000, 1500)))
     assert max(Image.open(BytesIO(thumb)).size) == storage.THUMB_EDGE
+
+
+def test_middle_tier_is_640px() -> None:
+    """640 中间档给商品卡片用：卡片宽 200~260，2x 屏要 ~520。
+
+    加这一档就是因为卡片原来直接吃 1280 的 full —— 多送 5~6 倍像素。
+    """
+    _full, mid, _thumb, _w, _h = storage.process_image(_image_bytes(size=(3000, 1500)))
+    assert max(Image.open(BytesIO(mid)).size) == storage.MID_EDGE
+    # 三档从同一张归一化后的图缩出来，尺度必须严格递减
+    assert storage.THUMB_EDGE < storage.MID_EDGE < storage.LONG_EDGE
 
 
 def test_exif_and_gps_are_stripped() -> None:
     """★ 重编码后 EXIF 与 GPS 必须全部消失。"""
-    full, thumb, _w, _h = storage.process_image(_image_bytes(exif=_exif_with_gps()))
+    full, _mid, thumb, _w, _h = storage.process_image(_image_bytes(exif=_exif_with_gps()))
     for data in (full, thumb):
         out = Image.open(BytesIO(data))
         assert len(out.getexif()) == 0, "重编码必须丢弃全部元数据"
@@ -88,7 +99,7 @@ def test_orientation_is_applied_then_dropped() -> None:
     buf = BytesIO()
     im.save(buf, format="JPEG", exif=exif.tobytes())
 
-    _full, _thumb, width, height = storage.process_image(buf.getvalue())
+    _full, _mid, _thumb, width, height = storage.process_image(buf.getvalue())
     assert (width, height) == (200, 400), "EXIF 里的方向应当已经被应用到像素上"
 
 
@@ -143,8 +154,11 @@ def test_path_rejects_unknown_biz() -> None:
         storage.build_path(biz="../../etc", user_id=1)
 
 
-def test_thumb_path_convention() -> None:
+def test_derived_path_convention() -> None:
+    """两档派生图都靠后缀约定推出来，库里只存原图路径。"""
     assert storage.thumb_path_of("reviews/1/ab.webp") == "reviews/1/ab_t.webp"
+    assert storage.mid_path_of("reviews/1/ab.webp") == "reviews/1/ab_m.webp"
+    assert storage.mid_path_of("products/9/x.webp") == "products/9/x_m.webp"
 
 
 def test_absolute_path_blocks_traversal() -> None:
@@ -192,6 +206,8 @@ async def test_upload_endpoint_returns_paths(client: AsyncClient, buyer: dict) -
     assert data["path"].startswith("reviews/"), "入库用的相对路径要带 reviews/ 前缀"
     assert not data["path"].startswith("/"), "入库路径不带前导斜杠"
     assert data["url"].startswith("/media/")
+    assert data["midPath"].endswith("_m.webp")
+    assert data["midUrl"].startswith("/media/")
     assert data["thumbPath"].endswith("_t.webp")
     assert data["thumbUrl"].startswith("/media/")
     assert data["width"] > 0
@@ -270,12 +286,14 @@ async def test_uploaded_file_lands_on_disk_as_webp(client: AsyncClient, buyer: d
     data = resp.json()["data"]
 
     full = storage.absolute_path(data["path"])
+    mid = storage.absolute_path(data["midPath"])
     thumb = storage.absolute_path(data["thumbPath"])
-    assert full.exists() and thumb.exists()
+    assert full.exists() and mid.exists() and thumb.exists()
 
     im = Image.open(full)
     assert im.format == "WEBP"
     assert max(im.size) == storage.LONG_EDGE, "落盘的应当是归一化之后的图"
+    assert max(Image.open(mid).size) == storage.MID_EDGE
     assert max(Image.open(thumb).size) == storage.THUMB_EDGE
 
     # url 只是给前端拼的，路径前缀与 media_url_prefix 一致即可

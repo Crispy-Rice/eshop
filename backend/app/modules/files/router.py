@@ -48,20 +48,23 @@ async def upload_image(
         )
 
     # ★ 解码与重编码是同步 CPU 操作，必须丢到线程池，不能阻塞事件循环
-    full, thumb, width, height = await anyio.to_thread.run_sync(storage.process_image, raw)
+    rendered = await anyio.to_thread.run_sync(storage.process_image, raw)
 
     path = storage.build_path(biz=biz, user_id=user.id)
-    await anyio.to_thread.run_sync(storage.save_image, path, full, thumb)
+    await anyio.to_thread.run_sync(storage.save_image, path, rendered)
 
     prefix = settings.media_url_prefix
+    mid_path = storage.mid_path_of(path)
     thumb_path = storage.thumb_path_of(path)
     return ApiResponse.ok(
         ImageUploadOut(
             path=path,
             url=f"{prefix}{path}",
+            mid_path=mid_path,
+            mid_url=f"{prefix}{mid_path}",
             thumb_path=thumb_path,
             thumb_url=f"{prefix}{thumb_path}",
-            width=width,
-            height=height,
+            width=rendered.width,
+            height=rendered.height,
         )
     )

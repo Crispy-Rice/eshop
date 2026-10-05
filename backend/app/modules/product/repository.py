@@ -182,6 +182,45 @@ async def list_spus_by_ids(session: AsyncSession, spu_ids: Sequence[int]) -> lis
     return list(result)
 
 
+def _spu_filters(
+    *,
+    keywords: Sequence[str],
+    category_ids: Sequence[int] | None,
+    price_from: int | None,
+    price_to: int | None,
+    shop_id: int | None,
+    status: int | None,
+    on_shelf_only: bool,
+) -> list[Any]:
+    """搜索的过滤条件。
+
+    ★ **列表查询和计数必须共用这一份**。两边各写一遍，早晚会漂：
+      界面上写着"共 30 件"，翻到底只有 28 件，而且没人知道是哪边错了。
+
+    - ``keywords``：按空格拆好的词，每个词都要命中 search_text（AND 语义）
+    - 价格区间用「区间相交」判断：``price_max >= from AND price_min <= to``
+    """
+    conds: list[Any] = [Spu.deleted.is_(False)]
+
+    if on_shelf_only:
+        conds.append(Spu.status == 2)
+    if status is not None:
+        conds.append(Spu.status == status)
+    if shop_id is not None:
+        conds.append(Spu.shop_id == shop_id)
+    if category_ids:
+        conds.append(Spu.category_id.in_(category_ids))
+    if price_from is not None:
+        conds.append(Spu.price_max >= price_from)
+    if price_to is not None:
+        conds.append(Spu.price_min <= price_to)
+    for word in keywords:
+        # 转义 LIKE 的通配符，避免用户输入 % 把全表带出来
+        escaped = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds.append(Spu.search_text.ilike(f"%{escaped}%", escape="\\"))
+    return conds
+
+
 async def search_spus(
     session: AsyncSession,
     *,
@@ -196,36 +235,57 @@ async def search_spus(
     cursor_clause: Any | None,
     limit: int,
 ) -> list[Spu]:
-    """搜索/浏览商品。
-
-    - ``keywords``：按空格拆好的词，每个词都要命中 search_text（AND 语义）
-    - 价格区间用「区间相交」判断：``price_max >= from AND price_min <= to``
-    - 分页用游标（行值比较），不用 OFFSET
-    """
-    stmt: Select[Any] = select(Spu).where(Spu.deleted.is_(False))
-
-    if on_shelf_only:
-        stmt = stmt.where(Spu.status == 2)
-    if status is not None:
-        stmt = stmt.where(Spu.status == status)
-    if shop_id is not None:
-        stmt = stmt.where(Spu.shop_id == shop_id)
-    if category_ids:
-        stmt = stmt.where(Spu.category_id.in_(category_ids))
-    if price_from is not None:
-        stmt = stmt.where(Spu.price_max >= price_from)
-    if price_to is not None:
-        stmt = stmt.where(Spu.price_min <= price_to)
-    for word in keywords:
-        # 转义 LIKE 的通配符，避免用户输入 % 把全表带出来
-        escaped = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        stmt = stmt.where(Spu.search_text.ilike(f"%{escaped}%", escape="\\"))
+    """搜索/浏览商品。分页用游标（行值比较），不用 OFFSET。"""
+    stmt: Select[Any] = select(Spu).where(
+        *_spu_filters(
+            keywords=keywords,
+            category_ids=category_ids,
+            price_from=price_from,
+            price_to=price_to,
+            shop_id=shop_id,
+            status=status,
+            on_shelf_only=on_shelf_only,
+        )
+    )
     if cursor_clause is not None:
         stmt = stmt.where(cursor_clause)
 
     stmt = stmt.order_by(*order_by).limit(limit)
     result = await session.scalars(stmt)
     return list(result)
+
+
+async def count_spus(
+    session: AsyncSession,
+    *,
+    keywords: list[str],
+    category_ids: list[int] | None,
+    price_from: int | None,
+    price_to: int | None,
+    shop_id: int | None,
+    status: int | None,
+    on_shelf_only: bool,
+) -> int:
+    """同条件下的**总数**，给"共 N 件商品"用。
+
+    参数和 :func:`search_spus` 一字不差（游标除外）—— 条件共用 ``_spu_filters``，
+    所以两边不可能对不上。
+
+    ★ 这是一次额外的 COUNT，**只在需要总数的调用方那里跑**（见 service.search_products），
+      不是每次翻页都跑。
+    """
+    stmt = select(func.count()).select_from(Spu).where(
+        *_spu_filters(
+            keywords=keywords,
+            category_ids=category_ids,
+            price_from=price_from,
+            price_to=price_to,
+            shop_id=shop_id,
+            status=status,
+            on_shelf_only=on_shelf_only,
+        )
+    )
+    return int(await session.scalar(stmt) or 0)
 
 
 def row_value_cursor(column: Any, value: Any, row_id: int, *, descending: bool) -> Any:

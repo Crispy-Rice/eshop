@@ -248,6 +248,11 @@ class SpuCardOut(CamelModel):
     category_id: SnowflakeId
     title: str
     main_image: str
+    # ★ 640 档，**卡片渲染用它**。卡片宽 200~260 CSS px，直接吃 1280 的原图等于
+    #   多送 5~6 倍像素；真实照片一张 100~300KB，一屏 12 张就是一两个 MB。
+    #   故意保留 main_image 不替换：`_m` 文件缺失时（老上传、手工放进目录的图）
+    #   前端要能回退到它，而不是直接裂图。
+    main_image_mid: str
     price_min: int
     price_max: int
     total_sold: int
@@ -285,3 +290,7 @@ class SpuListOut(CamelModel):
     items: list[SpuCardOut]
     has_more: bool
     next_cursor: str | None = None
+    # ★ **可空**：只有商城搜索接口会数总数，而且只在第一页给。
+    #   商家/运营列表页没有这个文案，不该替它们白跑一次 COUNT；
+    #   翻页时也早就在首页拿过了。前端拿不到就退回"已显示 N 件"。
+    total: int | None = None

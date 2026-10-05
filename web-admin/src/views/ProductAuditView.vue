@@ -12,7 +12,7 @@ import {
   type SpuCard,
 } from '@/api/product'
 import { formatPriceRange } from '@/utils/money'
-import { onImageError, placeholderImage } from '@/utils/placeholder'
+import { onImageError, thumbFallback, thumbSrc } from '@/utils/placeholder'
 
 /**
  * 平台审核只列这三档。
@@ -182,7 +182,8 @@ onMounted(load)
           <template #default="{ row }">
             <div class="cell-product">
               <img
-                :src="row.mainImage || placeholderImage(row.title)"
+                :src="thumbSrc(row.mainImage, row.mainImageMid, row.title)"
+                :data-fallback-src="thumbFallback(row.mainImage, row.mainImageMid)"
                 class="thumb"
                 :alt="row.title"
                 @error="onImageError"

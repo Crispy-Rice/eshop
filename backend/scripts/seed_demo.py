@@ -132,18 +132,101 @@ def demo_png(title: str, caption: str = "") -> bytes:
     return buf.getvalue()
 
 
+# ---------------------------------------------------------------------------
+# 真实演示图（demo_assets/）
+# ---------------------------------------------------------------------------
+# 素材由 ``fetch_demo_images.py`` 从 Pixabay 拉下来，逐张留档在
+# ``demo_assets/ATTRIBUTION.md``。**目录不存在时整条链路回退到生成图**，
+# 所以没跑过那个脚本也能正常 seed。
+ASSETS_DIR = Path(__file__).resolve().parent / "demo_assets" / "products"
+
+# 商品标题 → 素材 slug。slug 就是素材文件名（``hoodie.webp`` → ``"hoodie"``）。
+#
+# ★ 用标题当键、不往商品 spec 里塞 slug：spec 是"商品数据"，slug 是"演示素材
+#   从哪来的"，两者生命周期不同 —— 换一批图不该动商品定义。
+IMAGE_ASSETS: dict[str, str] = {
+    "纯棉基础款卫衣": "hoodie",
+    "每日坚果礼盒": "nuts",
+    "可调哑铃 20kg": "dumbbell",
+    "双门冰箱": "fridge",
+    "台式主机 战 700": "desktop",
+    "三体（全集）": "novel",
+    "平板微波炉 20L": "microwave",
+    "磁吸手机壳": "phonecase",
+    "考研英语真题集": "textbook",
+    "iPhone 16 Pro": "iphone",
+    "小米 14": "xiaomi14",
+    "小米 15 Ultra": "xiaomi15",
+    "滚筒洗衣机 10kg": "washer",
+    "IH 电饭煲": "ricecooker",
+    "儿童绘本套装": "picturebook",
+    "轻薄本 Air 14": "laptop",
+    "无线降噪耳机": "headphones",
+    "轻量跑鞋": "runningshoes",
+    "法式碎花连衣裙": "dress",
+    "桌面蓝牙音箱": "speaker",
+    "精品挂耳咖啡": "coffee",
+    "针织开衫": "cardigan",
+    "通勤衬衫裙": "shirtdress",
+    "黄油曲奇礼盒": "cookies",
+    "明前龙井": "greentea",
+    "复古板鞋": "canvasshoes",
+    "瑜伽垫": "yogamat",
+    "精装名著套装": "classics",
+    "立体翻翻书": "popupbook",
+    "雅思核心词汇": "vocab",
+}
+
+# 轮播图素材。**这些是已经裁成 10:3 的成品**（1200×360），不是原图 ——
+# 横幅和卡片不一样，卡片 1:1 居中裁掉的多半是背景，横幅 10:3 拿普通横图去
+# `object-fit: cover` 会拦腰截掉一半。裁切在 fetch_demo_images.py 里做。
+BANNERS_DIR = Path(__file__).resolve().parent / "demo_assets" / "banners"
+
+# 轮播图标题 → 素材 slug
+BANNER_ASSETS: dict[str, str] = {
+    "新品首发": "new",
+    "数码好物": "digital",
+    "全场包邮": "freeship",
+}
+
+
+def _asset_for(title: str) -> Path | None:
+    """这个商品有真实素材吗。没有就返回 None，调用方回退到生成图。"""
+    return _pick_asset(IMAGE_ASSETS, ASSETS_DIR, title)
+
+
+def _pick_asset(mapping: dict[str, str], directory: Path, title: str) -> Path | None:
+    slug = mapping.get(title)
+    if not slug:
+        return None
+    path = directory / f"{slug}.webp"
+    return path if path.exists() else None
+
+
 def upload_demo_image(
-    client: httpx.Client, headers: dict[str, str], *, title: str, caption: str = ""
+    client: httpx.Client,
+    headers: dict[str, str],
+    *,
+    title: str,
+    caption: str = "",
+    asset: Path | None = None,
 ) -> str:
-    """画一张图并走真实上传接口传上去，返回可直接入库的 url。
+    """上传一张演示图，返回可直接入库的 url。
 
     走接口而不是直接写文件：这样种子数据走的是和商家上传**完全一样**的路径
-    （判型、重编码、缩略图、路径白名单都会被真的走一遍）。
+    （判型、重编码、三档派生图、路径白名单都会被真的走一遍）。
+
+    ``asset`` 给定时传那个文件（真实照片），否则按标题画一张生成图。
     """
+    if asset is not None:
+        name, data, mime = f"{asset.stem}.webp", asset.read_bytes(), "image/webp"
+    else:
+        name, data, mime = f"{_seed_of(title)[:8]}.png", demo_png(title, caption), "image/png"
+
     resp = client.post(
         "/files/images",
         params={"biz": "products"},
-        files={"file": (f"{_seed_of(title)[:8]}.png", demo_png(title, caption), "image/png")},
+        files={"file": (name, data, mime)},
         headers=headers,
     )
     return unwrap(resp)["url"]
@@ -188,12 +271,23 @@ def banner_png(title: str) -> bytes:
     return buf.getvalue()
 
 
-def upload_banner_image(client: httpx.Client, headers: dict[str, str], *, title: str) -> str:
-    """画一张轮播图并走真实上传接口传上去（biz=banners），返回可入库的 url。"""
+def upload_banner_image(
+    client: httpx.Client, headers: dict[str, str], *, title: str, asset: Path | None = None
+) -> str:
+    """上传一张轮播图（biz=banners），返回可入库的 url。
+
+    ``asset`` 给定时传那个文件（已裁成 10:3 的真实照片），否则画一张渐变。
+    """
+    if asset is not None:
+        name, data, mime = f"banner-{asset.stem}.webp", asset.read_bytes(), "image/webp"
+    else:
+        name = f"banner-{_seed_of(title)[:8]}.png"
+        data, mime = banner_png(title), "image/png"
+
     resp = client.post(
         "/files/images",
         params={"biz": "banners"},
-        files={"file": (f"banner-{_seed_of(title)[:8]}.png", banner_png(title), "image/png")},
+        files={"file": (name, data, mime)},
         headers=headers,
     )
     return unwrap(resp)["url"]
@@ -371,13 +465,18 @@ def ensure_banners(
     *,
     category_ids: dict[str, str],
     spu_ids: dict[str, str],
-) -> int:
-    """三条演示轮播图。按标题幂等，已存在的跳过（不重传图）。
+    force: bool = False,
+) -> tuple[int, int]:
+    """三条演示轮播图，返回 ``(新建数, 换图数)``。
 
     落地页用**真实存在**的商品 / 类目 id：填一个不存在的路径，点进去就是 404，
     演示时反而露怯。
+
+    ``force=True``（``--reimage``）时把已有的图换成 ``demo_assets/banners/`` 里的真图。
+    和商品那边同理：换图**没法从 url 推断**（旧图也是 ``/media/banners/...``），
+    只能显式要求。不 force 时已存在就原样不动。
     """
-    existing = {b["title"] for b in unwrap(client.get("/admin/banners", headers=admin_h))}
+    existing = {b["title"]: b for b in unwrap(client.get("/admin/banners", headers=admin_h))}
 
     iphone_id = spu_ids.get("iPhone 16 Pro")
     specs: list[tuple[str, str | None]] = [
@@ -386,11 +485,23 @@ def ensure_banners(
         ("全场包邮", None),
     ]
 
-    created = 0
+    created = updated = 0
     for index, (title, link) in enumerate(specs):
-        if title in existing:
+        asset = _pick_asset(BANNER_ASSETS, BANNERS_DIR, title)
+        current = existing.get(title)
+
+        if current is not None:
+            if force and asset is not None:
+                image = upload_banner_image(client, admin_h, title=title, asset=asset)
+                unwrap(
+                    client.put(
+                        f"/admin/banners/{current['id']}", json={"image": image}, headers=admin_h
+                    )
+                )
+                updated += 1
             continue
-        image = upload_banner_image(client, admin_h, title=title)
+
+        image = upload_banner_image(client, admin_h, title=title, asset=asset)
         unwrap(
             client.post(
                 "/admin/banners",
@@ -399,7 +510,7 @@ def ensure_banners(
             )
         )
         created += 1
-    return created
+    return created, updated
 
 
 def ensure_buyer(client: httpx.Client) -> dict[str, str]:
@@ -742,6 +853,17 @@ def _more_products(category_ids: dict[str, str]) -> list[dict]:
     """
     return [
         _simple_product(
+            category_ids["智能手机"],
+            "小米 14",
+            "徕卡光学 · 骁龙 8 Gen 3",
+            "版本",
+            [
+                ("std", "标准版 12+256", 399900, 193),
+                ("pro", "Pro 版 16+512", 499900, 200),
+            ],
+            sku_prefix="MI14",
+        ),
+        _simple_product(
             category_ids["笔记本"],
             "轻薄本 Air 14",
             "2.8K 屏 · 16G+512G",
@@ -933,6 +1055,106 @@ def _more_products(category_ids: dict[str, str]) -> list[dict]:
             ],
             sku_prefix="BK-EXAM",
         ),
+        # ---- 第二件：让热门类目点进去不止一个商品 ----
+        _simple_product(
+            category_ids["上衣"],
+            "针织开衫",
+            "羊毛混纺 · 宽松版",
+            "尺码",
+            [
+                ("m", "M", 26900, 420),
+                ("l", "L", 26900, 450),
+            ],
+            sku_prefix="CL-CARDIGAN",
+        ),
+        _simple_product(
+            category_ids["连衣裙"],
+            "通勤衬衫裙",
+            "纯棉 · 收腰",
+            "尺码",
+            [
+                ("s", "S", 39900, 380),
+                ("m", "M", 39900, 400),
+            ],
+            sku_prefix="CL-SHIRTD",
+        ),
+        _simple_product(
+            category_ids["休闲零食"],
+            "黄油曲奇礼盒",
+            "手工烘焙 · 12 枚",
+            "规格",
+            [
+                ("one", "单盒", 6900, 320),
+                ("gift", "礼盒装", 12900, 680),
+            ],
+            sku_prefix="FD-COOKIE",
+        ),
+        _simple_product(
+            category_ids["饮料冲调"],
+            "明前龙井",
+            "核心产区 · 罐装",
+            "规格",
+            [
+                ("g50", "50g 罐装", 12800, 120),
+                ("g100", "100g 罐装", 23800, 240),
+            ],
+            sku_prefix="DR-LONGJING",
+        ),
+        _simple_product(
+            category_ids["运动鞋"],
+            "复古板鞋",
+            "牛皮鞋面 · 橡胶底",
+            "尺码",
+            [
+                ("40", "40 码", 32900, 900),
+                ("42", "42 码", 32900, 950),
+            ],
+            sku_prefix="SP-CANVAS",
+        ),
+        _simple_product(
+            category_ids["健身器材"],
+            "瑜伽垫",
+            "TPE 双面防滑 · 8mm",
+            "厚度",
+            [
+                ("mm6", "6mm", 8900, 900),
+                ("mm8", "8mm", 11900, 1200),
+            ],
+            sku_prefix="FT-YOGA",
+        ),
+        _simple_product(
+            category_ids["小说"],
+            "精装名著套装",
+            "全 8 册 · 硬壳精装",
+            "版本",
+            [
+                ("std", "平装版", 15800, 2400),
+                ("hard", "精装版", 26800, 3600),
+            ],
+            sku_prefix="BK-CLASSIC",
+        ),
+        _simple_product(
+            category_ids["童书"],
+            "立体翻翻书",
+            "撕不烂 · 3D 立体",
+            "规格",
+            [
+                ("animal", "动物世界", 5900, 480),
+                ("space", "太空探秘", 5900, 480),
+            ],
+            sku_prefix="BK-POPUP",
+        ),
+        _simple_product(
+            category_ids["教育考试"],
+            "雅思核心词汇",
+            "分级记忆 · 附音频",
+            "规格",
+            [
+                ("basic", "基础篇", 4500, 700),
+                ("pro", "冲刺篇", 5200, 760),
+            ],
+            sku_prefix="BK-VOCAB",
+        ),
     ]
 
 
@@ -948,14 +1170,27 @@ def _spec_caption(spec: dict, sku: dict) -> str:
 
 
 def with_images(spec: dict, client: httpx.Client, headers: dict[str, str]) -> dict:
-    """上架前给规格补图：主图用商品名，SKU 封面用「商品名 + 规格」。
+    """上架前给规格补图。
 
-    每个 SKU 一张不同的图是有意义的 —— 商城详情页是
-    ``currentSku.coverImage || spu.mainImage``，选中规格时会换图，
-    这样演示时能直接看到"规格切换 → 图跟着换"。
+    **有真实素材**（``demo_assets/``，见 ``IMAGE_ASSETS``）：主图与各 SKU 共用同一张。
+    商家也常这么做，而且只传一次 —— 每个 SKU 各传一份是白占一倍磁盘。
+    代价是"切换规格会换图"那个演示效果没了；真图面前这点演示价值不值得让
+    一页商品里混着 30 张彩色渐变块。
+
+    **没有素材**（没跑过 ``fetch_demo_images.py``）：回退到老行为，主图用商品名、
+    SKU 封面用「商品名 + 规格」，每张都不同。
     """
     out = copy.deepcopy(spec)
     title = out["title"]
+    asset = _asset_for(title)
+
+    if asset is not None:
+        url = upload_demo_image(client, headers, title=title, asset=asset)
+        out["mainImage"] = url
+        for sku in out["skus"]:
+            sku["coverImage"] = url
+        return out
+
     out["mainImage"] = upload_demo_image(client, headers, title=title)
     for sku in out["skus"]:
         sku["coverImage"] = upload_demo_image(
@@ -975,7 +1210,12 @@ def _needs_image(url: str | None) -> bool:
 
 
 def ensure_product_images(
-    client: httpx.Client, headers: dict[str, str], spu_id: str, title: str
+    client: httpx.Client,
+    headers: dict[str, str],
+    spu_id: str,
+    title: str,
+    *,
+    force: bool = False,
 ) -> int:
     """给**已存在**的商品补齐真实演示图，返回这次补了几张（0 = 本来就齐）。
 
@@ -984,10 +1224,33 @@ def ensure_product_images(
       改成"缺什么补什么"之后，seed 才是真正幂等的：跑几次都收敛到同一份数据，
       过期的旧数据重跑一次就自动修好。
 
+    ``force=True``（命令行 ``--reimage``）：只要这个商品有真实素材就**强制重传**。
+    换图这件事**没法从 url 推断** —— 上一批生成图落库也是 ``/media/products/...``，
+    ``_needs_image`` 只会当成"已齐"跳过。所以只能显式要求。
+    重传后主图与各 SKU 共用同一张（理由见 ``with_images``）。
+
     只碰标题对得上演示商品的那几条（调用方按标题匹配），不会动商家的真实商品。
     """
     detail = unwrap(client.get(f"/merchant/spus/{spu_id}", headers=headers))
+    asset = _asset_for(title)
     fixed = 0
+
+    if force and asset is not None:
+        url = upload_demo_image(client, headers, title=title, asset=asset)
+        unwrap(
+            client.put(
+                f"/merchant/spus/{spu_id}", json={"mainImage": url}, headers=headers
+            )
+        )
+        fixed += 1
+        for sku in detail["skus"]:
+            unwrap(
+                client.put(
+                    f"/merchant/skus/{sku['id']}", json={"coverImage": url}, headers=headers
+                )
+            )
+            fixed += 1
+        return fixed
 
     if _needs_image(detail["mainImage"]):
         unwrap(
@@ -1021,7 +1284,14 @@ def ensure_product_images(
 
 
 def main() -> int:
-    """脚本主体是同步的（httpx 用同步客户端），只有改库那一步需要跑一次协程。"""
+    """脚本主体是同步的（httpx 用同步客户端），只有改库那一步需要跑一次协程。
+
+    命令行：
+        --reimage   把已有演示商品强制换成 ``demo_assets/`` 里的真实图
+                    （换图没法从 url 推断，只能显式要求，见 ``ensure_product_images``）
+    """
+    reimage = "--reimage" in sys.argv
+
     with httpx.Client(base_url=API, timeout=30) as client:
         # 后端没起来时给一句人话，而不是抛一堆连接异常
         try:
@@ -1070,7 +1340,9 @@ def main() -> int:
                 # ★ 同名不再直接跳过：缺图的要补上。
                 #   以前这里 continue，导致旧数据里的占位图永远修不掉，
                 #   商城里就是一排灰框 —— 重跑 seed 也救不回来。
-                fixed = ensure_product_images(client, merchant_h, existing["id"], spec["title"])
+                fixed = ensure_product_images(
+                    client, merchant_h, existing["id"], spec["title"], force=reimage
+                )
                 if fixed:
                     repaired += fixed
                     print(f"补图 {fixed} 张：{spec['title']}")
@@ -1102,10 +1374,11 @@ def main() -> int:
                 client.get("/merchant/spus", params={"limit": 60}, headers=merchant_h)
             )["items"]
         }
-        banner_count = ensure_banners(
-            client, admin_h, category_ids=category_ids, spu_ids=spu_ids
+        banner_created, banner_updated = ensure_banners(
+            client, admin_h, category_ids=category_ids, spu_ids=spu_ids, force=reimage
         )
-        print(f"轮播图就绪：新建 {banner_count} 张（已存在的跳过）")
+        banner_note = f"，换图 {banner_updated} 张" if banner_updated else ""
+        print(f"轮播图就绪：新建 {banner_created} 张{banner_note}")
 
         # ---------- 仓库 → 库存 → 运费 ----------
         # ★ 顺序不能反：库存行按 (sku, 仓库) 建，运费绑定也要 warehouseId。

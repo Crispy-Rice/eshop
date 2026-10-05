@@ -66,6 +66,8 @@ async def search(
         sort=sort,
         cursor=cursor,
         limit=limit,
+        # 只有这一条要给"共 N 件商品"。商家/运营列表页没有这个文案，别替它们跑 COUNT
+        with_total=True,
     )
     return ApiResponse.ok(result)
 

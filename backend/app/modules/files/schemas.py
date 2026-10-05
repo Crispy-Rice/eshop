@@ -14,12 +14,15 @@ class ImageUploadOut(CamelModel):
     评价插入时会校验它必须以 ``reviews/{自己的 user_id}/`` 开头（docs/12 §9），
     所以它不能带 ``/media/`` 前缀。
 
-    ``url`` / ``thumbUrl`` 只是给前端渲染用的便利字段。
+    ``url`` / ``midUrl`` / ``thumbUrl`` 只是给前端渲染用的便利字段，按消费场景选一档：
+    详情页用 ``url``，商品卡片用 ``midUrl``，评价九宫格这类小图用 ``thumbUrl``。
     """
 
     path: str = Field(description="相对路径，入库用")
     url: str = Field(description="可直接用于 <img src>")
+    mid_path: str = Field(description="640 中间档相对路径，商品卡片用")
+    mid_url: str = Field(description="640 中间档 URL")
     thumb_path: str = Field(description="缩略图相对路径")
-    thumb_url: str = Field(description="缩略图 URL，列表页用")
+    thumb_url: str = Field(description="缩略图 URL，小图用")
     width: int
     height: int

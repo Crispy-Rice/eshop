@@ -21,6 +21,7 @@ from __future__ import annotations
 import uuid
 from io import BytesIO
 from pathlib import Path
+from typing import NamedTuple
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -33,12 +34,21 @@ logger = get_logger(__name__)
 # 允许的图片格式（Pillow 嗅探出来的格式名，不是扩展名）
 ALLOWED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 
-# 长边归一化到这个尺寸。**这一步替代了缩略图**的主要作用：
-# 原图直出可能一张 3MB，归一化 + WEBP 后通常 50~150KB
+# 三档尺寸，按"消费场景"分，不按"好看"分：
+#
+#   full  1280  详情页大图、店铺 LOGO、轮播图、头像
+#   mid    640  商城商品卡片（卡片宽 200~260，2x 屏要 ~520，640 刚好不糊又不浪费）
+#   thumb  200  评价九宫格、订单行、售后凭证这类小缩略
+#
+# ★ 加 mid 的原因是：原来卡片直接吃 1280 的 full，而卡片只有 200~260 CSS px ——
+#   多送 5~6 倍像素，用户一个都看不到。生成图时代看不出来（平色渐变才 3KB），
+#   换成真实照片后一张就是 100~300KB，12 张卡片就是一两个 MB。
 LONG_EDGE = 1280
+MID_EDGE = 640
 THUMB_EDGE = 200
-# 缩略图的后缀约定。库里只存原图路径，缩略图路径由这个约定推导
+# 派生图的后缀约定。库里只存原图路径，另外两档由这个约定推导（见 thumb_path_of）
 THUMB_SUFFIX = "_t"
+MID_SUFFIX = "_m"
 
 # WEBP 编码质量
 QUALITY = 82
@@ -89,13 +99,23 @@ def encode_webp(im: Image.Image, long_edge: int) -> bytes:
     return _encode(_fit(im, long_edge))
 
 
-def process_image(raw: bytes) -> tuple[bytes, bytes, int, int]:
-    """把用户上传的字节转成 (原图 webp, 缩略图 webp, 宽, 高)。
+class Rendered(NamedTuple):
+    """一次解码产出的三档字节。**三份都从同一张归一化后的图缩出来**，尺寸才自洽。"""
+
+    full: bytes
+    mid: bytes
+    thumb: bytes
+    width: int
+    height: int
+
+
+def process_image(raw: bytes) -> Rendered:
+    """把用户上传的字节转成 full / mid / thumb 三档 webp。
 
     **纯函数**：不落盘、不读库，便于单测。
 
-    返回的宽高是**归一化之后**的尺寸 —— 上报原始尺寸会让前端按错误的宽高留位，
-    在图片加载完成时抖动。
+    ``width`` / ``height`` 是**归一化之后**的尺寸 —— 上报原始尺寸会让前端按错误的
+    宽高留位，在图片加载完成时抖动。
     """
     if not raw:
         raise BizError(ErrorCode.INVALID_IMAGE, "文件为空")
@@ -122,9 +142,15 @@ def process_image(raw: bytes) -> tuple[bytes, bytes, int, int]:
     if im.mode in ("P", "CMYK", "LA"):
         im = im.convert("RGBA" if "A" in im.mode or im.mode == "P" else "RGB")
 
-    # 只归一化一次，缩略图从归一化后的图再缩 —— 尺寸与产物保持一致
+    # 只归一化一次，三档都从归一化后的图再缩 —— 尺寸与产物保持一致
     fitted = _fit(im, LONG_EDGE)
-    return _encode(fitted), _encode(_fit(fitted, THUMB_EDGE)), fitted.width, fitted.height
+    return Rendered(
+        full=_encode(fitted),
+        mid=_encode(_fit(fitted, MID_EDGE)),
+        thumb=_encode(_fit(fitted, THUMB_EDGE)),
+        width=fitted.width,
+        height=fitted.height,
+    )
 
 
 def build_path(*, biz: str, user_id: int, now_suffix: str | None = None) -> str:
@@ -140,14 +166,54 @@ def build_path(*, biz: str, user_id: int, now_suffix: str | None = None) -> str:
     return f"{biz}/{user_id}/{name}.webp"
 
 
+def _derive(path: str, suffix: str) -> str:
+    """``ab.webp`` + ``_t`` → ``ab_t.webp``。三档路径全靠这一个约定，别各写各的。"""
+    base, _, ext = path.rpartition(".")
+    return f"{base}{suffix}.{ext}"
+
+
 def thumb_path_of(path: str) -> str:
-    """由原图路径推出缩略图路径（``ab.webp`` → ``ab_t.webp``）。
+    """由原图路径推出 200 缩略图的路径。
 
     库里只存原图路径（``review.review.images`` 是字符串数组，docs/12 §2.1），
-    缩略图路径按这个约定推导 —— 单一来源，不用多存一列。
+    派生图路径按后缀约定推导 —— 单一来源，不用多存两三列。
     """
-    base, _, ext = path.rpartition(".")
-    return f"{base}{THUMB_SUFFIX}.{ext}"
+    return _derive(path, THUMB_SUFFIX)
+
+
+def mid_path_of(path: str) -> str:
+    """由原图路径推出 640 中间档的路径。商品卡片用它。"""
+    return _derive(path, MID_SUFFIX)
+
+
+def _derive_url(url: str, suffix: str) -> str:
+    """url 版的 ``_derive``，**只动我们自己生成的 media url**。
+
+    空值、外链原样返回。理由：推导规则是"在扩展名前插后缀"，它对任何字符串都
+    "能算出一个结果"，但对 ``https://cdn.example.com/a.jpg`` 算出来的地址必然 404。
+    与其给前端一个坏链接再靠回退兜，不如在这里就不改。
+
+    （商品主图正常都走上传接口，理论上都是 media url；这一层挡的是历史脏数据和
+    将来可能出现的"填外链"用法。）
+    """
+    if not url.startswith(get_settings().media_url_prefix):
+        return url
+    return _derive(url, suffix)
+
+
+def thumb_url_of(url: str) -> str:
+    """由原图 **url** 推出 200 缩略的 url。
+
+    ``products`` / ``shops`` / ``avatars`` / ``banners`` 这几条业务线库里存的是
+    **完整 url**（直接用 ``<img src>``），不是相对路径。推导规则和路径版完全一样
+    —— 都是"在扩展名前插后缀" —— 单独给个名字只是让调用点读起来不别扭。
+    """
+    return _derive_url(url, THUMB_SUFFIX)
+
+
+def mid_url_of(url: str) -> str:
+    """由原图 **url** 推出 640 中间档的 url。见 ``thumb_url_of``。"""
+    return _derive_url(url, MID_SUFFIX)
 
 
 def absolute_path(relative: str) -> Path:
@@ -160,9 +226,14 @@ def absolute_path(relative: str) -> Path:
     return target
 
 
-def save_image(relative: str, full: bytes, thumb: bytes) -> None:
-    """落盘原图与缩略图。父目录不存在就建。"""
+def save_image(relative: str, rendered: Rendered) -> None:
+    """落盘三档。父目录不存在就建。
+
+    ★ **幂等**：同一个 ``relative`` 重复写会覆盖同名文件。回填脚本正是靠这一点，
+      对已有原图重跑一遍就能把缺的 ``_m`` / ``_t`` 补齐。
+    """
     target = absolute_path(relative)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(full)
-    absolute_path(thumb_path_of(relative)).write_bytes(thumb)
+    target.write_bytes(rendered.full)
+    absolute_path(mid_path_of(relative)).write_bytes(rendered.mid)
+    absolute_path(thumb_path_of(relative)).write_bytes(rendered.thumb)

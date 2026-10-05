@@ -774,16 +774,71 @@ async def test_search_cursor_pagination(client: AsyncClient, session) -> None:
     assert len(first["items"]) == 2
     assert first["hasMore"] is True
     assert first["nextCursor"]
+    # ★ 总数**只在第一页**算：商城要显示"共 N 件"，但没必要每翻一页都重数一遍
+    assert first["total"] == 3
 
     second = (
         await client.get("/api/search", params={"keyword": "商品", "limit": 2, "cursor": first["nextCursor"]})
     ).json()["data"]
     assert len(second["items"]) == 1
     assert second["hasMore"] is False
+    assert second["total"] is None, "翻页响应不该再带总数"
 
     # 两页合起来正好是全部 3 个，且没有重复
     seen = [i["id"] for i in first["items"]] + [i["id"] for i in second["items"]]
     assert sorted(seen) == sorted(spu_ids)
+
+    # 商家列表没有"共 N 件商品"这个文案，不该替它白跑一次 COUNT
+    mine = (await client.get("/api/merchant/spus", headers=headers)).json()["data"]
+    assert mine["total"] is None
+
+
+async def test_search_total_is_same_scope_as_list(client: AsyncClient, session) -> None:
+    """★ "共 N 件"的 N 必须和列表**同口径** —— 两边共用 ``_spu_filters``。
+
+    价格过滤是最容易写成两套条件的：列表按「区间相交」判断
+    （``price_max >= from AND price_min <= to``），计数要是顺手写成
+    「价格落在区间内」，区间价商品上就会对不上数。
+    """
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "手机")
+    merchant = await register(client, phone="13800138011")
+    await open_shop(client, merchant["accessToken"])
+    headers = auth_header(merchant["accessToken"])
+
+    # 三件商品，**第三件价格有跨度**（SKU 从 3000 到 7000 元）。
+    #   ★ 必须有跨度才分得出两种口径：单价商品 min == max，怎么写都一样，
+    #     拿它测等于没测（第一版就是这么写的，把计数故意写错也没变红）。
+    prices_per_spu = [
+        (100000, 100000, 100000),  # 1000 元
+        (500000, 500000, 500000),  # 5000 元
+        (300000, 700000, 700000),  # 3000~7000 元（有跨度）
+    ]
+    for index, prices in enumerate(prices_per_spu):
+        payload = _spu_payload(category)
+        payload["title"] = f"价格商品{index}"
+        for sku_index, sku in enumerate(payload["skus"]):
+            sku["skuCode"] = f"PR{index}-{sku_index}"
+            sku["price"] = prices[sku_index]
+        created = (await client.post("/api/merchant/spus", json=payload, headers=headers)).json()["data"]
+        await client.post(f"/api/merchant/spus/{created['id']}/submit", headers=headers)
+        await client.post(
+            f"/api/admin/spus/{created['id']}/audit",
+            json={"approved": True},
+            headers=auth_header(admin["accessToken"]),
+        )
+
+    data = (await client.get("/api/search", params={"keyword": "价格商品", "limit": 50})).json()["data"]
+    assert data["total"] == len(data["items"]), "总数必须和列表条数对得上"
+    assert data["total"] == 3
+
+    # 带价格过滤时同样要对得上。判据是**区间相交**：5000 那件和 3000~7000 那件
+    # 都跨过 4000，所以是 2 件。若计数误用"价格落在区间内"，3000~7000 那件会被漏掉。
+    filtered = (
+        await client.get("/api/search", params={"keyword": "价格商品", "priceFrom": 400000, "limit": 50})
+    ).json()["data"]
+    assert filtered["total"] == 2
+    assert filtered["total"] == len(filtered["items"])
 
 
 async def test_invalid_cursor_rejected(client: AsyncClient) -> None:

@@ -6,6 +6,8 @@ export interface SpuCard {
   categoryId: string
   title: string
   mainImage: string
+  /** 640 中间档。列表缩略用它渲染；缺失时回退到 mainImage */
+  mainImageMid: string
   priceMin: number
   priceMax: number
   totalSold: number
@@ -58,6 +60,8 @@ export interface SpuList {
   items: SpuCard[]
   hasMore: boolean
   nextCursor: string | null
+  /** 总数。只有公开 `/search` 的第一页给；商家/审核列表恒为 null */
+  total: number | null
 }
 
 // ---------- 发布商品 ----------

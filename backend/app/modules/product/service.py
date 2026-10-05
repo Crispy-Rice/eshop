@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import BizError, ErrorCode
 from app.core.logging import get_logger
 from app.core.snowflake import next_id
+from app.modules.files import storage
 from app.modules.product import repository as repo
 from app.modules.product.models import (
     SPU_DRAFT,
@@ -601,6 +602,8 @@ def _to_card(spu: Spu) -> SpuCardOut:
         category_id=spu.category_id,
         title=spu.title,
         main_image=spu.main_image,
+        # 卡片渲染用 640 档。原图照旧一并返回，前端在 _m 缺失时回退到它
+        main_image_mid=storage.mid_url_of(spu.main_image),
         price_min=spu.price_min,
         price_max=spu.price_max,
         total_sold=spu.total_sold,
@@ -625,8 +628,17 @@ async def search_products(
     shop_id: int | None = None,
     status: int | None = None,
     on_shelf_only: bool = True,
+    with_total: bool = False,
 ) -> SpuListOut:
-    """商品搜索 / 浏览 / 商家自己的商品列表，共用这一条路径。"""
+    """商品搜索 / 浏览 / 商家自己的商品列表，共用这一条路径。
+
+    ``with_total=True`` 时才去数总数（商城搜索页要显示「共 N 件商品」）。
+    默认关是因为**游标分页本来就是为了不跑 COUNT**（下面那句"多取一条判有无下一页"），
+    而商家/运营两个列表页根本没有总数文案，不该替它们付这个开销。
+
+    且**只在第一页算**：``cursor`` 有值说明是翻页，总数早就在首页拿过了。
+    同一次搜索里数据不会变，重复数只是白花时间。
+    """
     if sort not in SORT_SPECS:
         raise BizError(ErrorCode.VALIDATION_ERROR, f"不支持的排序方式: {sort}")
     limit = max(1, min(limit, MAX_PAGE_SIZE))
@@ -673,7 +685,25 @@ async def search_products(
         raw_value = last.created_at.isoformat() if sort == "newest" else getattr(last, column.key)
         next_cursor = _encode_cursor(sort, raw_value, last.id)
 
-    return SpuListOut(items=[_to_card(s) for s in rows], has_more=has_more, next_cursor=next_cursor)
+    total = None
+    if with_total and cursor is None:
+        total = await repo.count_spus(
+            session,
+            keywords=keywords,
+            category_ids=category_ids,
+            price_from=price_from,
+            price_to=price_to,
+            shop_id=shop_id,
+            status=status,
+            on_shelf_only=on_shelf_only,
+        )
+
+    return SpuListOut(
+        items=[_to_card(s) for s in rows],
+        has_more=has_more,
+        next_cursor=next_cursor,
+        total=total,
+    )
 
 
 async def list_admin_spus(

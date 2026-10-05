@@ -8,7 +8,7 @@ import { isBizError } from '@/api/errors'
 import { fetchCategoryTree, searchProducts, type Category, type SearchSort, type SpuCard } from '@/api/product'
 import BannerCarousel from '@/components/BannerCarousel.vue'
 import { formatPriceRange, yuanToFen } from '@/utils/money'
-import { onImageError } from '@/utils/placeholder'
+import { onImageError, thumbFallback, thumbSrc } from '@/utils/placeholder'
 
 const router = useRouter()
 const route = useRoute()
@@ -21,6 +21,8 @@ const loading = ref(false)
 const loadingMore = ref(false)
 const nextCursor = ref<string | null>(null)
 const hasMore = ref(false)
+/** 符合条件的总数。只有首页返回，翻页时保持不变 */
+const total = ref<number | null>(null)
 const searched = ref(false)
 
 const filters = reactive({
@@ -59,8 +61,10 @@ const priceRange = computed(() => {
 const resultText = computed(() => {
   if (!searched.value) return '正在加载…'
   if (items.value.length === 0) return '没有找到符合条件的商品'
-  // hasMore 为真时总数还不确定，所以说"已显示"而不是"共"
-  return hasMore.value ? `已显示 ${items.value.length} 件商品` : `共 ${items.value.length} 件商品`
+  // ★ 用服务端给的总数。它只在第一页返回（见后端 with_total），
+  //   所以翻页途中这里一直是首页那个值，不会跳。
+  //   拿不到才退回"已显示" —— 别把"这一页 12 件"说成总数，那是另一回事。
+  return total.value !== null ? `共 ${total.value} 件商品` : `已显示 ${items.value.length} 件商品`
 })
 
 /**
@@ -108,6 +112,8 @@ async function load(reset: boolean): Promise<void> {
     items.value = reset ? result.items : [...items.value, ...result.items]
     nextCursor.value = result.nextCursor
     hasMore.value = result.hasMore
+    // 只有首页带 total；翻页响应里是 null，不能拿它覆盖已经拿到手的值
+    if (reset) total.value = result.total
     searched.value = true
     // 不 await：商品先渲染出来，店名稍后补上，别为了附加信息拖住列表
     void loadShopNames(result.items)
@@ -324,7 +330,13 @@ onMounted(async () => {
           rel="noopener"
         >
           <div class="card-media">
-            <img :src="item.mainImage" :alt="item.title" loading="lazy" @error="onImageError" />
+            <img
+              :src="thumbSrc(item.mainImage, item.mainImageMid, item.title)"
+              :data-fallback-src="thumbFallback(item.mainImage, item.mainImageMid)"
+              :alt="item.title"
+              loading="lazy"
+              @error="onImageError"
+            />
           </div>
           <div class="card-body">
             <h3 class="card-title" :title="item.title">{{ item.title }}</h3>
