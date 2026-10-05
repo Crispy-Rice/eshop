@@ -32,11 +32,14 @@ import {
   createCouponTemplate,
   createPromoActivity,
   issueCoupon,
+  listCouponIssues,
   listCouponTemplates,
   listPromoActivities,
   lookupUserByPhone,
   type AdminCouponTemplate,
   type AdminPromoActivity,
+  type CouponIssueRecord,
+  type CouponIssueSummary,
   type UserLookup,
 } from '@/api/promotion'
 import { useAuthStore } from '@/stores/auth'
@@ -342,6 +345,45 @@ async function submitIssue(): Promise<void> {
 }
 
 // ============================================================
+// 补发记录
+//
+// ★ 补发**不占活动额度**，"活动库存"根本不构成约束 —— 能被看见才是最有效的那道。
+//   这个抽屉就是那道约束：谁、何时、给谁、发了哪张券，全部摆在明面上。
+//   后端另有两道配额闸（单用户单模板、单运营 24 小时），撞了会在发券时报错。
+// ============================================================
+const recordsVisible = ref(false)
+const recordsLoading = ref(false)
+const records = ref<CouponIssueRecord[]>([])
+const recordsSummary = ref<CouponIssueSummary | null>(null)
+const recordsCursor = ref<string | null>(null)
+const recordsHasMore = ref(false)
+
+async function openIssueRecords(): Promise<void> {
+  recordsVisible.value = true
+  await loadIssueRecords(true)
+}
+
+async function loadIssueRecords(reset = false): Promise<void> {
+  if (reset) {
+    records.value = []
+    recordsCursor.value = null
+    recordsSummary.value = null
+  }
+  recordsLoading.value = true
+  try {
+    const page = await listCouponIssues({ cursor: recordsCursor.value, limit: 20 })
+    records.value = [...records.value, ...page.items]
+    recordsSummary.value = page.summary
+    recordsCursor.value = page.nextCursor
+    recordsHasMore.value = page.hasMore
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '加载补发记录失败')
+  } finally {
+    recordsLoading.value = false
+  }
+}
+
+// ============================================================
 // 加载
 // ============================================================
 async function loadCoupons(reset = true): Promise<void> {
@@ -454,6 +496,10 @@ onMounted(async () => {
           <el-radio-button value="activity">促销活动</el-radio-button>
         </el-radio-group>
         <div class="spacer" />
+        <!-- 补发记录：让"谁给谁发了多少"看得见。这是约束运营发券的主要手段 -->
+        <el-button v-if="tab === 'coupon'" size="small" @click="openIssueRecords">
+          补发记录
+        </el-button>
         <el-button
           type="primary"
           size="small"
@@ -839,6 +885,41 @@ onMounted(async () => {
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- ============ 补发记录 ============ -->
+    <el-drawer v-model="recordsVisible" title="补发记录" size="680px">
+      <div v-if="recordsSummary" class="issue-summary">
+        <span>
+          最近 24 小时共补发 <b class="tnum">{{ recordsSummary.total }}</b> 张
+        </span>
+        <span v-for="op in recordsSummary.byOperator" :key="op.operatorName" class="by-op">
+          {{ op.operatorName }} {{ op.count }} 张
+        </span>
+      </div>
+
+      <el-table v-if="records.length > 0" v-loading="recordsLoading" :data="records" size="small">
+        <el-table-column label="时间" width="150">
+          <template #default="{ row }">{{ formatDateTime(row.createdAt) }}</template>
+        </el-table-column>
+        <el-table-column label="操作人" width="100" prop="operatorName" />
+        <el-table-column label="收件人" min-width="160">
+          <template #default="{ row }">
+            <div>{{ row.nickname || '—' }}</div>
+            <div class="sub tnum">{{ row.phoneMasked }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="券模板" min-width="130" prop="templateName" />
+        <el-table-column label="券码" width="150" prop="code" />
+      </el-table>
+
+      <el-empty v-else-if="!recordsLoading" description="还没有补发记录" />
+
+      <div v-if="recordsHasMore" class="load-more">
+        <el-button size="small" :loading="recordsLoading" @click="loadIssueRecords(false)">
+          加载更多
+        </el-button>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -947,5 +1028,41 @@ onMounted(async () => {
   font-size: var(--text-base);
   font-weight: var(--weight-medium);
   color: var(--color-text);
+}
+
+/* 补发记录的汇总条：一眼看出发了多少、谁发得多 */
+.issue-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding: var(--space-3);
+  margin-bottom: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.issue-summary b {
+  color: var(--color-price);
+}
+
+/* 按操作人的小分组，用描边和总数区分开 */
+.by-op {
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+}
+
+.sub {
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+}
+
+.load-more {
+  margin-top: var(--space-3);
+  text-align: center;
 }
 </style>

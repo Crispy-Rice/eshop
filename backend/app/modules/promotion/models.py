@@ -107,6 +107,23 @@ CODE_SOURCE_EXCHANGE = 3
 CODE_SOURCE_ACTIVITY = 4
 CODE_SOURCE_REFUND = 5  # 退回
 
+# ---------------- 客服补发的两道闸 ----------------
+# ★ 补发**不占活动额度**（``issued_count`` 不变，理由见 issue_by_admin），
+#   所以"活动库存"本身不构成约束 —— 这两条是补发自己该有的配额。
+#   它们是**事前拒**：事后再查，券已经发出去了。
+
+# 同一个用户、同一个模板，累计最多被补发多少张。
+# 不限时间窗 —— 要挡的是"给一个小号反复刷"，那是累积行为，加窗口反而能隔天绕过。
+ISSUE_MAX_PER_USER_TPL = 3
+
+# 单个运营 24 小时内最多补发多少张。
+# 用**滚动 24 小时**而不是"自然日"：没有零点重置的悬崖，也不用纠结时区
+# （全库时间戳都是 UTC，按自然日会变成北京时间早上 8 点重置，很奇怪）。
+ISSUE_MAX_PER_OPERATOR_24H = 200
+
+# 补发流水的 biz_key 前缀。用它把"补发"从券的其它流水（锁/核销/退回）里筛出来。
+ISSUE_BIZ_KEY_PREFIX = "ISSUE:"
+
 # ---------------- 促销活动 ----------------
 ACTIVITY_STATUS_NOT_STARTED = 1
 ACTIVITY_STATUS_ONGOING = 2

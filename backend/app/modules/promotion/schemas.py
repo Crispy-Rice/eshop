@@ -255,6 +255,49 @@ class UserLookupOut(CamelModel):
     phone_masked: str
 
 
+# ---------------- 客服补发的记录与配额 ----------------
+class CouponIssueOperatorOut(CamelModel):
+    """补发汇总里的一个操作人。"""
+
+    operator_name: str
+    count: int
+
+
+class CouponIssueRecordOut(CamelModel):
+    """一条补发记录。
+
+    **一行 = 一张券** —— 审计就该到这个粒度：出了问题能顺着 ``code``
+    查到具体那一张，而不是只知道"某人某天发了一批"。
+    """
+
+    id: SnowflakeId
+    created_at: datetime
+    template_name: str
+    # 券码：出问题时能顺着它去查这张券的完整流水
+    code: str
+    # 操作人：解析不出昵称时退回原始标识（如 admin:123），不显示空白
+    operator_name: str
+    # 收件人
+    user_id: SnowflakeId
+    nickname: str
+    phone_masked: str
+    remark: str | None = None
+
+
+class CouponIssueSummaryOut(CamelModel):
+    """最近 24 小时的补发汇总 —— 一眼看出发了多少、谁发得多。"""
+
+    total: int
+    by_operator: list[CouponIssueOperatorOut]
+
+
+class CouponIssuePageOut(CamelModel):
+    items: list[CouponIssueRecordOut]
+    has_more: bool
+    next_cursor: str | None = None
+    summary: CouponIssueSummaryOut
+
+
 class PromoActivityCreateRequest(CamelModel):
     name: str = Field(min_length=2, max_length=64)
     level: int = Field(ge=0, le=2, description="0单品 1店铺 2平台")

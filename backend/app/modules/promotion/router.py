@@ -47,6 +47,10 @@ from app.modules.promotion.schemas import (
     BannerUpdateRequest,
     CalcPriceOut,
     CalcPriceRequest,
+    CouponIssueOperatorOut,
+    CouponIssuePageOut,
+    CouponIssueRecordOut,
+    CouponIssueSummaryOut,
     CouponReceiveOut,
     CouponTemplateCreateRequest,
     CouponTemplateOut,
@@ -382,6 +386,87 @@ async def admin_issue(
             )
             for c in codes
         ]
+    )
+
+
+def _operator_id(operator: str | None) -> int:
+    """``admin:123`` → ``123``；解析不出返回 0（视作"查不到名字"）。"""
+    if not operator or ":" not in operator:
+        return 0
+    try:
+        return int(operator.rsplit(":", 1)[1])
+    except ValueError:
+        return 0
+
+
+def _operator_label(operator: str | None, labels: dict[int, tuple[str, str]]) -> str:
+    """操作人的展示名。查不到就退回原始标识（如 ``admin:123``）——
+    审计列表宁可显示一个难看的标识，也不能显示空白。"""
+    return labels.get(_operator_id(operator), (operator or "未知", ""))[0]
+
+
+@router.get(
+    "/api/admin/coupons/issues",
+    response_model=ApiResponse[CouponIssuePageOut],
+    summary="客服补发记录（运营）",
+)
+async def list_coupon_issues(
+    session: DbSession,
+    _: AdminDep,
+    cursor: str | None = Query(default=None, max_length=32),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> ApiResponse[CouponIssuePageOut]:
+    """补发的历史记录 + 最近 24 小时汇总。
+
+    ★ 补发**不占活动额度**，所以"活动库存"根本不构成约束；真正有效的那道约束是
+      **能被看见**。这个接口就是让补发变得可见：谁、何时、给谁、发了哪张券。
+
+    操作人与收件人的昵称在这里补齐 —— 它们在 account 域，promotion 不能 import
+    account（docs/01 §2），而路由同时看得见两边。
+    """
+    page = await service.list_issue_records(session, cursor=cursor, limit=limit)
+    total, by_operator = await service.issue_summary_24h(session)
+
+    # 收件人与操作人一起去重、一次批量取名字 —— 一页几十行不该发几十次查询
+    wanted: set[int] = set()
+    for flow, code, _tpl in page["items"]:
+        wanted.add(int(code.user_id))
+        if _operator_id(flow.operator):
+            wanted.add(_operator_id(flow.operator))
+    for operator, _n in by_operator:
+        if _operator_id(operator):
+            wanted.add(_operator_id(operator))
+    labels = await account_service.list_user_labels(session, sorted(wanted))
+
+    def _recipient(user_id: int) -> tuple[str, str]:
+        return labels.get(user_id, ("", ""))
+
+    return ApiResponse.ok(
+        CouponIssuePageOut(
+            items=[
+                CouponIssueRecordOut(
+                    id=flow.id,
+                    created_at=flow.created_at,
+                    template_name=tpl.name,
+                    code=code.code,
+                    operator_name=_operator_label(flow.operator, labels),
+                    user_id=code.user_id,
+                    nickname=_recipient(int(code.user_id))[0],
+                    phone_masked=_recipient(int(code.user_id))[1],
+                    remark=flow.remark,
+                )
+                for flow, code, tpl in page["items"]
+            ],
+            has_more=page["has_more"],
+            next_cursor=page["next_cursor"],
+            summary=CouponIssueSummaryOut(
+                total=total,
+                by_operator=[
+                    CouponIssueOperatorOut(operator_name=_operator_label(op, labels), count=n)
+                    for op, n in by_operator
+                ],
+            ),
+        )
     )
 
 

@@ -189,6 +189,32 @@ export interface UserLookup {
   phoneMasked: string
 }
 
+/** 一条补发记录。**一行 = 一张券** —— 审计到这个粒度，能顺着券码查下去。 */
+export interface CouponIssueRecord {
+  id: string
+  createdAt: string
+  templateName: string
+  code: string
+  /** 操作人昵称；解析不出会是 `admin:123` 这种原始标识，不会是空白 */
+  operatorName: string
+  userId: string
+  nickname: string
+  phoneMasked: string
+  remark: string | null
+}
+
+export interface CouponIssueSummary {
+  total: number
+  byOperator: { operatorName: string; count: number }[]
+}
+
+export interface CouponIssuePage {
+  items: CouponIssueRecord[]
+  hasMore: boolean
+  nextCursor: string | null
+  summary: CouponIssueSummary
+}
+
 // ============================================================
 // 接口
 // ============================================================
@@ -222,6 +248,20 @@ export function issueCoupon(payload: {
  */
 export function lookupUserByPhone(phone: string): Promise<UserLookup> {
   return get<UserLookup>('/admin/users/lookup', { params: { phone } })
+}
+
+/**
+ * 客服补发的历史记录（含最近 24 小时的汇总）。
+ *
+ * ★ 这是约束运营发券的**主要手段**：补发不占活动额度，"活动库存"根本不构成
+ *   约束 —— 能被看见才是最有效的那道。后端另有两道配额闸（单用户单模板、
+ *   单运营 24 小时）。
+ */
+export function listCouponIssues(params: {
+  cursor?: string | null
+  limit?: number
+}): Promise<CouponIssuePage> {
+  return get<CouponIssuePage>('/admin/coupons/issues', { params })
 }
 
 export function listPromoActivities(params: {

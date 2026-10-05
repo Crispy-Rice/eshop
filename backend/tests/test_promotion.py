@@ -19,7 +19,12 @@ from app.core.redis import get_redis
 from app.core.snowflake import next_id
 from app.modules.promotion import repository as repo
 from app.modules.promotion import service
-from app.modules.promotion.models import CODE_UNUSED, CouponCode, CouponTemplate
+from app.modules.promotion.models import (
+    CODE_UNUSED,
+    ISSUE_MAX_PER_USER_TPL,
+    CouponCode,
+    CouponTemplate,
+)
 from tests.conftest import auth_header, make_admin, register
 
 SHOP_ID = 990101
@@ -844,3 +849,94 @@ async def test_issue_rejects_unknown_user(client: AsyncClient, session) -> None:
     )
     assert resp.status_code == 404
     assert "用户" in resp.json()["message"]
+
+
+# ============================================================
+# 补发的两道闸 + 记录
+# ============================================================
+
+
+async def _issue_ctx(client: AsyncClient, session) -> dict:
+    """一个可发券的上下文：管理员 headers、模板 id、收件人 userId。"""
+    admin = await _admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    tpl_id = await _create_template_via_api(client, headers, name="补发验证券")
+    buyer = await register(client, phone=BUYER_PHONE)
+    buyer_id = (
+        await client.get("/api/me", headers=auth_header(buyer["accessToken"]))
+    ).json()["data"]["id"]
+    return {"headers": headers, "tplId": tpl_id, "userId": buyer_id}
+
+
+async def test_issue_per_user_template_cap(client: AsyncClient, session) -> None:
+    """★ 同一用户在同一模板上累计最多补发 N 张 —— 挡住"给一个小号反复刷"。
+
+    这道闸**不限时间窗**：累积行为加窗口反而能隔天绕过去。
+    """
+    ctx = await _issue_ctx(client, session)
+
+    async def issue(n: int):
+        return await client.post(
+            "/api/admin/coupons/issue",
+            json={"templateId": ctx["tplId"], "userId": ctx["userId"], "count": n},
+            headers=ctx["headers"],
+        )
+
+    assert (await issue(ISSUE_MAX_PER_USER_TPL)).status_code == 200
+    over = await issue(1)
+    assert over.status_code == 400
+    assert "上限" in over.json()["message"]
+
+
+async def test_issue_operator_daily_cap(client: AsyncClient, session, monkeypatch) -> None:
+    """★ 单个运营 24 小时的补发总量也封顶。
+
+    阈值调小来测 —— 真按 200 张跑这个用例要发 200 次请求，不值得。
+    """
+    monkeypatch.setattr(service, "ISSUE_MAX_PER_OPERATOR_24H", 2)
+    ctx = await _issue_ctx(client, session)
+
+    async def issue(n: int):
+        return await client.post(
+            "/api/admin/coupons/issue",
+            json={"templateId": ctx["tplId"], "userId": ctx["userId"], "count": n},
+            headers=ctx["headers"],
+        )
+
+    assert (await issue(2)).status_code == 200
+    over = await issue(1)
+    assert over.status_code == 400
+    assert "24 小时" in over.json()["message"]
+
+
+async def test_issue_records_are_visible(client: AsyncClient, session) -> None:
+    """★ 补发要查得到：谁、何时、给谁、发了哪张券。
+
+    补发**不占活动额度**，"活动库存"根本不构成约束 —— 真正有效的那道是"能被看见"。
+    """
+    ctx = await _issue_ctx(client, session)
+    resp = await client.post(
+        "/api/admin/coupons/issue",
+        json={"templateId": ctx["tplId"], "userId": ctx["userId"], "count": 2},
+        headers=ctx["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    issued = {c["code"] for c in resp.json()["data"]}
+    assert len(issued) == 2
+
+    page = await client.get("/api/admin/coupons/issues", headers=ctx["headers"])
+    assert page.status_code == 200, page.text
+    data = page.json()["data"]
+
+    mine = [r for r in data["items"] if r["code"] in issued]
+    assert len(mine) == 2  # 一行 = 一张券
+    row = mine[0]
+    assert row["operatorName"]  # 操作人名解析出来了，不是 admin:123 这种
+    assert row["nickname"]  # 收件人名
+    assert row["phoneMasked"] == "139****9011"
+    assert row["templateName"] == "补发验证券"
+    assert row["remark"] == "客服补发"
+
+    # 汇总让"今天发了多少"一眼可见
+    assert data["summary"]["total"] >= 2
+    assert any(o["count"] >= 2 for o in data["summary"]["byOperator"])

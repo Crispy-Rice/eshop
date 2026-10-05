@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.promotion.models import (
     BANNER_ENABLED,
     CODE_LOCKED,
+    ISSUE_BIZ_KEY_PREFIX,
     Banner,
     CouponCode,
     CouponFlow,
@@ -368,6 +369,84 @@ async def try_insert_flow(session: AsyncSession, flow: CouponFlow) -> bool:
     )
     result = await session.execute(stmt.on_conflict_do_nothing(index_elements=["biz_key"]))
     return result.rowcount == 1
+
+
+async def list_issue_records(
+    session: AsyncSession, *, cursor: int | None, limit: int
+) -> list[tuple[CouponFlow, CouponCode, CouponTemplate]]:
+    """客服补发的流水，最新在前。
+
+    **一行 = 一张券**（``biz_key`` 是 ``ISSUE:{code_id}``，一次发 5 张就是 5 行）——
+      审计记录本来就该逐条，这样能顺着查到具体那张券码。
+
+    ★ 三表一次 join 取全：流水给出"谁在何时发的"，券码给出"发给谁"，
+      模板给出"发的是哪张券"。分三次查会让列表页变成 N+1。
+
+    ★ 多取一条：调用方用"返回条数 > limit"判断还有没有下一页，不用额外跑 count。
+    """
+    stmt: Select = (
+        select(CouponFlow, CouponCode, CouponTemplate)
+        .join(CouponCode, CouponCode.id == CouponFlow.coupon_code_id)
+        .join(CouponTemplate, CouponTemplate.id == CouponCode.coupon_template_id)
+        .where(CouponFlow.biz_key.startswith(ISSUE_BIZ_KEY_PREFIX))
+        .order_by(CouponFlow.id.desc())
+        .limit(limit + 1)
+    )
+    if cursor is not None:
+        stmt = stmt.where(CouponFlow.id < cursor)
+    rows = await session.execute(stmt)
+    return [(flow, code, tpl) for flow, code, tpl in rows.all()]
+
+
+async def count_issues_for_user_template(
+    session: AsyncSession, *, user_id: int, tpl_id: int
+) -> int:
+    """这个用户在**这个模板**上累计被补发过多少张。
+
+    ★ 不限时间窗：要挡的是"给一个小号反复刷"，那是累积行为 ——
+      加个时间窗反而能隔天绕过去。
+    """
+    total = await session.scalar(
+        select(func.count())
+        .select_from(CouponFlow)
+        .join(CouponCode, CouponCode.id == CouponFlow.coupon_code_id)
+        .where(
+            CouponFlow.biz_key.startswith(ISSUE_BIZ_KEY_PREFIX),
+            CouponCode.user_id == user_id,
+            CouponCode.coupon_template_id == tpl_id,
+        )
+    )
+    return int(total or 0)
+
+
+async def count_issues_since(session: AsyncSession, *, operator: str, since: datetime) -> int:
+    """某个运营从 ``since`` 起一共补发了多少张。"""
+    total = await session.scalar(
+        select(func.count())
+        .select_from(CouponFlow)
+        .where(
+            CouponFlow.biz_key.startswith(ISSUE_BIZ_KEY_PREFIX),
+            CouponFlow.operator == operator,
+            CouponFlow.created_at >= since,
+        )
+    )
+    return int(total or 0)
+
+
+async def issue_summary_since(
+    session: AsyncSession, *, since: datetime
+) -> list[tuple[str | None, int]]:
+    """从 ``since`` 起按操作人分组的补发张数，多的在前。"""
+    rows = await session.execute(
+        select(CouponFlow.operator, func.count())
+        .where(
+            CouponFlow.biz_key.startswith(ISSUE_BIZ_KEY_PREFIX),
+            CouponFlow.created_at >= since,
+        )
+        .group_by(CouponFlow.operator)
+        .order_by(func.count().desc())
+    )
+    return [(operator, int(n)) for operator, n in rows]
 
 
 # ============================================================

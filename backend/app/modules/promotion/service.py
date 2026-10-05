@@ -38,6 +38,9 @@ from app.modules.promotion.models import (
     CODE_STATUS_TEXT,
     CODE_UNUSED,
     CODE_USED,
+    ISSUE_BIZ_KEY_PREFIX,
+    ISSUE_MAX_PER_OPERATOR_24H,
+    ISSUE_MAX_PER_USER_TPL,
     VALID_DAYS_AFTER,
     CouponCode,
     CouponFlow,
@@ -273,10 +276,29 @@ async def issue_by_admin(
 
     **不走 Redis 计数**，也不占活动额度 —— ``issued_count`` 不增加。
     理由：补发是"平台欠用户的"，不该消耗活动库存（否则会挤占正常用户的名额）。
+
+    ★ 但"不占活动额度"不等于"没有上限"——下面两道闸是补发自己该有的配额。
+      它们是**事前拒**：事后再查，券已经发出去了。阈值见 ``models`` 里的常量。
     """
     tpl = await repo.get_template(session, tpl_id)
     if tpl is None:
         raise BizError(ErrorCode.COUPON_NOT_FOUND)
+
+    already = await repo.count_issues_for_user_template(session, user_id=user_id, tpl_id=tpl_id)
+    if already + count > ISSUE_MAX_PER_USER_TPL:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            f"该用户在这个模板上已补发 {already} 张，单用户上限 {ISSUE_MAX_PER_USER_TPL} 张",
+        )
+
+    recent = await repo.count_issues_since(
+        session, operator=operator, since=datetime.now(UTC) - timedelta(hours=24)
+    )
+    if recent + count > ISSUE_MAX_PER_OPERATOR_24H:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            f"你 24 小时内已补发 {recent} 张，上限 {ISSUE_MAX_PER_OPERATOR_24H} 张",
+        )
 
     codes = [
         await repo.insert_code(session, _build_code(tpl, user_id, source=CODE_SOURCE_SYSTEM))
@@ -289,12 +311,46 @@ async def issue_by_admin(
                 coupon_code_id=c.id,
                 from_status=0,  # 0 表示"从未存在到已发出"
                 to_status=CODE_UNUSED,
-                biz_key=f"ISSUE:{c.id}",
+                biz_key=f"{ISSUE_BIZ_KEY_PREFIX}{c.id}",
                 operator=operator,
                 remark="客服补发",
             ),
         )
     return codes
+
+
+async def list_issue_records(
+    session: AsyncSession, *, cursor: str | None, limit: int
+) -> dict[str, Any]:
+    """客服补发的历史记录（最新在前）。
+
+    ``items`` 里是 ``(流水, 券码, 模板)`` 三元组 —— **原始行**，由路由转出参模型。
+    之所以不在这里拼 DTO：列表要显示**操作人昵称**与**收件人昵称**，而两者都在
+    account 域，promotion 不能 import account（docs/01 §2）。拼装留给同时看得见
+    两个模块的那一层，也就是路由。
+    """
+    rows = await repo.list_issue_records(
+        session, cursor=_decode_cursor(cursor) if cursor else None, limit=limit
+    )
+    # repository 多取了一条，据此判断还有没有下一页
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    return {
+        "items": page,
+        "has_more": has_more,
+        "next_cursor": _encode_cursor(page[-1][0].id) if has_more and page else None,
+    }
+
+
+async def issue_summary_24h(session: AsyncSession) -> tuple[int, list[tuple[str | None, int]]]:
+    """最近 24 小时的补发汇总：``(总张数, [(操作人, 张数), ...])``。
+
+    放进记录接口一起返回，省得列表页为了一个"今日发了多少"再跑一趟。
+    """
+    by_operator = await repo.issue_summary_since(
+        session, since=datetime.now(UTC) - timedelta(hours=24)
+    )
+    return sum(n for _, n in by_operator), by_operator
 
 
 # ============================================================

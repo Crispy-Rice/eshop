@@ -425,6 +425,18 @@ async def user_exists(session: AsyncSession, user_id: int) -> bool:
     return await repo.get_user_by_id(session, user_id) is not None
 
 
+async def list_user_labels(session: AsyncSession, user_ids: Sequence[int]) -> dict[int, tuple[str, str]]:
+    """批量取 ``(昵称, 打码手机号)``。
+
+    给运营侧的审计列表用（补发记录）：那里既要认人、又要防重名，
+    所以比 ``list_user_profiles`` 多带一个打码号。
+    """
+    if not user_ids:
+        return {}
+    users = await repo.list_users_by_ids(session, list(user_ids))
+    return {u.id: (u.nickname, u.phone_masked or "") for u in users}
+
+
 # ============================================================
 # 收货地址
 # ============================================================
