@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -26,6 +26,26 @@ const items = ref<SpuCard[]>([])
 const loading = ref(false)
 const statusFilter = ref<number | undefined>(undefined)
 const shopLoading = ref(false)
+
+/**
+ * 平台账号（admin / finance）不开店。
+ *
+ * 后端 ``create_shop`` 会直接 403，所以这不只是"藏一个按钮"：给平台账号看
+ * "你还没有店铺"本身就是错的 —— 商家菜单按店铺归属分，运营本来就不该有店铺。
+ */
+const ROLE_TEXT: Record<string, string> = { admin: '平台运营', finance: '财务' }
+
+const isPlatformRole = computed(
+  () => auth.user?.role === 'admin' || auth.user?.role === 'finance',
+)
+
+const noShopTitle = computed(() => (isPlatformRole.value ? '平台账号' : '你还没有店铺'))
+
+const noShopHint = computed(() =>
+  isPlatformRole.value
+    ? `当前是${ROLE_TEXT[auth.user?.role ?? ''] ?? '平台'}账号，不需要开店。`
+    : '上架商品前需要先开通店铺。',
+)
 
 const statusTabs = [
   { label: '全部', value: undefined },
@@ -136,10 +156,16 @@ onMounted(() => {
       class="shop-alert"
       show-icon
     >
-      <template #title>你还没有店铺</template>
+      <template #title>{{ noShopTitle }}</template>
       <div class="alert-body">
-        <span>上架商品前需要先开通店铺。</span>
-        <el-button type="primary" size="small" :loading="shopLoading" @click="openShop">
+        <span>{{ noShopHint }}</span>
+        <el-button
+          v-if="!isPlatformRole"
+          type="primary"
+          size="small"
+          :loading="shopLoading"
+          @click="openShop"
+        >
           立即开通
         </el-button>
       </div>

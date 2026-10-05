@@ -156,3 +156,17 @@ export const listAdminSpus = (params: {
   cursor?: string | null
   limit?: number
 }) => get<SpuList>('/admin/spus', { params })
+
+/**
+ * 公开搜索（买家侧那条）。**轮播图选商品用它**。
+ *
+ * ★ 不能用 `/merchant/spus`：那条按店铺归属判权，而平台运营没有店铺，必 403；
+ *   `/admin/spus` 也不合适 —— 它只放给 admin，finance 进不去。
+ *   这个接口不需要登录，且**只返回在售商品**，正合适：banner 指向已下架的商品，
+ *   买家点过去就是 404。
+ */
+export const searchProducts = (params: { keyword?: string; limit?: number }) =>
+  get<SpuList>('/search', { params: { ...params, sort: 'newest' } })
+
+/** 公开的商品详情。用来把已配好的 `/products/<id>` 反查成商品名显示出来 */
+export const fetchPublicSpu = (spuId: string) => get<SpuDetail>(`/spus/${spuId}`)

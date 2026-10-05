@@ -8,7 +8,14 @@ from sqlalchemy import select, text
 
 from app.core.crypto import phone_decrypt, phone_hash
 from app.modules.account.models import RefreshToken, User, UserAddress
-from tests.conftest import TEST_PASSWORD, TEST_PHONE, api_code, auth_header, register
+from tests.conftest import (
+    TEST_PASSWORD,
+    TEST_PHONE,
+    api_code,
+    auth_header,
+    make_admin,
+    register,
+)
 
 # ============================================================
 # 注册
@@ -460,3 +467,28 @@ async def test_update_shop_rejects_short_name(client: AsyncClient) -> None:
 
 async def test_update_shop_requires_login(client: AsyncClient) -> None:
     assert (await client.put("/api/merchant/shop", json={"name": "新店名"})).status_code == 401
+
+
+async def test_platform_role_cannot_open_shop(client: AsyncClient, session) -> None:
+    """★ 平台账号不开店：接口直接 403，不只是前端藏了按钮。
+
+    两道理由：商家菜单本来就按店铺归属分（运营不该有店铺）；运营在自己的平台上
+    卖货是利益冲突（商品审核也只放给 admin）。只挡前端等于接口还开着。
+    """
+    admin = await make_admin(client, session, phone="13900139081")
+    denied = await client.post(
+        "/api/merchant/shop",
+        json={"name": "运营的店"},
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["code"] == "FORBIDDEN"
+
+    # 反证：买家开店照常成功 —— 上面挡的是角色，不是这条路整个坏了
+    buyer = await register(client, phone="13800138081")
+    ok = await client.post(
+        "/api/merchant/shop",
+        json={"name": "正常小店"},
+        headers=auth_header(buyer["accessToken"]),
+    )
+    assert ok.status_code == 200, ok.text

@@ -394,8 +394,8 @@ onMounted(load)
 
       <el-divider>区域规则</el-divider>
       <p class="section-hint">
-        ★ 配置了区域规则就**必须保留一条「全国默认」**（区域码填 <code>0</code>），
-        否则其他地区一条规则都匹配不到，用户会被"该地区不配送"拦住。
+        配置了区域规则就必须保留一条「全国默认」（区域码填 <code>0</code>），
+        否则其他地区一条规则都匹配不到，买家会被「该地区不配送」拦住。
       </p>
 
       <el-table :data="regions" size="small" class="mini-table">

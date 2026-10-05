@@ -172,12 +172,31 @@ function pickCategory(id: string): void {
  *
  * ★ 这样「banner 指向 /?categoryId=xxx」这种站内链接才有意义 —— 否则跳过来
  *   只是换了个 query，列表照样是全量。顺带筛选结果可以刷新保留 / 直接分享。
- *   只在这里写、不在 route.query 上挂 watcher，所以不会来回打架。
  */
 watch(
   () => filters.categoryId,
   (id) => {
+    // 已经对上了就不用再 replace —— 反向 watcher 回写时两次会撞在一起
+    if ((route.query.categoryId ?? '') === (id || '')) return
     void router.replace({ query: { ...route.query, categoryId: id || undefined } })
+  },
+)
+
+/**
+ * 反向同步：URL 上的类目变了，跟着筛选。
+ *
+ * ★ 少了这一条，**首页轮播图点「类目」型 banner 是没反应的** —— banner 就挂在
+ *   首页，点击是 push 到 `/?categoryId=xxx`，路由没换页、组件不重挂，
+ *   `onMounted` 只读一次 query，于是列表纹丝不动。
+ *   顺带把浏览器前进/后退也接上了。
+ */
+watch(
+  () => route.query.categoryId,
+  (value) => {
+    const id = typeof value === 'string' ? value : ''
+    if (id === filters.categoryId) return
+    filters.categoryId = id
+    void load(true)
   },
 )
 
@@ -258,7 +277,13 @@ onMounted(async () => {
     <!-- 类目导航：按层展开，点任意一层即筛商品（后端会连整棵子树一起算）。
          放在搜索栏下面、商品网格上面 —— 紧挨着它筛选的那片结果，"点了会变"最直观 -->
     <nav v-if="categories.length > 0" class="cat-nav">
-      <div v-for="(row, depth) in catRows" :key="depth" class="cat-row" :class="{ sub: depth > 0 }">
+      <div
+        v-for="(row, depth) in catRows"
+        :key="depth"
+        class="cat-row"
+        :class="{ sub: depth > 0 }"
+        :style="{ '--depth': depth }"
+      >
         <button
           v-if="depth === 0"
           type="button"
@@ -341,23 +366,33 @@ onMounted(async () => {
 .cat-nav {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4);
   background: var(--color-bg-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
+  /* 内边距交给每一行自己，行与行之间的分隔线才能通到两侧 */
+  overflow: hidden;
 }
 
 .cat-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-3) var(--space-4);
 }
 
-/* 子级往右缩一点，层级一眼能看出来 */
+/*
+ * 二级及更深的一行：换成子面板。
+ *
+ * ★ 原来只给了 16px 左缩进，读起来就是"第一行没排满、又接了一行"——
+ *   和上面那条一级行之间看不出从属关系，所以显脏。
+ *   现在给它浅底 + 一条分隔线 + 随层级递增的缩进：
+ *   一眼能看到"这行是我刚点的那个类目的下一层"，而不是另一组一级类目。
+ */
 .cat-row.sub {
-  padding-left: var(--space-4);
+  background: var(--color-bg-subtle);
+  border-top: 1px solid var(--color-border);
+  padding-left: calc(var(--space-4) + var(--depth) * var(--space-4));
 }
 
 .cat-chip {

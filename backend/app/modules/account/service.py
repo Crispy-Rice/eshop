@@ -273,6 +273,16 @@ async def create_shop(session: AsyncSession, user_id: int, req: ShopCreateReques
     if user is None:
         raise BizError(ErrorCode.UNAUTHORIZED)
 
+    # ★ 平台账号不开店。两道理由：
+    #   1. 权限设计本就是这个口径 —— ``/api/merchant/*`` 按店铺归属判权，前端也刻意
+    #      不给平台账号看商家菜单（运营维护的是平台数据，不该假装能管某个店的库存）。
+    #      菜单都不给看却留着开店入口，是自相矛盾。
+    #   2. 运营在自己的平台上卖货是利益冲突：商品审核只放给 admin，
+    #      等于自家审核自家。
+    #   只在前端藏按钮等于没挡 —— 接口本身必须拒绝。
+    if user.role in {"admin", "finance"}:
+        raise BizError(ErrorCode.FORBIDDEN, "平台账号不支持开店")
+
     if await repo.get_shop_by_owner(session, user_id) is not None:
         raise BizError(ErrorCode.VALIDATION_ERROR, "你已经开过店铺了")
 

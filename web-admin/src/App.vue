@@ -6,6 +6,7 @@ import { ElMessage } from 'element-plus'
 import { setUnauthorizedHandler } from '@/api/http'
 import ProfileEditDialog from '@/components/ProfileEditDialog.vue'
 import { MALL_APP_URL } from '@/utils/siblingApp'
+import { onImageError } from '@/utils/placeholder'
 import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
@@ -101,12 +102,21 @@ async function onLogout(): Promise<void> {
         <div class="spacer" />
 
         <!-- 同一个账号也能逛商城（卖家账号买东西是常规做法），给个顺手的入口 -->
-        <a :href="MALL_APP_URL" class="mall-link">去商城</a>
+        <a :href="MALL_APP_URL" class="jump-link">去商城</a>
 
         <div v-if="auth.isLoggedIn" class="user">
           <!-- 昵称是个人资料的入口：点开是下拉，和后台控制台的惯例一致 -->
           <el-dropdown trigger="click" @command="onUserCommand">
-            <span class="nickname" title="个人资料">{{ auth.user?.nickname }}</span>
+            <span class="user-chip" title="个人资料">
+              <img
+                v-if="auth.user?.avatar"
+                class="chip-avatar"
+                :src="auth.user.avatar"
+                alt="头像"
+                @error="onImageError"
+              />
+              <span class="chip-name">{{ auth.user?.nickname }}</span>
+            </span>
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item command="profile">个人资料</el-dropdown-item>
@@ -223,14 +233,21 @@ async function onLogout(): Promise<void> {
 }
 
 /* 跨端入口：贴着用户区但不参与它内部的紧凑排布 */
-.mall-link {
+/* 跨端入口：描边小胶囊。它跳出当前应用，所以用"盒子"把它和站内导航区分开 */
+.jump-link {
   flex: 0 0 auto;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
   font-size: var(--text-sm);
   color: var(--color-text-secondary);
-  transition: color var(--dur-fast) var(--ease-out);
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
 }
 
-.mall-link:hover {
+.jump-link:hover {
+  border-color: var(--color-accent);
   color: var(--color-accent);
 }
 
@@ -241,16 +258,35 @@ async function onLogout(): Promise<void> {
   flex: 0 0 auto;
 }
 
-.nickname {
-  font-size: var(--text-base);
-  color: var(--color-text);
+/* 用户胶囊：头像 + 名字，整体是个通往个人资料的下拉 */
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-subtle);
   cursor: pointer;
   outline: none;
-  transition: color var(--dur-fast) var(--ease-out);
+  transition: background-color var(--dur-fast) var(--ease-out);
 }
 
-.nickname:hover {
-  color: var(--color-accent);
+.user-chip:hover {
+  background: var(--color-bg-hover);
+}
+
+.chip-avatar {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  background: var(--media-bg);
+}
+
+.chip-name {
+  font-size: var(--text-sm);
+  color: var(--color-text);
 }
 
 /* ---------- 内容 ---------- */

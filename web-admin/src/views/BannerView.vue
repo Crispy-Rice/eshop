@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import {
@@ -11,6 +11,8 @@ import {
   type Banner,
 } from '@/api/banner'
 import { isBizError } from '@/api/errors'
+import { fetchCategoryTree, type Category } from '@/api/category'
+import { fetchPublicSpu, searchProducts } from '@/api/product'
 import ImageUploader from '@/components/ImageUploader.vue'
 import { onImageError } from '@/utils/placeholder'
 
@@ -22,6 +24,9 @@ import { onImageError } from '@/utils/placeholder'
  *
  * 排序用**数字字段**，不做拖拽：和类目管理页保持一致的取舍（拖拽会把"换顺序"
  * 和别的语义混在一次交互里）。
+ *
+ * ★ 跳转**不让运营手填路径**，改成"选一个商品 / 选一个类目"。
+ *   手填 `/products/9900…` 这种雪花 ID，运营根本不知道该填什么，填错了还是死链。
  */
 const items = ref<Banner[]>([])
 const loading = ref(false)
@@ -30,13 +35,77 @@ const dialogVisible = ref(false)
 const saving = ref(false)
 const editingId = ref<string | null>(null)
 
+/** 跳转目标。none=不可点；custom 是留给非商品/类目页面的逃生口 */
+type LinkType = 'none' | 'product' | 'category' | 'custom'
+
 const form = reactive({
   title: '',
   image: '',
-  /** 站内路径。空串提交时会转成 null（= 不可点） */
-  linkUrl: '',
+  linkType: 'none' as LinkType,
+  /** 商品 id / 类目 id；custom 时就是原样路径 */
+  linkValue: '',
   sort: 0,
   status: 1,
+})
+
+// 商品选择器的候选。按关键词远程搜（接口是公开的 /search，只回在售商品）
+const productOptions = ref<{ id: string; title: string }[]>([])
+const productLoading = ref(false)
+const categories = ref<Category[]>([])
+
+async function searchProduct(keyword: string): Promise<void> {
+  productLoading.value = true
+  try {
+    const res = await searchProducts({ keyword: keyword || undefined, limit: 20 })
+    productOptions.value = res.items.map((i) => ({ id: i.id, title: i.title }))
+  } catch {
+    productOptions.value = []
+  } finally {
+    productLoading.value = false
+  }
+}
+
+/** 站内路径 →（类型, 值）。认不出来的一律算"自定义"，不丢数据 */
+function parseLink(url: string | null): { linkType: LinkType; linkValue: string } {
+  if (!url) return { linkType: 'none', linkValue: '' }
+  const product = /^\/products\/(\d+)$/.exec(url)
+  if (product?.[1]) return { linkType: 'product', linkValue: product[1] }
+  const category = /^\/\?categoryId=(\d+)$/.exec(url)
+  if (category?.[1]) return { linkType: 'category', linkValue: category[1] }
+  return { linkType: 'custom', linkValue: url }
+}
+
+/** （类型, 值）→ 站内路径。选不出东西时当作不可点，而不是存一个半截路径 */
+function buildLink(): string | null {
+  if (form.linkType === 'none' || !form.linkValue) return null
+  if (form.linkType === 'product') return `/products/${form.linkValue}`
+  if (form.linkType === 'category') return `/?categoryId=${form.linkValue}`
+  return form.linkValue
+}
+
+const LINK_TYPE_TEXT: Record<LinkType, string> = {
+  none: '不可点',
+  product: '商品',
+  category: '类目',
+  custom: '自定义',
+}
+
+/** 表格里那一列的分类标签，比一长串 `/products/9900…` 好读 */
+function linkTypeOf(url: string | null): LinkType {
+  return parseLink(url).linkType
+}
+
+const linkHint = computed(() => {
+  switch (form.linkType) {
+    case 'none':
+      return '这张图不可点，纯展示'
+    case 'product':
+      return '点击后打开该商品详情页（只能选在售商品）'
+    case 'category':
+      return '点击后回到首页并筛选该类目（含它的子类目）'
+    default:
+      return '只能填站内路径（以 / 开头）'
+  }
 })
 
 async function load(): Promise<void> {
@@ -54,20 +123,33 @@ function openCreate(): void {
   editingId.value = null
   form.title = ''
   form.image = ''
-  form.linkUrl = ''
+  form.linkType = 'none'
+  form.linkValue = ''
   form.sort = items.value.length > 0 ? Math.max(...items.value.map((i) => i.sort)) + 10 : 10
   form.status = 1
   dialogVisible.value = true
 }
 
-function openEdit(row: Banner): void {
+async function openEdit(row: Banner): Promise<void> {
   editingId.value = row.id
   form.title = row.title
   form.image = row.image
-  form.linkUrl = row.linkUrl ?? ''
+  const parsed = parseLink(row.linkUrl)
+  form.linkType = parsed.linkType
+  form.linkValue = parsed.linkValue
   form.sort = row.sort
   form.status = row.status
   dialogVisible.value = true
+
+  // 选中的商品要能显示出名字，否则下拉里只挂着一个雪花 ID
+  if (parsed.linkType === 'product' && !productOptions.value.some((p) => p.id === parsed.linkValue)) {
+    try {
+      const spu = await fetchPublicSpu(parsed.linkValue)
+      productOptions.value = [...productOptions.value, { id: spu.id, title: spu.title }]
+    } catch {
+      // 商品可能已下架/删除，那就只显示 id，别为它挡住弹窗
+    }
+  }
 }
 
 async function submit(): Promise<void> {
@@ -79,12 +161,15 @@ async function submit(): Promise<void> {
     ElMessage.warning('请上传图片')
     return
   }
+  if (form.linkType !== 'none' && !form.linkValue.trim()) {
+    ElMessage.warning('请选择跳转目标，或把跳转改成「不跳转」')
+    return
+  }
 
   const body = {
     title: form.title.trim(),
     image: form.image,
-    // 空串统一成 null：后端把空串当"清空链接"，两者都表示"不可点"
-    linkUrl: form.linkUrl.trim() || null,
+    linkUrl: buildLink(),
     sort: form.sort,
   }
 
@@ -127,7 +212,16 @@ async function remove(row: Banner): Promise<void> {
   }
 }
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+  // 类目树给"跳转=类目"用；商品先拉一页在售的当默认候选（选不完的靠远程搜）
+  try {
+    categories.value = await fetchCategoryTree()
+  } catch {
+    categories.value = []
+  }
+  await searchProduct('')
+})
 </script>
 
 <template>
@@ -158,9 +252,14 @@ onMounted(load)
           </template>
         </el-table-column>
 
-        <el-table-column label="跳转" min-width="200">
+        <el-table-column label="跳转" width="110">
           <template #default="{ row }">
-            <span v-if="row.linkUrl" class="tnum link">{{ row.linkUrl }}</span>
+            <!-- 只出类型，不出路径：`/products/99005…` 对运营是噪音，
+                 真要核对就去编辑弹窗里看选择器回显。
+                 有跳转的给柔和底胶囊，没有的退成灰字 —— 一眼能分出哪些图可点 -->
+            <el-tag v-if="row.linkUrl" size="small" round disable-transitions>
+              {{ LINK_TYPE_TEXT[linkTypeOf(row.linkUrl)] }}
+            </el-tag>
             <span v-else class="muted">不可点</span>
           </template>
         </el-table-column>
@@ -201,11 +300,51 @@ onMounted(load)
           </div>
         </el-form-item>
         <el-form-item label="标题">
-          <el-input v-model="form.title" maxlength="64" class="w-full" placeholder="运营自己看的名字" />
+          <el-input v-model="form.title" maxlength="64" class="w-full" />
         </el-form-item>
         <el-form-item label="跳转">
-          <el-input v-model="form.linkUrl" class="w-full" placeholder="站内路径，如 /products/123 或 /?categoryId=1" />
-          <div class="field-hint">只能填站内路径（以 / 开头），留空表示这张图不可点</div>
+          <div class="link-field">
+            <el-radio-group v-model="form.linkType">
+              <el-radio-button value="none">不跳转</el-radio-button>
+              <el-radio-button value="product">商品</el-radio-button>
+              <el-radio-button value="category">类目</el-radio-button>
+              <el-radio-button value="custom">自定义</el-radio-button>
+            </el-radio-group>
+
+            <el-select
+              v-if="form.linkType === 'product'"
+              v-model="form.linkValue"
+              filterable
+              remote
+              reserve-keyword
+              :remote-method="searchProduct"
+              :loading="productLoading"
+              placeholder="输入商品名搜索"
+              class="w-full"
+            >
+              <el-option v-for="p in productOptions" :key="p.id" :label="p.title" :value="p.id" />
+            </el-select>
+
+            <el-tree-select
+              v-else-if="form.linkType === 'category'"
+              v-model="form.linkValue"
+              :data="categories"
+              :props="{ label: 'name', children: 'children' }"
+              node-key="id"
+              check-strictly
+              :render-after-expand="false"
+              placeholder="选一个类目"
+              class="w-full"
+            />
+
+            <el-input
+              v-else-if="form.linkType === 'custom'"
+              v-model="form.linkValue"
+              class="w-full"
+              placeholder="站内路径，如 /coupons"
+            />
+          </div>
+          <div class="field-hint">{{ linkHint }}</div>
         </el-form-item>
         <el-form-item label="排序">
           <el-input-number v-model="form.sort" :controls="false" />
@@ -294,11 +433,16 @@ onMounted(load)
 }
 
 .muted {
+  font-size: var(--text-sm);
   color: var(--color-text-placeholder);
 }
 
-.link {
-  color: var(--color-text-secondary);
+/* 跳转弹窗里那一组：类型单选在上，选择器在下，都占满宽度 */
+.link-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
 }
 
 .w-full {

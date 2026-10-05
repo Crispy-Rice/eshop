@@ -206,8 +206,10 @@ onMounted(load)
       <template v-else>
         <!-- 表头。树没法真做成 el-table，但把这一条加上，读起来就是后台那一套表格 -->
         <div class="panel-head">
-          <span>类目</span>
-          <span class="head-actions">操作</span>
+          <span class="col-name">类目</span>
+          <span class="col-count">商品数</span>
+          <span class="col-status">状态</span>
+          <span class="node-actions">操作</span>
         </div>
 
         <el-tree
@@ -220,13 +222,30 @@ onMounted(load)
         >
           <template #default="{ data }">
             <div class="node">
-              <span class="node-name" :class="{ off: data.status !== 1 }">{{ data.name }}</span>
-              <el-tag v-if="data.status !== 1" type="info" size="small" effect="plain" disable-transitions>
-                停用
-              </el-tag>
-              <el-tag v-if="data.spuCount > 0" size="small" effect="plain" disable-transitions>
-                <span class="tnum">{{ data.spuCount }}</span> 件商品
-              </el-tag>
+              <span class="node-name col-name" :class="{ off: data.status !== 1 }">
+                {{ data.name }}
+              </span>
+
+              <!-- 列宽固定，没内容时也占位 —— 一列看下来数字与状态才对齐 -->
+              <span class="col-count">
+                <el-tag v-if="data.spuCount > 0" size="small" effect="plain" disable-transitions>
+                  <span class="tnum">{{ data.spuCount }}</span> 件
+                </el-tag>
+                <span v-else class="muted">—</span>
+              </span>
+
+              <span class="col-status">
+                <el-tag
+                  v-if="data.status !== 1"
+                  type="info"
+                  size="small"
+                  effect="plain"
+                  disable-transitions
+                >
+                  停用
+                </el-tag>
+                <span v-else class="muted">启用</span>
+              </span>
 
               <div class="node-actions">
                 <el-button
@@ -394,14 +413,16 @@ onMounted(load)
  * 类目树
  *
  * 后台其它页都是 el-table：表头、带分隔线的行、悬停高亮、一致的行高。
- * 树在结构上不是表格，但把这四样凑齐，读起来就还是同一套东西 ——
- * 之前"看着不整齐"主要就缺在这里。
+ * 树在结构上不是表格，但把这四样凑齐，读起来就还是同一套东西。
+ *
+ * ★ 再加一条：**列要对齐**。商品数和状态原来是紧跟在类目名后面的，
+ *   名字长短一变，后面就参差不齐 —— 一级看下来像几行散落的标签，不像表格。
+ *   所以给它们固定列宽（表头与行共用同一组宽度），数字才会排成一竖列。
  * ------------------------------------------------------------------------*/
 
 .panel-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   padding: var(--space-2) var(--space-4);
   border-bottom: 1px solid var(--color-border);
   background: var(--color-bg-subtle);
@@ -409,9 +430,34 @@ onMounted(load)
   color: var(--color-text-secondary);
 }
 
-/* 与下面四个操作槽位的总宽一致，「操作」二字才正好压在按钮上方 */
-.head-actions {
-  width: calc(78px + 42px * 3);
+/* 四列的宽度在**表头与行之间共用** —— 两边各写一份，早晚会漂移 */
+.col-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.col-count {
+  flex: 0 0 auto;
+  width: 96px;
+}
+
+.col-status {
+  flex: 0 0 auto;
+  width: 64px;
+}
+
+.node-actions {
+  flex: 0 0 auto;
+  width: 204px;
+  display: grid;
+  grid-template-columns: 78px 42px 42px 42px;
+  align-items: center;
+  justify-items: end;
+}
+
+/* 表头那一格只是个标签，别套按钮网格，右对齐即可 */
+.panel-head .node-actions {
+  display: block;
   text-align: right;
 }
 
@@ -435,7 +481,7 @@ onMounted(load)
 .node {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
   width: 100%;
   padding-right: var(--space-4);
 }
@@ -450,22 +496,19 @@ onMounted(load)
   color: var(--color-text-placeholder);
 }
 
-/*
- * 四个操作各占一个**固定槽位**。
- *
- * ★ 不能只靠右对齐：三级类目没有「新增子类目」，缺这一个按钮，后面三个就会整体
- *   右移 —— 一列行看下来按钮的左边缘参差不齐，这正是这一页显得不整齐的主因。
- *   用 grid 显式指定列，缺的那个位置空着即可。
- */
-.node-actions {
-  margin-left: auto;
-  flex: 0 0 auto;
-  display: grid;
-  grid-template-columns: 78px 42px 42px 42px;
-  align-items: center;
-  justify-items: end;
+/* 没有内容的那一格也用「—」占位，行高与视觉节奏才不会塌 */
+.muted {
+  font-size: var(--text-sm);
+  color: var(--color-text-placeholder);
 }
 
+/*
+ * 四个操作各占一个**固定槽位**（宽度在 `.node-actions` 里统一给）。
+ *
+ * ★ 不能只靠右对齐：三级类目没有「新增子类目」，缺这一个按钮，后面三个就会整体
+ *   右移 —— 一列行看下来按钮的左边缘参差不齐。
+ *   用 grid 显式指定列，缺的那个位置空着即可。
+ */
 .node-actions :deep(.act-create) {
   grid-column: 1;
 }

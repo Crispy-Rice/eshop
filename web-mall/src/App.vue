@@ -9,6 +9,7 @@ import { useTheme } from '@/composables/useTheme'
 import { useAuthStore } from '@/stores/auth'
 import { useCartStore } from '@/stores/cart'
 import { ADMIN_APP_URL } from '@/utils/siblingApp'
+import { onImageError } from '@/utils/placeholder'
 
 const auth = useAuthStore()
 const cart = useCartStore()
@@ -24,9 +25,9 @@ const backendEntry = computed(() => {
   const user = auth.user
   if (!user) return null
   if (user.role === 'admin' || user.role === 'finance') {
-    return { label: '运营后台', url: ADMIN_APP_URL }
+    return { label: '去后台', url: ADMIN_APP_URL }
   }
-  return user.shopId ? { label: '商家后台', url: ADMIN_APP_URL } : null
+  return user.shopId ? { label: '去后台', url: ADMIN_APP_URL } : null
 })
 
 // 令牌失效时由 http 层回调：清状态并跳登录
@@ -94,10 +95,21 @@ async function onLogout(): Promise<void> {
 
         <div class="user">
           <template v-if="auth.isLoggedIn">
-            <a v-if="backendEntry" :href="backendEntry.url" class="backend-link">
+            <!-- 跨端入口：描边小胶囊，和站内导航区分开（它跳出当前应用） -->
+            <a v-if="backendEntry" :href="backendEntry.url" class="jump-link">
               {{ backendEntry.label }}
             </a>
-            <RouterLink to="/account" class="nickname" title="个人中心">{{ auth.user?.nickname }}</RouterLink>
+            <!-- 用户胶囊：头像 + 名字，点进个人中心 -->
+            <RouterLink to="/account" class="user-chip" title="个人中心">
+              <img
+                v-if="auth.user?.avatar"
+                class="chip-avatar"
+                :src="auth.user.avatar"
+                alt="头像"
+                @error="onImageError"
+              />
+              <span class="chip-name">{{ auth.user?.nickname }}</span>
+            </RouterLink>
             <el-button link type="primary" @click="onLogout">退出</el-button>
           </template>
           <RouterLink v-else to="/login">
@@ -287,26 +299,50 @@ async function onLogout(): Promise<void> {
   flex: 0 0 auto;
 }
 
-/* 跨端入口：比站内导航轻一档，不跟"购物车/我的订单"抢注意力 */
-.backend-link {
+/* 跨端入口：描边小胶囊。它跳出当前应用，所以用"盒子"把它和站内导航区分开 */
+.jump-link {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
   font-size: var(--text-sm);
   color: var(--color-text-secondary);
-  transition: color var(--dur-fast) var(--ease-out);
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
 }
 
-.backend-link:hover {
+.jump-link:hover {
+  border-color: var(--color-accent);
   color: var(--color-accent);
 }
 
-.nickname {
-  font-size: var(--text-base);
+/* 用户胶囊：头像 + 名字，整体是个通往个人中心的按钮 */
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-subtle);
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.user-chip:hover {
+  background: var(--color-bg-hover);
+}
+
+.chip-avatar {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  background: var(--media-bg);
+}
+
+.chip-name {
+  font-size: var(--text-sm);
   color: var(--color-text);
-  transition: color var(--dur-fast) var(--ease-out);
-}
-
-/* 昵称是通往个人中心的入口 —— 给个 hover 提示，否则看不出能点 */
-.nickname:hover {
-  color: var(--color-accent);
 }
 
 /* ---------- 内容 ---------- */
@@ -329,7 +365,7 @@ async function onLogout(): Promise<void> {
   }
 
   /* 窄屏和 .nav 一并收起：header 里每样都是定宽，留着会把内容顶出可视区 */
-  .backend-link {
+  .jump-link {
     display: none;
   }
 }
