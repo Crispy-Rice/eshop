@@ -675,6 +675,12 @@ async def ship(
     if sub is None or int(sub.shop_id) != shop_id:
         raise BizError(ErrorCode.ORDER_ITEM_NOT_FOUND, "订单不存在")
 
+    # ★ 先预检单号是否已被用过，**再动状态机**。
+    #   不预检的话，uk_delivery_express 的唯一冲突会中断整个 PG 事务、冒成
+    #   500「系统繁忙」；而单号填重是商家自己能改的问题，必须给一句明确的话。
+    if await repo.delivery_express_exists(session, express_company, express_no):
+        raise BizError(ErrorCode.VALIDATION_ERROR, "该快递单号已被使用，请核对后重新填写")
+
     await transit(
         session,
         order_sub_no,

@@ -7,7 +7,6 @@ import { fetchCategoryTree, type Category } from '@/api/category'
 import { isBizError } from '@/api/errors'
 import { createSpu, type SkuIn, type SpuCreateInput } from '@/api/product'
 import ImageUploader from '@/components/ImageUploader.vue'
-import { DEFAULT_IMAGE } from '@/utils/placeholder'
 import { formatYuan, yuanToFen } from '@/utils/money'
 
 const router = useRouter()
@@ -49,7 +48,10 @@ const form = reactive({
   categoryId: '' as string,
   title: '',
   subTitle: '',
-  mainImage: DEFAULT_IMAGE,
+  // ★ 空串，不是占位图。以前这里预填一段灰色 SVG 的 data URI 来满足"非空"校验，
+  //   结果它被当成真实图片存进了库，一路传染到购物车和订单快照 —— 前端兜底只认
+  //   空值，对"一张能成功加载的灰图"无能为力。图可以之后再补，占位图不能进库。
+  mainImage: '',
 })
 
 const groups = ref<GroupRow[]>([
@@ -59,7 +61,8 @@ const groups = ref<GroupRow[]>([
 const rules: FormRules = {
   categoryId: [{ required: true, message: '请选择末级类目', trigger: 'change' }],
   title: [{ required: true, message: '请输入商品标题', trigger: 'blur' }],
-  mainImage: [{ required: true, message: '请上传主图', trigger: 'change' }],
+  // 主图不设为必填：允许"先发布、后补图"。空图在商城由展示层兜底成占位图，
+  // 而**占位图本身不能进库** —— 那会变成一张骗过 onImageError 的灰块。
 }
 
 const cascaderProps = {
@@ -148,7 +151,7 @@ watch(
           enabled: true,
           skuCode: '',
           price: undefined,
-          coverImage: DEFAULT_IMAGE,
+          coverImage: '',
           weightG: undefined,
         }
       }
@@ -196,7 +199,7 @@ function validateSpecs(): string | null {
   for (const row of enabledSkus.value) {
     if (!row.skuCode.trim()) return `「${row.label}」缺少商家编码`
     if (row.price === undefined || row.price <= 0) return `「${row.label}」的价格必须大于 0`
-    if (!row.coverImage.trim()) return `「${row.label}」缺少封面图`
+    // 规格封面是选填的：不传时商城会用商品主图（后端 batch_get_skus 里回落）
     if (!row.weightG || row.weightG <= 0) return `「${row.label}」的重量必须大于 0`
   }
 

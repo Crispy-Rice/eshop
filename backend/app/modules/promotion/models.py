@@ -472,3 +472,49 @@ class PromoStackRule(Base):
     )
     effective_from: Mapped[datetime | None] = mapped_column(TS)
     effective_to: Mapped[datetime | None] = mapped_column(TS)
+
+
+# ============================================================
+# 首页 Banner
+# ============================================================
+BANNER_ENABLED = 1
+BANNER_DISABLED = 2
+
+BANNER_STATUS_TEXT: dict[int, str] = {
+    BANNER_ENABLED: "启用",
+    BANNER_DISABLED: "停用",
+}
+
+
+class Banner(Base):
+    """首页轮播图。
+
+    放在 promotion schema 下的理由：它是**运营投放内容**，归属和营销一致，
+    管理端点也沿用同一套角色（admin / finance），没必要为一张表新建模块。
+
+    ★ ``image`` 存的是**完整 url**（``/media/banners/<uid>/xxx.webp``），
+      与 products / shops / avatars 同一套契约 —— 它直接当 ``<img src>`` 用。
+
+    ★ ``link_url`` **只接受站内路径**（以 ``/`` 开头），空表示这张图不可点。
+      外链要处理新窗口、referrer、白名单，当前场景用不到。
+
+    没有"生效时间窗"：没人要预约投放，加了就是给不存在的需求写代码。
+    """
+
+    __tablename__ = "banner"
+    __table_args__ = (
+        # 公开接口的查询就是 WHERE status=1 ORDER BY sort, id，正好吃这个索引
+        Index("idx_banner_status_sort", "status", "sort", "id"),
+        {"schema": "promotion", "comment": "首页轮播图"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    title: Mapped[str] = mapped_column(String(64), nullable=False, comment="运营看的名字，也当 alt")
+    image: Mapped[str] = mapped_column(String(255), nullable=False, comment="完整 url")
+    link_url: Mapped[str | None] = mapped_column(String(255), comment="站内路径，空=不可点")
+    sort: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    status: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("1"), comment="1启用 2停用"
+    )
+    created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())

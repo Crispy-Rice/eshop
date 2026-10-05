@@ -923,3 +923,397 @@ async def test_create_spu_is_atomic(client: AsyncClient, session) -> None:
     # 规格组没有被重复写入
     groups = await session.scalar(text("SELECT count(*) FROM product.spec_group"))
     assert groups == 4  # 两个商品各 2 个规格组
+
+
+# ============================================================
+# 平台商品列表与审核意见
+# ============================================================
+
+
+async def _category_tree(client: AsyncClient, admin_token: str) -> str:
+    """建「数码 / 手机 / 智能手机」三层，返回末级类目 id。"""
+    level1 = await _make_category(client, admin_token, "数码")
+    level2 = await _make_category(client, admin_token, "手机", parent_id=level1)
+    return await _make_category(client, admin_token, "智能手机", parent_id=level2)
+
+
+async def _merchant_submits(client: AsyncClient, category_id: str, phone: str) -> tuple[dict, str]:
+    """开一家新店、发布商品并**提交审核**（停在待审核）。返回 (商家 token, spu_id)。"""
+    merchant = await register(client, phone=phone)
+    await open_shop(client, merchant["accessToken"])
+    headers = auth_header(merchant["accessToken"])
+
+    resp = await client.post("/api/merchant/spus", json=_spu_payload(category_id), headers=headers)
+    assert resp.status_code == 200, resp.text
+    spu_id = resp.json()["data"]["id"]
+
+    submitted = await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=headers)
+    assert submitted.status_code == 200, submitted.text
+    return merchant, spu_id
+
+
+async def _admin_list(client: AsyncClient, admin_token: str, **params) -> list[dict]:
+    resp = await client.get("/api/admin/spus", params=params, headers=auth_header(admin_token))
+    assert resp.status_code == 200, resp.text
+    return resp.json()["data"]["items"]
+
+
+# ============================================================
+# 删除商品（软删）
+# ============================================================
+
+
+async def _create_spu(client: AsyncClient, headers: dict[str, str], category_id: str) -> str:
+    resp = await client.post("/api/merchant/spus", json=_spu_payload(category_id), headers=headers)
+    assert resp.status_code == 200, resp.text
+    return resp.json()["data"]["id"]
+
+
+async def _make_on_shelf(client: AsyncClient, session, phone: str = "13900139099") -> tuple[dict, dict, str, str]:
+    """造一个**已上架**的商品。返回 (商家, 商品 headers, spu_id, admin token)。"""
+    merchant, category, _ = await _setup_merchant(client, session)
+    headers = auth_header(merchant["accessToken"])
+    admin = await make_admin(client, session, phone=phone)
+    spu_id = await _create_spu(client, headers, category)
+
+    await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=headers)
+    await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": True},
+        headers=auth_header(admin["accessToken"]),
+    )
+    return merchant, headers, spu_id, admin["accessToken"]
+
+
+async def _db_deleted(session, spu_id: str) -> bool:
+    return bool(
+        await session.scalar(text("SELECT deleted FROM product.spu WHERE id = :id"), {"id": int(spu_id)})
+    )
+
+
+async def _db_stock_sku_ids(session, sku_ids: set[str]) -> set[str]:
+    """这些 SKU 在 ``inventory.sku_stock`` 里真实存在的行。
+
+    读侧现在会把已删商品过滤掉，光看接口返回分不清"没有行"和"有行但被藏了"，
+    所以关键断言要落到库上。
+    """
+    if not sku_ids:
+        return set()
+    rows = await session.scalars(
+        text("SELECT sku_id FROM inventory.sku_stock WHERE sku_id = ANY(:ids)"),
+        {"ids": [int(s) for s in sku_ids]},
+    )
+    return {str(r) for r in rows}
+
+
+async def test_delete_draft_product(client: AsyncClient, session) -> None:
+    """草稿可以直接删。删的是**软删** —— 行还在，只是打了 deleted 标记。"""
+    merchant, category, _ = await _setup_merchant(client, session)
+    headers = auth_header(merchant["accessToken"])
+    spu_id = await _create_spu(client, headers, category)
+
+    resp = await client.delete(f"/api/merchant/spus/{spu_id}", headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    listed = (await client.get("/api/merchant/spus", headers=headers)).json()["data"]["items"]
+    assert all(i["id"] != spu_id for i in listed)
+
+    # ★ 行还在。物理删除会让历史订单指向空气，而且误删救不回来
+    assert await _db_deleted(session, spu_id) is True
+
+
+async def test_delete_off_shelf_product(client: AsyncClient, session) -> None:
+    """已下架的商品可以删 —— "先下架、再删除"就是设计好的两步。"""
+    _, headers, spu_id, _ = await _make_on_shelf(client, session)
+    assert (await client.post(f"/api/merchant/spus/{spu_id}/off-shelf", headers=headers)).status_code == 200
+
+    assert (await client.delete(f"/api/merchant/spus/{spu_id}", headers=headers)).status_code == 200
+
+
+async def test_cannot_delete_on_shelf_product(client: AsyncClient, session) -> None:
+    """★ 在售的不让直接删：商城正卖着的东西忽然消失，买家点进去就是 404。"""
+    _, headers, spu_id, _ = await _make_on_shelf(client, session)
+
+    resp = await client.delete(f"/api/merchant/spus/{spu_id}", headers=headers)
+    assert resp.status_code == 400, resp.text
+    assert "先下架" in resp.json()["message"]
+    assert await _db_deleted(session, spu_id) is False
+
+
+async def test_cannot_delete_pending_audit_product(client: AsyncClient, session) -> None:
+    """★ 审核中的不让删：删了平台正在看的那条会变成"商品不存在"，运营一头雾水。"""
+    merchant, category, _ = await _setup_merchant(client, session)
+    headers = auth_header(merchant["accessToken"])
+    spu_id = await _create_spu(client, headers, category)
+    await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=headers)
+
+    resp = await client.delete(f"/api/merchant/spus/{spu_id}", headers=headers)
+    assert resp.status_code == 400, resp.text
+    assert "审核" in resp.json()["message"]
+
+
+async def test_cannot_delete_another_shops_product(client: AsyncClient, session) -> None:
+    """★ 越权返回 404 而不是 403：不区分"不存在"和"不是你的"。"""
+    merchant, category, _ = await _setup_merchant(client, session)
+    spu_id = await _create_spu(client, auth_header(merchant["accessToken"]), category)
+
+    other = await register(client, phone="13800138077")
+    await open_shop(client, other["accessToken"], name="别家店")
+
+    resp = await client.delete(
+        f"/api/merchant/spus/{spu_id}", headers=auth_header(other["accessToken"])
+    )
+    assert resp.status_code == 404
+
+
+async def test_deleted_product_leaves_platform_list(client: AsyncClient, session) -> None:
+    """删完平台侧也看不到了 —— 否则运营会对着一件不存在的商品点审核。"""
+    _, headers, spu_id, admin_token = await _make_on_shelf(client, session)
+    await client.post(f"/api/merchant/spus/{spu_id}/off-shelf", headers=headers)
+
+    before = {i["id"] for i in await _admin_list(client, admin_token, limit=60)}
+    assert spu_id in before
+
+    await client.delete(f"/api/merchant/spus/{spu_id}", headers=headers)
+
+    after = {i["id"] for i in await _admin_list(client, admin_token, limit=60)}
+    assert spu_id not in after
+
+
+async def test_delete_twice_is_404(client: AsyncClient, session) -> None:
+    """删过就查不到了（get_spu 过滤 deleted），再删是 404 而不是"又删成功一次"。"""
+    merchant, category, _ = await _setup_merchant(client, session)
+    headers = auth_header(merchant["accessToken"])
+    spu_id = await _create_spu(client, headers, category)
+
+    assert (await client.delete(f"/api/merchant/spus/{spu_id}", headers=headers)).status_code == 200
+    assert (await client.delete(f"/api/merchant/spus/{spu_id}", headers=headers)).status_code == 404
+
+
+async def test_deleted_product_gets_no_stock_rows(client: AsyncClient, session) -> None:
+    """★ 删掉的商品不该在库存页凭空冒出库存行。
+
+    库存页会"给还没有库存记录的 SKU 补行"（``inventory.ensure_stock_rows``），
+    而它拿的 SKU 列表来自 ``product.list_skus_by_shop`` —— 那个查询必须排掉
+    已软删的商品，否则商家刚删掉一个从没建过库存的商品，一打开库存页就多出
+    几行 0 库存的残留行，像是没删干净。
+
+    断言直接查库，不只查接口返回 —— 接口侧现在也过滤已删商品，
+    光看返回会把"补行没跑"和"补行跑了但被过滤了"混为一谈。
+    """
+    merchant, category, _ = await _setup_merchant(client, session)
+    headers = auth_header(merchant["accessToken"])
+    # 有仓才会触发补行，否则这个用例会空过
+    wh = await client.post("/api/merchant/warehouses", json={"name": "测试仓"}, headers=headers)
+    assert wh.status_code == 200, wh.text
+
+    async def skus_of(spu_id: str) -> set[str]:
+        detail = await client.get(f"/api/merchant/spus/{spu_id}", headers=headers)
+        return {s["id"] for s in detail.json()["data"]["skus"]}
+
+    doomed = await _create_spu(client, headers, category)
+    doomed_skus = await skus_of(doomed)
+    assert (await client.delete(f"/api/merchant/spus/{doomed}", headers=headers)).status_code == 200
+
+    # 一件没被删的，用来证明"补行"确实在工作 —— 否则下面的断言是空过
+    alive = await _create_spu(client, headers, category)
+    alive_skus = await skus_of(alive)
+
+    items = (
+        await client.get("/api/merchant/inventory", params={"limit": 100}, headers=headers)
+    ).json()["data"]["items"]
+    stocked = {i["skuId"] for i in items}
+
+    assert alive_skus <= stocked, "没删的商品应该被补上库存行"
+    assert not (doomed_skus & stocked), "已删除的商品不该被补库存行"
+    assert not await _db_stock_sku_ids(session, doomed_skus), "库里也不该有它的库存行"
+
+
+async def test_inventory_hides_stock_rows_of_deleted_product(
+    client: AsyncClient, session
+) -> None:
+    """★ 已经建过库存行的商品被删掉后，库存页不该再显示那一行。
+
+    行必须**留在库里**：上面可能挂着未发货订单的预占，删了发货/解锁会对不上账。
+    所以过滤只能做在读侧（``inventory.repo.list_stock`` 的 ``exclude_sku_ids``）。
+    """
+    merchant, category, _ = await _setup_merchant(client, session)
+    headers = auth_header(merchant["accessToken"])
+    await client.post("/api/merchant/warehouses", json={"name": "测试仓"}, headers=headers)
+    # 有仓才会触发补行
+
+    spu_id = await _create_spu(client, headers, category)
+    skus = {
+        s["id"]
+        for s in (
+            await client.get(f"/api/merchant/spus/{spu_id}", headers=headers)
+        ).json()["data"]["skus"]
+    }
+
+    # 先逛一次库存页，让它的 SKU 都拿到库存行
+    before = (
+        await client.get("/api/merchant/inventory", params={"limit": 100}, headers=headers)
+    ).json()["data"]["items"]
+    assert skus <= {i["skuId"] for i in before}, "这一步没补上行，下面的断言会空过"
+
+    assert (await client.delete(f"/api/merchant/spus/{spu_id}", headers=headers)).status_code == 200
+
+    after = (
+        await client.get("/api/merchant/inventory", params={"limit": 100}, headers=headers)
+    ).json()["data"]["items"]
+    assert not (skus & {i["skuId"] for i in after}), "已删商品的库存行不该出现在列表里"
+    assert skus == await _db_stock_sku_ids(session, skus), "行还在库里（不能物理删）"
+
+
+async def test_admin_lists_pending_spus(client: AsyncClient, session) -> None:
+    """★ 这条路径以前根本不存在：平台侧一个能列出商品的接口都没有，
+    审核接口只能靠调用方自己知道 spu_id —— 所以一直没有可用的审核页。"""
+    admin = await make_admin(client, session)
+    category = await _category_tree(client, admin["accessToken"])
+    _, spu_id = await _merchant_submits(client, category, "13800138011")
+
+    items = await _admin_list(client, admin["accessToken"], status=5)
+    assert [i["id"] for i in items] == [spu_id]
+    assert items[0]["status"] == 5
+
+
+async def test_admin_spu_list_is_cross_shop(client: AsyncClient, session) -> None:
+    """平台看到的是**所有店铺**的商品 —— 这正是它和 /api/merchant/spus 的区别。"""
+    admin = await make_admin(client, session)
+    category = await _category_tree(client, admin["accessToken"])
+    _, first = await _merchant_submits(client, category, "13800138012")
+    _, second = await _merchant_submits(client, category, "13800138013")
+
+    items = await _admin_list(client, admin["accessToken"], status=5, limit=60)
+    assert {first, second} <= {i["id"] for i in items}
+    # 两件商品来自两个不同的店
+    assert len({i["shopId"] for i in items}) == 2
+
+
+async def test_admin_spu_list_filters_by_status(client: AsyncClient, session) -> None:
+    admin = await make_admin(client, session)
+    category = await _category_tree(client, admin["accessToken"])
+    _, spu_id = await _merchant_submits(client, category, "13800138014")
+
+    audited = await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": True},
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert audited.status_code == 200, audited.text
+
+    assert await _admin_list(client, admin["accessToken"], status=5) == []
+    assert [i["id"] for i in await _admin_list(client, admin["accessToken"], status=2)] == [spu_id]
+
+
+async def test_admin_spu_list_requires_admin(client: AsyncClient) -> None:
+    merchant = await register(client, phone="13800138015")
+    resp = await client.get("/api/admin/spus", headers=auth_header(merchant["accessToken"]))
+    assert resp.status_code == 403
+
+
+async def test_reject_reason_reaches_merchant(client: AsyncClient, session) -> None:
+    """★ 驳回理由要落到商家看得见的地方。
+
+    这个接口从第一天就收 ``remark``，但**没有任何地方存它** —— 驳回后商品
+    只是悄悄回到草稿，商家不知道该改什么。
+    """
+    admin = await make_admin(client, session)
+    category = await _category_tree(client, admin["accessToken"])
+    merchant, spu_id = await _merchant_submits(client, category, "13800138016")
+
+    rejected = await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": False, "remark": "主图太模糊，换一张"},
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert rejected.status_code == 200, rejected.text
+
+    detail = (
+        await client.get(
+            f"/api/merchant/spus/{spu_id}", headers=auth_header(merchant["accessToken"])
+        )
+    ).json()["data"]
+    assert detail["status"] == 1  # 回到草稿，改完可以再交
+    assert detail["auditRemark"] == "主图太模糊，换一张"
+
+
+async def test_approve_clears_previous_reject_reason(client: AsyncClient, session) -> None:
+    """改完再提交并通过之后，不该还挂着上一次的驳回理由。"""
+    admin = await make_admin(client, session)
+    category = await _category_tree(client, admin["accessToken"])
+    merchant, spu_id = await _merchant_submits(client, category, "13800138017")
+    admin_headers = auth_header(admin["accessToken"])
+    merchant_headers = auth_header(merchant["accessToken"])
+
+    await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": False, "remark": "旧理由"},
+        headers=admin_headers,
+    )
+    await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=merchant_headers)
+    await client.post(f"/api/admin/spus/{spu_id}/audit", json={"approved": True}, headers=admin_headers)
+
+    detail = (await client.get(f"/api/merchant/spus/{spu_id}", headers=merchant_headers)).json()["data"]
+    assert detail["status"] == 2
+    assert detail["auditRemark"] is None
+
+
+async def test_buyer_never_sees_audit_remark(client: AsyncClient, session) -> None:
+    """★ 审核意见是平台↔商家之间的内部说明，买家不该看到。
+
+    正常流程下"通过"会把理由清掉，所以这里直接把状态推成已上架来构造这个
+    组合 —— 防的是以后有人把清空的顺序改掉。
+    """
+    admin = await make_admin(client, session)
+    category = await _category_tree(client, admin["accessToken"])
+    merchant, spu_id = await _merchant_submits(client, category, "13800138018")
+
+    await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": False, "remark": "内部说明"},
+        headers=auth_header(admin["accessToken"]),
+    )
+    await session.execute(text("UPDATE product.spu SET status = 2 WHERE id = :id"), {"id": int(spu_id)})
+    await session.commit()
+
+    public = (await client.get(f"/api/spus/{spu_id}")).json()["data"]
+    assert public["auditRemark"] is None
+
+    # 店主自己仍然看得到
+    mine = (
+        await client.get(
+            f"/api/merchant/spus/{spu_id}", headers=auth_header(merchant["accessToken"])
+        )
+    ).json()["data"]
+    assert mine["auditRemark"] == "内部说明"
+
+
+async def test_create_product_without_images(client: AsyncClient, session) -> None:
+    """主图与规格封面都可以为空 —— "先发布、后补图"是合法路径。
+
+    以前后台用一段灰色占位图 data URI 来满足"非空"校验，结果占位图被当成真实图片
+    存进库，一路传染到购物车、结算页和订单快照（它是一张能成功加载的灰图，
+    前端的 onImageError 兜底根本不触发）。空就是空，兜底交给展示层。
+    """
+    merchant, category, _ = await _setup_merchant(client, session)
+    headers = auth_header(merchant["accessToken"])
+    payload = _spu_payload(category)
+    payload["mainImage"] = ""
+    for sku in payload["skus"]:
+        sku["coverImage"] = ""
+
+    resp = await client.post("/api/merchant/spus", json=payload, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    spu_id = resp.json()["data"]["id"]
+    detail = (
+        await client.get(f"/api/merchant/spus/{spu_id}", headers=headers)
+    ).json()["data"]
+    assert detail["mainImage"] == ""
+    assert all(s["coverImage"] == "" for s in detail["skus"])
+    # 库里也不能留下任何占位图形态的值
+    assert (
+        await session.scalar(text("SELECT count(*) FROM product.sku WHERE cover_image LIKE 'data:%'"))
+        == 0
+    )

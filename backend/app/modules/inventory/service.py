@@ -769,11 +769,16 @@ async def list_stock_out(
         if target_wh is not None:
             await ensure_stock_rows(session, shop_id, target_wh)
 
+    # ★ 已软删商品的库存行不展示。行还在库里（可能有预占对应未发货订单，
+    #   删掉会让发货/解锁对不上账），但商品已经从商城消失，摆在库存页只会让
+    #   商家以为"没删干净"。过滤必须在 SQL 层做，见 repo.list_stock。
+    deleted_sku_ids = await product_service.list_deleted_sku_ids(session, shop_id)
     rows = await repo.list_stock(
         session,
         shop_id,
         warehouse_id=warehouse_id,
         sku_id=sku_id,
+        exclude_sku_ids=deleted_sku_ids,
         cursor=cursor,
         limit=limit,
     )
@@ -797,10 +802,12 @@ async def list_stock_out(
                 sku_id=row.sku_id,
                 warehouse_id=row.warehouse_id,
                 warehouse_name=warehouses.get(row.warehouse_id, ""),
-                # SKU 已被删除时仍显示库存行，但标题留空 —— 静默丢行会让商家以为库存没了
+                # 已软删商品的 SKU 上面就被排掉了，取不到只可能是数据异常
+                # （SKU 指向了不存在的 SPU）。标题留空，前端会退回显示 skuId，
+                # 比整行静默消失强 —— 那种情况商家会以为库存丢了。
                 sku_code=sku.sku_code if sku else "",
                 spec_text=sku.spec_text if sku else "",
-                spu_title=sku.title if sku else "（商品已删除）",
+                spu_title=sku.title if sku else "",
                 total=row.total,
                 available=row.available,
                 locked=row.locked,

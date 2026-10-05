@@ -41,6 +41,7 @@ async def clean_promotion(app_runtime: None):
             "coupon_code",
             "coupon_template",
             "promo_activity",
+            "banner",
         ):
             await s.execute(text(f"DELETE FROM promotion.{t}"))
     redis = get_redis()
@@ -680,3 +681,106 @@ async def test_admin_activity_list_rejects_non_admin(client: AsyncClient) -> Non
         "/api/admin/promotions", headers=auth_header(user["accessToken"])
     )
     assert resp.status_code == 403
+
+
+# ============================================================
+# 首页 Banner
+#
+# 这条链路此前完全不存在（代码库里没有任何 banner 概念），所以从建到删整条走一遍。
+# ============================================================
+async def test_banner_crud_and_public_visibility(client: AsyncClient, session) -> None:
+    """★ 公开接口只出启用中的，且按 sort 排序；停用后商城立刻看不到。"""
+    admin = await make_admin(client, session)
+    ah = auth_header(admin["accessToken"])
+
+    created: list[dict] = []
+    for i, (title, sort) in enumerate([("新品首发", 20), ("618 主会场", 10)]):
+        resp = await client.post(
+            "/api/admin/banners",
+            json={
+                "title": title,
+                "image": f"/media/banners/x/{i}.webp",
+                "sort": sort,
+                "linkUrl": "/products/1",
+            },
+            headers=ah,
+        )
+        assert resp.status_code == 200, resp.text
+        created.append(resp.json()["data"])
+
+    # 公开接口：不需要登录，按 sort 升序（10 在前）
+    public = await client.get("/api/banners")
+    assert public.status_code == 200
+    assert [b["title"] for b in public.json()["data"]] == ["618 主会场", "新品首发"]
+
+    # 停用一条：公开接口里没了，但管理端还看得到 ——
+    # 否则停用过的图就再也找不回来，等于变相删除
+    banner_id = created[1]["id"]
+    resp = await client.put(f"/api/admin/banners/{banner_id}", json={"status": 2}, headers=ah)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["status"] == 2
+    assert [b["title"] for b in (await client.get("/api/banners")).json()["data"]] == ["新品首发"]
+    assert len((await client.get("/api/admin/banners", headers=ah)).json()["data"]) == 2
+
+    # 删除：成功一次，再来就是 404
+    assert (await client.delete(f"/api/admin/banners/{banner_id}", headers=ah)).status_code == 200
+    assert (await client.delete(f"/api/admin/banners/{banner_id}", headers=ah)).status_code == 404
+
+
+async def test_banner_update_clears_link_and_keeps_others(
+    client: AsyncClient, session
+) -> None:
+    """部分更新：只改传了的字段；link_url 传空串 = 清空链接。"""
+    admin = await make_admin(client, session)
+    ah = auth_header(admin["accessToken"])
+    resp = await client.post(
+        "/api/admin/banners",
+        json={"title": "带链接", "image": "/media/banners/a.webp", "linkUrl": "/products/9", "sort": 5},
+        headers=ah,
+    )
+    banner_id = resp.json()["data"]["id"]
+
+    # 只改排序，标题/链接/图都不动
+    resp = await client.put(f"/api/admin/banners/{banner_id}", json={"sort": 1}, headers=ah)
+    data = resp.json()["data"]
+    assert (data["sort"], data["title"], data["linkUrl"], data["image"]) == (
+        1,
+        "带链接",
+        "/products/9",
+        "/media/banners/a.webp",
+    )
+
+    # 空串清空链接（None 是"不改"，两者语义不同）
+    resp = await client.put(f"/api/admin/banners/{banner_id}", json={"linkUrl": ""}, headers=ah)
+    assert resp.json()["data"]["linkUrl"] is None
+
+
+async def test_banner_rejects_external_link(client: AsyncClient, session) -> None:
+    """★ link_url 只接受站内路径：前端只会 router.push，外链会变成死链。"""
+    admin = await make_admin(client, session)
+    resp = await client.post(
+        "/api/admin/banners",
+        json={
+            "title": "外链",
+            "image": "/media/banners/x.webp",
+            "linkUrl": "https://example.com/a",
+        },
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_banner_admin_endpoints_are_role_guarded(client: AsyncClient, session) -> None:
+    """管理端点是 admin / finance —— 买家碰不到；公开接口不需要登录。"""
+    buyer = await register(client, phone="13800138091")
+    bh = auth_header(buyer["accessToken"])
+
+    assert (await client.get("/api/admin/banners", headers=bh)).status_code == 403
+    resp = await client.post(
+        "/api/admin/banners",
+        json={"title": "x", "image": "/media/banners/x.webp"},
+        headers=bh,
+    )
+    assert resp.status_code == 403
+    # 公开接口不带令牌也通
+    assert (await client.get("/api/banners")).status_code == 200

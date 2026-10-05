@@ -1,4 +1,4 @@
-import { get, post, put } from './http'
+import { del, get, post, put } from './http'
 
 export interface SpuCard {
   id: string
@@ -48,6 +48,8 @@ export interface SpuDetail {
   priceMax: number
   totalSold: number
   status: number
+  /** 最近一次审核意见。**只有店主看得到**，买家视角恒为 null */
+  auditRemark: string | null
   specGroups: SpecGroup[]
   skus: SkuDetail[]
 }
@@ -56,14 +58,6 @@ export interface SpuList {
   items: SpuCard[]
   hasMore: boolean
   nextCursor: string | null
-}
-
-export interface Shop {
-  id: string
-  name: string
-  logo: string | null
-  description: string | null
-  status: number
 }
 
 // ---------- 发布商品 ----------
@@ -129,6 +123,14 @@ export const onShelf = (spuId: string) => post<null>(`/merchant/spus/${spuId}/on
 
 export const offShelf = (spuId: string) => post<null>(`/merchant/spus/${spuId}/off-shelf`)
 
+/**
+ * 删除商品。**软删**：商品从商城、自己的列表、平台审核列表里一起消失，
+ * 但历史订单不受影响（订单读的是商品快照），库存页会保留它的库存行。
+ *
+ * 在售的（status=2）和审核中的（status=5）后端会拒绝，分别提示先下架 / 等审核结果。
+ */
+export const deleteSpu = (spuId: string) => del<null>(`/merchant/spus/${spuId}`)
+
 export const updateSku = (
   skuId: string,
   body: { price?: number; coverImage?: string; weightG?: number; status?: number },
@@ -139,7 +141,18 @@ export const updateSpu = (
   body: { title?: string; subTitle?: string | null; mainImage?: string; sortWeight?: number },
 ) => put<SpuDetail>(`/merchant/spus/${spuId}`, body)
 
-export const fetchMyShop = () => get<Shop>('/merchant/shop')
-
 export const auditSpu = (spuId: string, approved: boolean, remark?: string) =>
   post<null>(`/admin/spus/${spuId}/audit`, { approved, remark: remark ?? null })
+
+/**
+ * 平台侧的商品列表（**跨店铺**），审核队列用它。
+ *
+ * 与 `listMySpus` 的区别只有"不限定店铺"和"能看到待审核"——
+ * 后端那条路径本来就支持状态过滤，所以这里是同一个返回结构。
+ */
+export const listAdminSpus = (params: {
+  status?: number
+  keyword?: string
+  cursor?: string | null
+  limit?: number
+}) => get<SpuList>('/admin/spus', { params })

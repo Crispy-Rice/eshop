@@ -132,12 +132,14 @@ def calc(
     coupons: list[CouponInput] | None = None,
     activities: list[ActivityInput] | None = None,
     rules: list[tuple[str, str, int, bool]] | None = None,
+    selected: list[int] | None = None,
 ):
     return PriceCalculator(
         items,
         coupons=coupons or [],
         activities=activities or [],
         stack_rules=DEFAULT_RULES if rules is None else rules,
+        selected_coupon_ids=selected,
     ).run()
 
 
@@ -517,3 +519,40 @@ def test_negative_payable_raises() -> None:
     ]
     with pytest.raises(ValueError, match="应付金额为负"):
         pc._summarize()
+
+
+# ============================================================
+# ⑧ 用户显式选券：只算选中的
+#
+# ``selected_coupon_ids`` 以前只是被存进实例、**没有任何地方读它**，
+# 所以结算页点了哪张券都不影响结果 —— 引擎永远自己挑每组最优的那张。
+# 后果是"选了 ¥10、账单还是按 ¥20 减"，选择被无声吞掉。
+# ============================================================
+def test_selected_coupon_is_honored_even_when_worse() -> None:
+    """选了较差的券就只减较差的 —— 尊重用户的选择，哪怕他选了不划算的那张。"""
+    c30 = coupon(1, value=3000, threshold=10000)
+    c10 = coupon(2, value=1000)
+    items = [item(1, 20000)]
+
+    auto = calc(items, coupons=[c30, c10])
+    assert auto.platform_discount == 3000, "没指定时仍然自动取最优"
+
+    picked = calc(items, coupons=[c30, c10], selected=[2])
+    assert picked.platform_discount == 1000, "选了 ¥10 就只减 ¥10"
+    assert picked.payable_amount == 20000 - 1000
+
+
+def test_empty_selection_still_auto_picks_best() -> None:
+    """选中列表为空表示"没手选"，仍要自动给最优 —— 结算页默认不能让用户吃亏。"""
+    result = calc([item(1, 20000)], coupons=[coupon(1, value=3000, threshold=10000)])
+    assert result.platform_discount == 3000
+
+
+def test_selected_coupons_in_same_group_still_capped_at_one() -> None:
+    """同组选中多张时只生效优惠最大的那张 —— 组内上限 1 不受"手选"影响。"""
+    c30 = coupon(1, value=3000, threshold=10000)
+    c20 = coupon(2, value=2000, threshold=10000)
+    c10 = coupon(3, value=1000)
+
+    result = calc([item(1, 20000)], coupons=[c30, c20, c10], selected=[2, 3])
+    assert result.platform_discount == 2000, "选中的两张里取大的"

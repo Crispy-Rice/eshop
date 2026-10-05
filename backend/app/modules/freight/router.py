@@ -39,9 +39,20 @@ router = APIRouter()
 
 
 async def _to_template_out(
-    session: AsyncSession, tpl: FreightTemplate, *, with_count: bool = True
+    session: AsyncSession,
+    tpl: FreightTemplate,
+    *,
+    with_count: bool = True,
+    deleted_sku_ids: list[int] | None = None,
 ) -> FreightTemplateOut:
-    bound = await repo.count_binds_of_template(session, tpl.id) if with_count else 0
+    """``deleted_sku_ids`` 传已软删商品的 SKU，让"已绑定 N 个 SKU"跟抽屉里
+    能看到的明细对得上。调用方**一次请求取一遍**再传进来，别在这里查 ——
+    这个函数在列表里是按模板循环调用的。"""
+    bound = (
+        await repo.count_binds_of_template(session, tpl.id, exclude_sku_ids=deleted_sku_ids or ())
+        if with_count
+        else 0
+    )
     return FreightTemplateOut(
         id=tpl.id,
         name=tpl.name,
@@ -71,7 +82,11 @@ async def list_templates(
     session: DbSession, shop_id: CurrentShopIdDep
 ) -> ApiResponse[list[FreightTemplateOut]]:
     rows = await service.list_templates(session, shop_id)
-    return ApiResponse.ok([await _to_template_out(session, t) for t in rows])
+    # 已软删商品的 SKU 只取一次，循环里复用
+    deleted = await product_service.list_deleted_sku_ids(session, shop_id)
+    return ApiResponse.ok(
+        [await _to_template_out(session, t, deleted_sku_ids=deleted) for t in rows]
+    )
 
 
 @router.post(
@@ -97,7 +112,8 @@ async def get_template(
     tpl = await repo.get_shop_template(session, shop_id, template_id)
     if tpl is None:
         raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
-    return ApiResponse.ok(await _to_template_out(session, tpl))
+    deleted = await product_service.list_deleted_sku_ids(session, shop_id)
+    return ApiResponse.ok(await _to_template_out(session, tpl, deleted_sku_ids=deleted))
 
 
 @router.put(
@@ -117,9 +133,10 @@ async def update_template(
     以及"已下单的订单不受影响"（它们存的是运费快照）。
     """
     tpl, affected = await service.update_template(session, shop_id, template_id, body)
+    deleted = await product_service.list_deleted_sku_ids(session, shop_id)
     return ApiResponse.ok(
         FreightTemplateUpdateOut(
-            template=await _to_template_out(session, tpl),
+            template=await _to_template_out(session, tpl, deleted_sku_ids=deleted),
             affected_sku_count=affected,
             notice=(
                 f"已绑定 {affected} 个 SKU，修改后立即对**新建**订单生效；"
@@ -226,21 +243,27 @@ async def list_template_binds(
         int(w.id): w.name for w in await inventory_service.list_warehouses(session, shop_id)
     }
 
-    return ApiResponse.ok(
-        [
+    rows: list[SkuBindOut] = []
+    for b in binds:
+        sku = skus.get(int(b.sku_id))
+        if sku is None:
+            # 商品已软删。绑定行还在 ``freight.sku_freight_bind`` 里（软删不动
+            # 别的 schema），但对商家已经没有任何意义 —— 那个商品连下单都下不了。
+            # 排掉，让这个数字跟"已绑定 N 个 SKU"对得上。
+            continue
+        rows.append(
             SkuBindOut(
                 sku_id=b.sku_id,
-                sku_code=skus[int(b.sku_id)].sku_code if int(b.sku_id) in skus else "",
-                spu_title=skus[int(b.sku_id)].title if int(b.sku_id) in skus else "（商品已删除）",
-                spec_text=skus[int(b.sku_id)].spec_text if int(b.sku_id) in skus else "",
+                sku_code=sku.sku_code,
+                spu_title=sku.title,
+                spec_text=sku.spec_text,
                 warehouse_id=b.warehouse_id,
                 warehouse_name=warehouses.get(int(b.warehouse_id), ""),
                 priority=b.priority,
                 enabled=b.enabled,
             )
-            for b in binds
-        ]
-    )
+        )
+    return ApiResponse.ok(rows)
 
 
 @router.post(

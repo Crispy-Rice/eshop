@@ -1,20 +1,52 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 
 import * as authApi from '@/api/auth'
 import type { Address, AddressInput } from '@/api/auth'
 import { ErrorCode, isBizError } from '@/api/errors'
 import { post } from '@/api/http'
+import ProfileEditDialog from '@/components/ProfileEditDialog.vue'
 import { useAuthStore } from '@/stores/auth'
+import { onImageError } from '@/utils/placeholder'
 
 const auth = useAuthStore()
 const addresses = ref<Address[]>([])
 const loading = ref(false)
 const shopLoading = ref(false)
 const dialogVisible = ref(false)
+const profileVisible = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
+
+/**
+ * 角色标签。
+ *
+ * ★ 必须逐个列全。这里原来写的是「不是 buyer 就叫商家」的二元判断，
+ *   于是平台运营（admin）和财务（finance）在「我的」页都显示成「商家」。
+ */
+const ROLE_TEXT: Record<string, string> = {
+  buyer: '买家',
+  merchant: '商家',
+  admin: '平台运营',
+  finance: '财务',
+}
+
+const ROLE_TAG_TYPE: Record<string, 'info' | 'success' | 'warning' | 'danger'> = {
+  buyer: 'info',
+  merchant: 'success',
+  admin: 'warning',
+  finance: 'danger',
+}
+
+const roleText = computed(() => ROLE_TEXT[auth.user?.role ?? ''] ?? auth.user?.role ?? '')
+const roleTagType = computed(() => ROLE_TAG_TYPE[auth.user?.role ?? ''] ?? 'info')
+
+/** 平台侧账号。他们不参与买卖双方那套流程，「成为商家」对他们没有意义 */
+const isPlatformRole = computed(() => auth.user?.role === 'admin' || auth.user?.role === 'finance')
+
+/** 与后端 `account/models.py` 的 gender 注释一致：0未知 1男 2女 */
+const GENDER_TEXT: Record<number, string> = { 0: '保密', 1: '男', 2: '女' }
 
 const emptyForm = (): AddressInput => ({
   receiverName: '',
@@ -33,6 +65,18 @@ const form = ref<AddressInput>(emptyForm())
 /** 与后端 `account/schemas.py` 的 PHONE_PATTERN 保持一致 */
 const PHONE_PATTERN = /^1[3-9]\d{9}$/
 const REGION_CODE_PATTERN = /^\d{6}$/
+
+/**
+ * 收货手机号的实时指示：绿勾 / 红叉。
+ *
+ * ★ 和登录页同一条规则（复用了上面的 PHONE_PATTERN，不另写一份正则），
+ *   而不是"够 11 位就行" —— 11 位但号段不对照样过不了后端校验。
+ *   空着不显示图标。
+ */
+const phoneState = computed<'idle' | 'ok' | 'bad'>(() => {
+  if (!form.value.phone) return 'idle'
+  return PHONE_PATTERN.test(form.value.phone) ? 'ok' : 'bad'
+})
 
 /**
  * 省市区是三格输入、一个表单项。
@@ -191,21 +235,39 @@ onMounted(() => {
 <template>
   <div class="account">
     <el-card shadow="never">
-      <template #header>账号信息</template>
+      <template #header>
+        <div class="card-header">
+          <span>账号信息</span>
+          <el-button size="small" @click="profileVisible = true">编辑资料</el-button>
+        </div>
+      </template>
       <el-descriptions :column="2" border>
-        <el-descriptions-item label="昵称">{{ auth.user?.nickname }}</el-descriptions-item>
+        <el-descriptions-item label="昵称">
+          <div class="nick-cell">
+            <img
+              v-if="auth.user?.avatar"
+              class="avatar"
+              :src="auth.user.avatar"
+              alt="头像"
+              @error="onImageError"
+            />
+            <span>{{ auth.user?.nickname }}</span>
+          </div>
+        </el-descriptions-item>
         <el-descriptions-item label="手机号">{{ auth.user?.phone }}</el-descriptions-item>
         <el-descriptions-item label="角色">
-          <el-tag :type="auth.user?.role === 'buyer' ? 'info' : 'success'">
-            {{ auth.user?.role === 'buyer' ? '买家' : '商家' }}
-          </el-tag>
+          <el-tag :type="roleTagType">{{ roleText }}</el-tag>
         </el-descriptions-item>
-        <el-descriptions-item label="信用分">{{ auth.user?.creditScore }}</el-descriptions-item>
+        <el-descriptions-item label="性别">{{ GENDER_TEXT[auth.user?.gender ?? 0] }}</el-descriptions-item>
       </el-descriptions>
 
       <div class="shop-row">
         <template v-if="auth.user?.shopId">
           <span class="hint">店铺 ID：{{ auth.user.shopId }}</span>
+        </template>
+        <!-- 平台账号不该看到「成为商家」：它没有也不需要店铺，商家菜单在后台也不会出现 -->
+        <template v-else-if="isPlatformRole">
+          <span class="hint">当前是{{ roleText }}账号，不需要开店。</span>
         </template>
         <template v-else>
           <span class="hint">你还没有店铺。开通后可以在商家后台上架商品。</span>
@@ -257,7 +319,14 @@ onMounted(() => {
           <el-input v-model="form.receiverName" maxlength="64" />
         </el-form-item>
         <el-form-item label="手机号" prop="phone">
-          <el-input v-model="form.phone" maxlength="11" />
+          <el-input v-model="form.phone" maxlength="11">
+            <template #suffix>
+              <span v-if="phoneState === 'ok'" class="phone-hint ok" title="手机号格式正确">✓</span>
+              <span v-else-if="phoneState === 'bad'" class="phone-hint bad" title="手机号格式不对"
+                >✕</span
+              >
+            </template>
+          </el-input>
         </el-form-item>
         <el-form-item label="省市区" prop="province">
           <div class="region">
@@ -282,6 +351,8 @@ onMounted(() => {
         <el-button type="primary" @click="onSubmit">保存</el-button>
       </template>
     </el-dialog>
+
+    <ProfileEditDialog v-model="profileVisible" />
   </div>
 </template>
 
@@ -292,10 +363,41 @@ onMounted(() => {
   gap: var(--space-5);
 }
 
+/* 手机号的实时指示。颜色走语义 token，四套皮肤下自动跟着变 */
+.phone-hint {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  line-height: 1;
+}
+
+.phone-hint.ok {
+  color: var(--color-success);
+}
+
+.phone-hint.bad {
+  color: var(--color-danger);
+}
+
 .card-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+/* 昵称一格：头像在前、名字在后，头像缺席时不留空位 */
+.nick-cell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.nick-cell .avatar {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  background: var(--media-bg);
 }
 
 .shop-row {

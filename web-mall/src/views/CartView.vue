@@ -14,11 +14,13 @@ import {
   type CartItem,
 } from '@/api/cart'
 import { isBizError } from '@/api/errors'
+import { useCartStore } from '@/stores/cart'
 import { useAuthStore } from '@/stores/auth'
 import { formatYuan } from '@/utils/money'
 import { onImageError } from '@/utils/placeholder'
 
 const auth = useAuthStore()
+const cartStore = useCartStore()
 const router = useRouter()
 
 const cart = ref<Cart | null>(null)
@@ -39,6 +41,10 @@ async function load(): Promise<void> {
   } finally {
     loading.value = false
   }
+  // ★ 角标跟着一起刷。这一页的每个改动（移除/改数量/勾选/清失效）最后都落到
+  //   load()，在这里刷一次就全覆盖；否则删完商品角标还是旧数字，得刷页面才对。
+  //   失败路径（catch 里那次 load）也会走到，正好把角标拉回真实值。
+  await cartStore.refresh()
 }
 
 async function changeNum(item: CartItem, num: number): Promise<void> {

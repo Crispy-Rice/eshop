@@ -515,14 +515,28 @@ async def submit_for_audit(session: AsyncSession, shop_id: int, spu_id: int) -> 
 
 
 async def audit_spu(session: AsyncSession, spu_id: int, req: SpuAuditRequest) -> None:
-    """平台审核。通过 → 上架；不通过 → 退回草稿，商家修改后可再次提交。"""
+    """平台审核。通过 → 上架；不通过 → 退回草稿，商家修改后可再次提交。
+
+    ★ 审核意见**落库**（``audit_remark``）：驳回时写理由、通过时清空。
+      这个接口从第一天就收 ``remark``，但一直没有存 —— 驳回后商品只是悄悄回到
+      "草稿"，商家不知道要改什么。现在理由会显示在商家自己的商品详情里。
+    """
     spu = await repo.get_spu(session, spu_id)
     if spu is None:
         raise BizError(ErrorCode.NOT_FOUND, "商品不存在")
     if spu.status != SPU_PENDING_AUDIT:
         raise BizError(ErrorCode.VALIDATION_ERROR, "该商品不在待审核状态")
 
-    await repo.update_spu_fields(session, spu_id, {"status": SPU_ON_SHELF if req.approved else SPU_DRAFT})
+    remark = (req.remark or "").strip() or None
+    await repo.update_spu_fields(
+        session,
+        spu_id,
+        {
+            "status": SPU_ON_SHELF if req.approved else SPU_DRAFT,
+            # 通过时清空：否则商家改完再提交，详情里还挂着上一次的驳回理由
+            "audit_remark": None if req.approved else remark,
+        },
+    )
     logger.info("商品审核完成", extra={"spuId": spu_id, "approved": req.approved})
 
 
@@ -543,6 +557,30 @@ async def off_shelf(session: AsyncSession, shop_id: int, spu_id: int) -> None:
         return
     await repo.update_spu_fields(session, spu_id, {"status": SPU_OFF_SHELF})
     await repo.update_sku_status_by_spu(session, spu_id, 2)
+
+
+async def delete_spu(session: AsyncSession, shop_id: int, spu_id: int) -> None:
+    """商家删除自己的商品。**软删**（见 ``repository.soft_delete_spu``）。
+
+    ★ 两条前置规则，都是为了让"删除"这件事可解释：
+
+    - **在售的不让直接删**：商城正在卖的东西忽然消失，买家点进去就是 404。
+      必须先显式下架 —— 把"我还在卖"和"我不要了"分成两步，删除永远是一个
+      商家想清楚了才做的动作。
+    - **审核中的不让删**：平台运营正在看这条商品，删掉之后那条审核接口会拿到
+      404，运营那边只看到"商品不存在"，根本不知道发生了什么。
+
+    允许删的是：草稿、已下架、违规下架。
+    """
+    spu = await _get_owned_spu(session, shop_id, spu_id)
+
+    if spu.status == SPU_ON_SHELF:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "商品在售，请先下架再删除")
+    if spu.status == SPU_PENDING_AUDIT:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "商品审核中，请等审核结果出来再删除")
+
+    await repo.soft_delete_spu(session, spu_id)
+    logger.info("商品已删除", extra={"shopId": shop_id, "spuId": spu_id})
 
 
 async def _get_owned_spu(session: AsyncSession, shop_id: int, spu_id: int) -> Spu:
@@ -638,6 +676,33 @@ async def search_products(
     return SpuListOut(items=[_to_card(s) for s in rows], has_more=has_more, next_cursor=next_cursor)
 
 
+async def list_admin_spus(
+    session: AsyncSession,
+    *,
+    status: int | None = None,
+    keyword: str | None = None,
+    cursor: str | None = None,
+    limit: int = DEFAULT_PAGE_SIZE,
+) -> SpuListOut:
+    """平台侧的商品列表（**跨店铺**）。审核队列用它。
+
+    ★ 直接复用 ``search_products`` —— 它本来就支持 status / keyword / 游标。
+      这里的区别只有两点：不按店铺过滤，以及 **on_shelf_only=False**
+      （默认的那个开关会把"待审核"过滤掉，正是审核页最需要看到的状态）。
+
+    排序固定"最新在前"：审核队列关心的是刚提交的，不是最好卖的。
+    """
+    return await search_products(
+        session,
+        keyword=keyword,
+        sort="newest",
+        cursor=cursor,
+        limit=limit,
+        status=status,
+        on_shelf_only=False,
+    )
+
+
 async def get_spu_detail(
     session: AsyncSession, spu_id: int, *, owner_shop_id: int | None = None
 ) -> SpuDetailOut:
@@ -690,6 +755,8 @@ async def get_spu_detail(
         price_max=spu.price_max,
         total_sold=spu.total_sold,
         status=spu.status,
+        # ★ 只给店主看。买家视角下"图片太模糊，驳回"这种内部流程说明毫无意义
+        audit_remark=spu.audit_remark if owner_shop_id is not None else None,
         spec_groups=[
             SpecGroupOut(id=g.id, name=g.name, values=values_by_group.get(g.id, [])) for g in groups
         ],
@@ -743,7 +810,11 @@ async def batch_get_skus(
                 sku_code=sku.sku_code,
                 spec_text=sku.spec_text,
                 price=sku.price,
-                cover_image=sku.cover_image,
+                # ★ SKU 没单独设封面就退回商品主图。商家的习惯是只传一张主图，
+                #   规格图是可选的；不回退的话购物车/订单里全是灰块。
+                #   这里回退一次，购物车、结算、下单快照（trade 存的就是这个值）
+                #   三条链路一起生效 —— 各自去前端补 || 迟早漏一个页面。
+                cover_image=sku.cover_image or spu.main_image,
                 weight_g=sku.weight_g,
                 status=sku.status,
                 spu_status=spu.status,
@@ -763,6 +834,15 @@ async def list_shop_sku_ids(session: AsyncSession, shop_id: int, *, limit: int =
     否则商家发布商品后在库存页看不到它，也就无从设置库存。
     """
     return [s.id for s in await repo.list_skus_by_shop(session, shop_id, limit=limit)]
+
+
+async def list_deleted_sku_ids(session: AsyncSession, shop_id: int) -> list[int]:
+    """**已软删商品**下面的 SKU id。
+
+    别的模块的读侧拿它做排除：库存页、运费绑定列表里那些残留行要一起消失，
+    否则商家会以为"没删干净"。见 ``repository.list_deleted_sku_ids``。
+    """
+    return await repo.list_deleted_sku_ids(session, shop_id)
 
 
 async def apply_review_stat_delta(

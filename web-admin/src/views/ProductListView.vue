@@ -6,6 +6,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { isBizError } from '@/api/errors'
 import { post } from '@/api/http'
 import {
+  deleteSpu,
   listMySpus,
   offShelf,
   onShelf,
@@ -90,6 +91,34 @@ async function act(item: SpuCard, action: 'submit' | 'on' | 'off'): Promise<void
     await load()
   } catch (e) {
     ElMessage.error(isBizError(e) ? e.message : `${labels[action]}失败`)
+  }
+}
+
+/**
+ * 删除商品（软删）。
+ *
+ * ★ 确认框里必须说清"历史订单不受影响" —— 商家一听"删除"就担心已卖出去的订单
+ *   会不会跟着没了，不说清楚他不敢点。实际情况是订单读的是下单时的快照，一点影响都没有。
+ */
+async function remove(item: SpuCard): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除「${item.title}」吗？商城将不再展示它；已产生的历史订单不受影响。`,
+      '删除商品',
+      { type: 'warning', confirmButtonText: '删除', confirmButtonClass: 'el-button--danger' },
+    )
+  } catch {
+    return // 用户取消
+  }
+
+  try {
+    await deleteSpu(item.id)
+    ElMessage.success('已删除')
+    await load()
+  } catch (e) {
+    // 在售 / 审核中会被后端拒绝。原样弹文案 —— "商品在售，请先下架再删除"
+    // 比"删除失败"有用得多，商家看到就知道下一步干什么
+    ElMessage.error(isBizError(e) ? e.message : '删除失败')
   }
 }
 
@@ -178,7 +207,7 @@ onMounted(() => {
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="200" align="right">
+        <el-table-column label="操作" width="250" align="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="router.push(`/products/${row.id}`)">编辑</el-button>
             <el-button v-if="row.status === 1" link type="primary" @click="act(row, 'submit')">
@@ -189,6 +218,15 @@ onMounted(() => {
             </el-button>
             <el-button v-if="row.status === 2" link type="warning" @click="act(row, 'off')">
               下架
+            </el-button>
+            <!-- 在售（2）要先下架、审核中（5）要等结果，后端也会挡，这里先不给点 -->
+            <el-button
+              v-if="row.status !== 2 && row.status !== 5"
+              link
+              type="danger"
+              @click="remove(row)"
+            >
+              删除
             </el-button>
           </template>
         </el-table-column>

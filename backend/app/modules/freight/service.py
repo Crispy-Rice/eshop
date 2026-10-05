@@ -43,6 +43,10 @@ from app.modules.freight.schemas import (
     RegionRuleIn,
 )
 
+# ★ 依赖方向只允许 freight → product（docs/01 §2）。绑定时要校验 SKU 归属，
+#   只能走 product 的 service；product 不反向 import freight，所以不会成环。
+from app.modules.product import service as product_service
+
 # 商品的兜底重量（历史脏数据 weight_g = 0 时用），与引擎里的常量一致
 FALLBACK_WEIGHT_G = 500
 
@@ -172,7 +176,10 @@ async def update_template(
     tpl.merge_type = req.merge_type
     tpl.status = req.status
 
-    affected = await repo.count_binds_of_template(session, template_id)
+    # 影响面与列表里的"已绑定 N 个 SKU"用同一口径：已软删商品不算进去，
+    # 否则这句提示里的数字跟商家刚在列表上看到的对不上。
+    deleted = await product_service.list_deleted_sku_ids(session, shop_id)
+    affected = await repo.count_binds_of_template(session, template_id, exclude_sku_ids=deleted)
     return tpl, affected
 
 
@@ -262,6 +269,15 @@ async def bind_sku(
     tpl = await repo.get_shop_template(session, shop_id, template_id)
     if tpl is None:
         raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
+
+    # ★ 必须校验 SKU 属于本店。只查模板归属不够 —— 直接构造请求就能拿别人的
+    #   sku_id 把竞争对手的商品绑到自己的模板上（建个 0 元模板、优先级拉满，
+    #   对方的商品就对买家包邮了）。
+    #   ``batch_get_skus`` 只认没被软删的商品，所以顺带挡住了"给已删商品建绑定"。
+    skus = await product_service.batch_get_skus(session, [sku_id], only_on_shelf=False)
+    if not skus or skus[0].shop_id != shop_id:
+        raise BizError(ErrorCode.NOT_FOUND, "SKU 不存在")
+
     await repo.upsert_bind(
         session,
         sku_id=sku_id,

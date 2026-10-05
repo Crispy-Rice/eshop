@@ -53,10 +53,24 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
+    // 运营专属：后端的 /api/admin/spus 只放给 admin（不含 finance）
+    path: '/audits',
+    name: 'product-audits',
+    component: () => import('@/views/ProductAuditView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     // 运营专属：后端的 /api/admin/categories 只放给 admin（不含 finance）
     path: '/categories',
     name: 'categories',
     component: () => import('@/views/CategoryView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    // 运营专属：后端的 /api/admin/banners 放给 admin / finance（与营销同角色）
+    path: '/banners',
+    name: 'banners',
+    component: () => import('@/views/BannerView.vue'),
     meta: { requiresAuth: true },
   },
   {
@@ -69,6 +83,13 @@ const routes: RouteRecordRaw[] = [
     path: '/freight',
     name: 'freight',
     component: () => import('@/views/FreightTemplateView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    // 店铺设置：改名 / LOGO / 简介。没开店直接敲 URL 进来会看到一句引导（后端回 404）
+    path: '/shop',
+    name: 'shop-settings',
+    component: () => import('@/views/ShopSettingsView.vue'),
     meta: { requiresAuth: true },
   },
   {

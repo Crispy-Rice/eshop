@@ -34,6 +34,7 @@ from app.modules.account.schemas import (
     AddressUpdate,
     ShopCreateRequest,
     ShopOut,
+    ShopUpdateRequest,
     TokenResponse,
     UpdateProfileRequest,
     UserOut,
@@ -309,6 +310,38 @@ async def get_my_shop(session: AsyncSession, user_id: int) -> ShopOut:
     return _to_shop_out(shop)
 
 
+async def update_my_shop(session: AsyncSession, user_id: int, req: ShopUpdateRequest) -> ShopOut:
+    """改店铺设置：名称 / LOGO / 简介。
+
+    ★ ``logo`` 与 ``description`` 用 ``model_fields_set`` 区分"没传"和"显式传
+      null" —— 后者是**清空**（比如把简介删掉），不能当成不改。
+    ``name`` 反之：传 None 直接忽略，店铺不能没有名字。
+
+    改名不影响历史订单 —— trade 的 ``order_sub.shop_name_snap`` 存的是下单时的
+    快照，改动只作用于之后的展示，正是快照存在的意义。
+
+    归属校验和取值合成一次查询：按 owner_user_id 找店，找不到就是没开店。
+    """
+    shop = await repo.get_shop_by_owner(session, user_id)
+    if shop is None:
+        raise BizError(ErrorCode.NOT_FOUND, "你还没有店铺")
+
+    values: dict[str, object] = {}
+    if req.name is not None:
+        values["name"] = req.name
+    for field in ("logo", "description"):
+        if field in req.model_fields_set:
+            values[field] = getattr(req, field)
+
+    await repo.update_shop_fields(session, shop.id, values)
+
+    updated = await repo.get_shop_by_id(session, shop.id)
+    if updated is None:  # pragma: no cover - 刚更新过，理论上不会发生
+        raise BizError(ErrorCode.NOT_FOUND, "店铺不存在")
+    logger.info("店铺设置已更新", extra={"userId": user_id, "shopId": shop.id})
+    return _to_shop_out(updated)
+
+
 async def get_public_shop(session: AsyncSession, shop_id: int) -> ShopOut:
     """按 ID 取店铺的**公开**信息，商品详情页用来显示"这件商品是哪家店的"。
 
@@ -324,6 +357,18 @@ async def get_public_shop(session: AsyncSession, shop_id: int) -> ShopOut:
     if shop is None:
         raise BizError(ErrorCode.NOT_FOUND, "店铺不存在")
     return _to_shop_out(shop)
+
+
+async def list_public_shops(session: AsyncSession, shop_ids: Sequence[int]) -> list[ShopOut]:
+    """批量取店铺公开信息。
+
+    商品列表页一次显示 N 个商品，逐个请求就是 N+1 —— 而且那些商品往往只来自
+    一两个店，批量去重之后通常只查一次。
+    """
+    if not shop_ids:
+        return []
+    shops = await repo.list_shops_by_ids(session, list(shop_ids))
+    return [_to_shop_out(shop) for shop in shops]
 
 
 def _to_shop_out(shop: Shop) -> ShopOut:
@@ -463,4 +508,5 @@ __all__ = [
     "register",
     "update_address",
     "update_me",
+    "update_my_shop",
 ]

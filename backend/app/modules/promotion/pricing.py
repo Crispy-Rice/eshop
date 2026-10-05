@@ -436,6 +436,12 @@ class PriceCalculator:
             )
 
         for coupon in self.coupons:
+            # ★ 用户显式选了券时，只有选中的参与。不读这个字段的后果是
+            #   "结算页选了 ¥10、账单还是按 ¥20 减" —— 选择被无声忽略。
+            #   选中列表为空表示"没手选"，此时仍然自动取每组最优（结算页默认
+            #   就该给用户最划算的，不能退化成"不点就没优惠"）。
+            if self.selected_coupon_ids and coupon.code_id not in self.selected_coupon_ids:
+                continue
             # ★ 券属于哪一层由**它自己的 shop_id** 决定，不是由当前循环的层决定：
             #   shop_id = 0 → 平台券，只在平台层参与
             #   shop_id > 0 → 店铺券，只在店铺层参与，且只作用于本店商品

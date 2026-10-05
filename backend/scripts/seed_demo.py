@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -81,26 +81,6 @@ def _hsl(h: float, s: float, lightness: float) -> tuple[int, int, int]:
     return round(r * 255), round(g * 255), round(b * 255)
 
 
-def _font(size: int) -> Any:
-    """Pillow ≥10.1 的默认字体是**可缩放的 TrueType**（所以 ``anchor`` 也能用）。
-
-    不去找系统 TTF：Windows 有 arial、容器里没有，路径写死会在别的机器上炸。
-    pyproject 里钉的是 pillow>=11，这个签名一定存在。
-    """
-    return ImageFont.load_default(size=size)
-
-
-def _fit_font(draw: ImageDraw.ImageDraw, text: str, max_width: int, start: int) -> Any:
-    """把字号缩到能塞进 max_width 为止（长标题不该溢出画布）。"""
-    size = start
-    while size > 14:
-        f = _font(size)
-        if draw.textlength(text, font=f) <= max_width:
-            return f
-        size -= 4
-    return _font(14)
-
-
 def _seed_of(title: str) -> str:
     """标题 → 稳定的十六进制种子。决定色相，也当上传用的文件名。
 
@@ -110,9 +90,19 @@ def _seed_of(title: str) -> str:
 
 
 def demo_png(title: str, caption: str = "") -> bytes:
-    """生成一张 800×800 的演示图（PNG 字节）。同名的图每次都一样（种子取色）。"""
-    # 标题定色相 —— 同一个商品重跑拿到同一个颜色，不会每次变
-    hue = int(_seed_of(title)[:8], 16) % 360 / 360
+    """生成一张 800×800 的演示图（PNG 字节）。同样的入参永远画出同一张图。
+
+    ★ **不在图上画字。**
+      画中文得有 CJK 字体，而 Pillow 自带的 ``load_default()`` 只有拉丁字形 ——
+      中文会整片变成 ☒ 豆腐块（本地和线上都验证过）。演示图是在**服务器容器**里
+      生成的，容器里没有中文字体；把 ttf 打进仓库又要多十几 MB，不划算。
+      何况商品名本来就显示在图片正下方，画在图上纯属重复。
+      所以只留"影棚渐变 + 内描边"当背景板。
+    """
+    # 色相由「标题 + 规格」决定：同一商品每次同色，不同规格颜色不同 ——
+    # 详情页选中规格会换图（currentSku.coverImage || spu.mainImage），
+    # 去掉文字之后，这个色差就是"换了 SKU"的唯一视觉信号，所以不能省。
+    hue = int(_seed_of(title + caption)[:8], 16) % 360 / 360
     top = _hsl(hue, 0.30, 0.26)
     bottom = _hsl((hue + 0.07) % 1.0, 0.36, 0.50)
 
@@ -137,21 +127,6 @@ def demo_png(title: str, caption: str = "") -> bytes:
         width=2,
     )
 
-    text = title.strip()
-    font = _fit_font(draw, text, IMAGE_SIZE - inset * 3, IMAGE_SIZE // 8)
-    ty = IMAGE_SIZE // 2 - (IMAGE_SIZE // 24 if caption else 0)
-    draw.text((IMAGE_SIZE // 2, ty), text, font=font, fill=(255, 255, 255), anchor="mm")
-
-    if caption:
-        small = _fit_font(draw, caption, IMAGE_SIZE - inset * 3, IMAGE_SIZE // 20)
-        draw.text(
-            (IMAGE_SIZE // 2, ty + IMAGE_SIZE // 10),
-            caption,
-            font=small,
-            fill=(255, 255, 255),
-            anchor="mm",
-        )
-
     buf = BytesIO()
     im.save(buf, format="PNG")
     return buf.getvalue()
@@ -174,17 +149,103 @@ def upload_demo_image(
     return unwrap(resp)["url"]
 
 
+# 轮播图是宽幅（首页整幅横幅）。1200 的长边刚好卡在上传模块的缩图阈值（1280）之下，
+# 所以不会被再压一遍。
+BANNER_SIZE = (1200, 360)
+
+
+def banner_png(title: str) -> bytes:
+    """生成一张演示轮播图（PNG 字节）。同样的入参永远画出同一张。
+
+    ★ 同样**不画字**，理由见 :func:`demo_png`：容器里没有中文字体，画中文就是
+      一整片方块。所以 banner 只用"横向渐变 + 内描边"当背景板 ——
+      真要用，运营在后台换成设计稿即可。
+    """
+    # 前缀 "banner:" 是为了和商品图错开色相（同一个标题不该撞色）
+    hue = int(_seed_of("banner:" + title)[:8], 16) % 360 / 360
+    left = _hsl(hue, 0.42, 0.30)
+    right = _hsl((hue + 0.12) % 1.0, 0.48, 0.58)
+
+    width, height = BANNER_SIZE
+    im = Image.new("RGB", BANNER_SIZE)
+    draw = ImageDraw.Draw(im)
+    # 横向渐变：banner 是宽幅，横向过渡比纵向更像横幅
+    for x in range(width):
+        t = x / (width - 1)
+        draw.line(
+            [(x, 0), (x, height)],
+            fill=tuple(round(left[i] + (right[i] - left[i]) * t) for i in range(3)),
+        )
+
+    edge = tuple(round(c + (255 - c) * 0.30) for c in left)
+    inset = 16
+    draw.rounded_rectangle(
+        [inset, inset, width - inset, height - inset], radius=18, outline=edge, width=2
+    )
+
+    buf = BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def upload_banner_image(client: httpx.Client, headers: dict[str, str], *, title: str) -> str:
+    """画一张轮播图并走真实上传接口传上去（biz=banners），返回可入库的 url。"""
+    resp = client.post(
+        "/files/images",
+        params={"biz": "banners"},
+        files={"file": (f"banner-{_seed_of(title)[:8]}.png", banner_png(title), "image/png")},
+        headers=headers,
+    )
+    return unwrap(resp)["url"]
+
+
 # SKU 编码带时间戳，避免和之前跑出来的商品撞码
 SUFFIX = str(int(time.time()))[-6:]
 
 # (类目名, 上级类目名)
+#
+# ★ **父必须排在子前面**：ensure_categories 是按这个顺序累积 ids 的，
+#   子类目要从 ids 里取父 id，父还没建就会挂到根上。
 CATEGORIES: list[tuple[str, str | None]] = [
+    # ---- 一级 ----
     ("数码", None),
-    ("手机", "数码"),
-    ("智能手机", "手机"),
-    ("电脑", "数码"),
+    ("家用电器", None),
+    ("服饰", None),
+    ("食品生鲜", None),
+    ("运动户外", None),
     ("图书", None),
+    # ---- 数码 ----
+    ("手机", "数码"),
+    ("电脑", "数码"),
+    ("影音", "数码"),
+    ("智能手机", "手机"),
+    ("手机配件", "手机"),
+    ("笔记本", "电脑"),
+    ("台式机", "电脑"),
+    ("耳机", "影音"),
+    ("音箱", "影音"),
+    # ---- 家用电器 ----
+    ("大家电", "家用电器"),
+    ("厨房小电", "家用电器"),
+    ("冰箱", "大家电"),
+    ("洗衣机", "大家电"),
+    ("电饭煲", "厨房小电"),
+    ("微波炉", "厨房小电"),
+    # ---- 服饰 ----
+    ("男装", "服饰"),
+    ("女装", "服饰"),
+    ("上衣", "男装"),
+    ("连衣裙", "女装"),
+    # ---- 食品生鲜 ----
+    ("休闲零食", "食品生鲜"),
+    ("饮料冲调", "食品生鲜"),
+    # ---- 运动户外 ----
+    ("运动鞋", "运动户外"),
+    ("健身器材", "运动户外"),
+    # ---- 图书 ----
     ("小说", "图书"),
+    ("童书", "图书"),
+    ("教育考试", "图书"),
 ]
 
 
@@ -297,6 +358,43 @@ def ensure_coupons(client: httpx.Client, admin_h: dict[str, str]) -> int:
                     "validEnd": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
                     "scopeType": 1,
                 },
+                headers=admin_h,
+            )
+        )
+        created += 1
+    return created
+
+
+def ensure_banners(
+    client: httpx.Client,
+    admin_h: dict[str, str],
+    *,
+    category_ids: dict[str, str],
+    spu_ids: dict[str, str],
+) -> int:
+    """三条演示轮播图。按标题幂等，已存在的跳过（不重传图）。
+
+    落地页用**真实存在**的商品 / 类目 id：填一个不存在的路径，点进去就是 404，
+    演示时反而露怯。
+    """
+    existing = {b["title"] for b in unwrap(client.get("/admin/banners", headers=admin_h))}
+
+    iphone_id = spu_ids.get("iPhone 16 Pro")
+    specs: list[tuple[str, str | None]] = [
+        ("新品首发", f"/products/{iphone_id}" if iphone_id else None),
+        ("数码好物", f"/?categoryId={category_ids['数码']}"),
+        ("全场包邮", None),
+    ]
+
+    created = 0
+    for index, (title, link) in enumerate(specs):
+        if title in existing:
+            continue
+        image = upload_banner_image(client, admin_h, title=title)
+        unwrap(
+            client.post(
+                "/admin/banners",
+                json={"title": title, "image": image, "linkUrl": link, "sort": (index + 1) * 10},
                 headers=admin_h,
             )
         )
@@ -480,7 +578,7 @@ def build_products(category_ids: dict[str, str]) -> list[dict]:
     seed 都会给已存在的商品白传一遍图。
     """
     img = None
-    return [
+    items: list[dict] = [
         {
             "categoryId": category_ids["智能手机"],
             "title": "iPhone 16 Pro",
@@ -591,6 +689,252 @@ def build_products(category_ids: dict[str, str]) -> list[dict]:
         },
     ]
 
+    items.extend(_more_products(category_ids))
+    return items
+
+
+def _simple_product(
+    category_id: str,
+    title: str,
+    sub_title: str,
+    spec_name: str,
+    options: list[tuple[str, str, int, int]],
+    *,
+    sku_prefix: str,
+) -> dict:
+    """单规格组的演示商品。
+
+    :param options: ``(key, 显示名, 价格分, 重量克)``
+
+    ★ 新类目下挂的都是这种一维规格的商品（容量 / 颜色 / 尺码），结构完全一样，
+      没必要为每一件都手写一整段字面量 —— 上面那三件老商品留着原样是因为它们
+      演示的是"两个规格组 + 无效组合"，那种复杂度才值得展开写。
+    """
+    return {
+        "categoryId": category_id,
+        "title": title,
+        "subTitle": sub_title,
+        "mainImage": None,
+        "specGroups": [
+            {
+                "name": spec_name,
+                "values": [{"key": key, "value": label} for key, label, _, _ in options],
+            }
+        ],
+        "skus": [
+            {
+                "skuCode": f"{sku_prefix}-{key.upper()}-{SUFFIX}",
+                "specValueKeys": [key],
+                "price": price,
+                "coverImage": None,
+                "weightG": weight,
+            }
+            for key, _, price, weight in options
+        ],
+    }
+
+
+def _more_products(category_ids: dict[str, str]) -> list[dict]:
+    """给新扩出来的末级类目各挂一件，免得点进类目全是空的。
+
+    类目导航做出来之后，"点进去没有商品"会非常显眼 —— 所以加类目就必须
+    连带补商品，这两件事是一体的。
+    """
+    return [
+        _simple_product(
+            category_ids["笔记本"],
+            "轻薄本 Air 14",
+            "2.8K 屏 · 16G+512G",
+            "配置",
+            [
+                ("i5", "i5 / 16G", 499900, 1400),
+                ("i7", "i7 / 16G", 629900, 1400),
+            ],
+            sku_prefix="NB-AIR14",
+        ),
+        _simple_product(
+            category_ids["耳机"],
+            "无线降噪耳机",
+            "主动降噪 · 30 小时续航",
+            "版本",
+            [
+                ("std", "标准版", 69900, 240),
+                ("pro", "Pro 版", 109900, 260),
+            ],
+            sku_prefix="HP-ANC",
+        ),
+        _simple_product(
+            category_ids["冰箱"],
+            "双门冰箱",
+            "风冷无霜 · 一级能效",
+            "容量",
+            [
+                ("220", "220L", 189900, 42000),
+                ("320", "320L", 259900, 55000),
+            ],
+            sku_prefix="FR-DOOR",
+        ),
+        _simple_product(
+            category_ids["电饭煲"],
+            "IH 电饭煲",
+            "厚釜内胆 · 24 小时预约",
+            "容量",
+            [
+                ("3l", "3L", 39900, 3600),
+                ("5l", "5L", 49900, 4500),
+            ],
+            sku_prefix="RC-IH",
+        ),
+        _simple_product(
+            category_ids["连衣裙"],
+            "法式碎花连衣裙",
+            "收腰显瘦 · 春夏款",
+            "尺码",
+            [
+                ("s", "S", 29900, 320),
+                ("m", "M", 29900, 330),
+                ("l", "L", 29900, 340),
+            ],
+            sku_prefix="DR-FLORAL",
+        ),
+        _simple_product(
+            category_ids["休闲零食"],
+            "每日坚果礼盒",
+            "六种坚果 · 独立小包",
+            "规格",
+            [
+                ("500", "500g", 6900, 550),
+                ("1000", "1kg", 11900, 1050),
+            ],
+            sku_prefix="SN-NUT",
+        ),
+        _simple_product(
+            category_ids["运动鞋"],
+            "轻量跑鞋",
+            "回弹中底 · 透气网面",
+            "尺码",
+            [
+                ("40", "40", 39900, 620),
+                ("41", "41", 39900, 640),
+                ("42", "42", 39900, 660),
+            ],
+            sku_prefix="SH-RUN",
+        ),
+        _simple_product(
+            category_ids["童书"],
+            "儿童绘本套装",
+            "全彩注音 · 3-6 岁",
+            "规格",
+            [
+                ("single", "单册", 3900, 320),
+                ("set", "全 10 册", 32900, 3200),
+            ],
+            sku_prefix="BK-KID",
+        ),
+        # ---- 下面这些是为了**每个末级类目都至少有一件商品** ----
+        # 类目导航做出来之后，点进去是空列表会非常显眼；留着空类目等于挖坑。
+        _simple_product(
+            category_ids["手机配件"],
+            "磁吸手机壳",
+            "兼容 MagSafe · 防摔",
+            "适配",
+            [
+                ("ip16", "iPhone 16", 9900, 60),
+                ("mi15", "小米 15", 8900, 60),
+            ],
+            sku_prefix="AC-CASE",
+        ),
+        _simple_product(
+            category_ids["台式机"],
+            "台式主机 战 700",
+            "独显 · 侧透机箱",
+            "配置",
+            [
+                ("std", "标准版", 399900, 8000),
+                ("high", "高配版", 599900, 8500),
+            ],
+            sku_prefix="PC-WAR700",
+        ),
+        _simple_product(
+            category_ids["音箱"],
+            "桌面蓝牙音箱",
+            "双单元 · 低音增强",
+            "版本",
+            [
+                ("std", "标准版", 29900, 900),
+                ("bass", "低音版", 45900, 1400),
+            ],
+            sku_prefix="SP-BT",
+        ),
+        _simple_product(
+            category_ids["洗衣机"],
+            "滚筒洗衣机 10kg",
+            "高温除菌 · 变频静音",
+            "容量",
+            [
+                ("8", "8kg", 159900, 62000),
+                ("10", "10kg", 199900, 68000),
+            ],
+            sku_prefix="WM-DRUM",
+        ),
+        _simple_product(
+            category_ids["微波炉"],
+            "平板微波炉 20L",
+            "机械旋钮 · 一键速热",
+            "容量",
+            [
+                ("20", "20L", 25900, 10500),
+                ("25", "25L", 34900, 12500),
+            ],
+            sku_prefix="MW-FLAT",
+        ),
+        _simple_product(
+            category_ids["上衣"],
+            "纯棉基础款卫衣",
+            "落肩宽松 · 秋冬加绒",
+            "尺码",
+            [
+                ("m", "M", 19900, 420),
+                ("l", "L", 19900, 440),
+                ("xl", "XL", 19900, 460),
+            ],
+            sku_prefix="TS-HOODIE",
+        ),
+        _simple_product(
+            category_ids["健身器材"],
+            "可调哑铃 20kg",
+            "快速调重 · 防滚落",
+            "规格",
+            [
+                ("10", "10kg 单只", 19900, 10500),
+                ("20", "20kg 单只", 34900, 20500),
+            ],
+            sku_prefix="FT-DUMBBELL",
+        ),
+        _simple_product(
+            category_ids["饮料冲调"],
+            "精品挂耳咖啡",
+            "中深烘 · 10 包/盒",
+            "规格",
+            [
+                ("box", "1 盒", 5900, 220),
+                ("twin", "2 盒装", 9900, 440),
+            ],
+            sku_prefix="DR-COFFEE",
+        ),
+        _simple_product(
+            category_ids["教育考试"],
+            "考研英语真题集",
+            "近十年 · 含解析",
+            "规格",
+            [
+                ("eng1", "英语一", 4900, 800),
+                ("eng2", "英语二", 4900, 800),
+            ],
+            sku_prefix="BK-EXAM",
+        ),
+    ]
+
 
 def _spec_caption(spec: dict, sku: dict) -> str:
     """把 SKU 的规格 key 翻成展示文案，如「暗夜黑 · 256G」。"""
@@ -618,6 +962,62 @@ def with_images(spec: dict, client: httpx.Client, headers: dict[str, str]) -> di
             client, headers, title=title, caption=_spec_caption(out, sku)
         )
     return out
+
+
+def _needs_image(url: str | None) -> bool:
+    """这张图是不是"还没被现行 seed 传过"。
+
+    现行 seed 走上传接口，落库的都是 ``/media/products/...``。
+    其它路径一律当成缺图 —— 老数据里是 ``/media/placeholder.svg``，
+    而**仓库里根本没有这个文件**，前端只能靠 ``onImageError`` 兜底成灰框。
+    """
+    return not (url or "").startswith("/media/products/")
+
+
+def ensure_product_images(
+    client: httpx.Client, headers: dict[str, str], spu_id: str, title: str
+) -> int:
+    """给**已存在**的商品补齐真实演示图，返回这次补了几张（0 = 本来就齐）。
+
+    ★ 为什么需要它：商品步骤以前碰到同名就 ``continue``，于是历史数据里那些
+      只写了占位图路径的商品**永远补不上图** —— 修数据只能靠手工 UPDATE。
+      改成"缺什么补什么"之后，seed 才是真正幂等的：跑几次都收敛到同一份数据，
+      过期的旧数据重跑一次就自动修好。
+
+    只碰标题对得上演示商品的那几条（调用方按标题匹配），不会动商家的真实商品。
+    """
+    detail = unwrap(client.get(f"/merchant/spus/{spu_id}", headers=headers))
+    fixed = 0
+
+    if _needs_image(detail["mainImage"]):
+        unwrap(
+            client.put(
+                f"/merchant/spus/{spu_id}",
+                json={"mainImage": upload_demo_image(client, headers, title=title)},
+                headers=headers,
+            )
+        )
+        fixed += 1
+
+    for sku in detail["skus"]:
+        if not _needs_image(sku["coverImage"]):
+            continue
+        # 封面用「商品名 + 规格」：详情页是 currentSku.coverImage || spu.mainImage，
+        # 选中规格会换图，演示时能直接看到"规格切换 → 图跟着换"
+        unwrap(
+            client.put(
+                f"/merchant/skus/{sku['id']}",
+                json={
+                    "coverImage": upload_demo_image(
+                        client, headers, title=title, caption=sku["specText"]
+                    )
+                },
+                headers=headers,
+            )
+        )
+        fixed += 1
+
+    return fixed
 
 
 def main() -> int:
@@ -655,20 +1055,30 @@ def main() -> int:
             print("店铺已存在，跳过开店")
 
         # ---------- 商品 ----------
-        existing_titles = {
-            item["title"]
-            for item in unwrap(client.get("/merchant/spus", params={"limit": 60}, headers=merchant_h))[
-                "items"
-            ]
+        by_title = {
+            item["title"]: item
+            for item in unwrap(
+                client.get("/merchant/spus", params={"limit": 60}, headers=merchant_h)
+            )["items"]
         }
 
         published = 0
+        repaired = 0
         for spec in build_products(category_ids):
-            if spec["title"] in existing_titles:
-                print(f"跳过（已存在）：{spec['title']}")
+            existing = by_title.get(spec["title"])
+            if existing is not None:
+                # ★ 同名不再直接跳过：缺图的要补上。
+                #   以前这里 continue，导致旧数据里的占位图永远修不掉，
+                #   商城里就是一排灰框 —— 重跑 seed 也救不回来。
+                fixed = ensure_product_images(client, merchant_h, existing["id"], spec["title"])
+                if fixed:
+                    repaired += fixed
+                    print(f"补图 {fixed} 张：{spec['title']}")
+                else:
+                    print(f"跳过（已存在、图也齐）：{spec['title']}")
                 continue
 
-            # 图在这里才生成并上传：上面 continue 掉的商品不会白传一遍
+            # 新商品才在这里生成图并上传
             payload = with_images(spec, client, merchant_h)
 
             created = unwrap(client.post("/merchant/spus", json=payload, headers=merchant_h))
@@ -682,6 +1092,20 @@ def main() -> int:
             )
             published += 1
             print(f"已上架：{payload['title']}（{len(created['skus'])} 个 SKU，含主图与封面）")
+
+        # ---------- 轮播图 ----------
+        # 落地页要指向真实存在的商品，所以这里重新拉一次列表 ——
+        # 上面那份 by_title 是创建前拿的，新建的商品不在里面。
+        spu_ids = {
+            item["title"]: item["id"]
+            for item in unwrap(
+                client.get("/merchant/spus", params={"limit": 60}, headers=merchant_h)
+            )["items"]
+        }
+        banner_count = ensure_banners(
+            client, admin_h, category_ids=category_ids, spu_ids=spu_ids
+        )
+        print(f"轮播图就绪：新建 {banner_count} 张（已存在的跳过）")
 
         # ---------- 仓库 → 库存 → 运费 ----------
         # ★ 顺序不能反：库存行按 (sku, 仓库) 建，运费绑定也要 warehouseId。
@@ -700,7 +1124,7 @@ def main() -> int:
     print(f"管理员账号：{ADMIN_PHONE} / {PASSWORD}   （运营后台）")
     print(f"商家账号：  {MERCHANT_PHONE} / {PASSWORD}   （商家后台）")
     print(f"买家账号：  {BUYER_PHONE} / {PASSWORD}   （商城，已带默认收货地址）")
-    print(f"本次新上架 {published} 个商品")
+    print(f"本次新上架 {published} 个商品，补齐 {repaired} 张图")
     print("=" * 56)
     return 0
 

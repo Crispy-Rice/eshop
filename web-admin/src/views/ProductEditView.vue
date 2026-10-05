@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { isBizError } from '@/api/errors'
 import {
+  deleteSpu,
   fetchMySpu,
   offShelf,
   onShelf,
@@ -114,6 +115,34 @@ async function act(action: 'submit' | 'on' | 'off'): Promise<void> {
   }
 }
 
+/**
+ * 删除商品（软删）。删成功后回列表页 —— 详情页已经没有可看的东西了。
+ *
+ * ★ 确认框必须说清"历史订单不受影响"：商家一听"删除"就怕已经卖出去的订单
+ *   跟着没了，不说明白他不敢点。实际订单读的是下单时的快照，一点不受影响。
+ */
+async function remove(): Promise<void> {
+  if (!spu.value) return
+  try {
+    await ElMessageBox.confirm(
+      `确定删除「${spu.value.title}」吗？商城将不再展示它；已产生的历史订单不受影响。`,
+      '删除商品',
+      { type: 'warning', confirmButtonText: '删除', confirmButtonClass: 'el-button--danger' },
+    )
+  } catch {
+    return // 用户取消
+  }
+
+  try {
+    await deleteSpu(spuId.value)
+    ElMessage.success('已删除')
+    await router.push('/')
+  } catch (e) {
+    // 在售 / 审核中会被后端拒绝，原样弹文案
+    ElMessage.error(isBizError(e) ? e.message : '删除失败')
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -133,9 +162,31 @@ onMounted(load)
             <el-button v-if="spu.status === 1" type="primary" @click="act('submit')">提交审核</el-button>
             <el-button v-if="spu.status === 3" type="success" @click="act('on')">上架</el-button>
             <el-button v-if="spu.status === 2" type="warning" @click="act('off')">下架</el-button>
+            <!-- 在售的要先下架、审核中的要等结果；后端也会挡，这里先不给点 -->
+            <el-button
+              v-if="spu.status !== 2 && spu.status !== 5"
+              type="danger"
+              plain
+              @click="remove"
+            >
+              删除
+            </el-button>
           </div>
         </div>
       </template>
+
+      <!-- 被驳回的商品会退回草稿，这里把平台的驳回理由原样告诉商家 ——
+           否则商品只是悄悄回到"草稿"，商家不知道该改什么。
+           理由在通过审核时会被清空，所以只会出现在草稿态。 -->
+      <el-alert
+        v-if="spu.status === 1 && spu.auditRemark"
+        type="error"
+        :closable="false"
+        class="mb16"
+        show-icon
+      >
+        <template #title>平台驳回：{{ spu.auditRemark }}</template>
+      </el-alert>
 
       <el-alert type="warning" :closable="false" class="mb16">
         <template #title>

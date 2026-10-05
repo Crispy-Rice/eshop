@@ -584,6 +584,80 @@ async def test_ship_twice_is_rejected(client: AsyncClient, session) -> None:
     assert second.json()["code"] == "ORDER_STATUS_INVALID"
 
 
+async def test_ship_rejects_duplicate_express_no(client: AsyncClient, session) -> None:
+    """★ 运单号撞号要给 400 明确提示，不能是 500。
+
+    ``uk_delivery_express`` 是全局唯一约束。不预检的话，唯一冲突会中断整个
+    PG 事务、冒成 500「系统繁忙」—— 而单号填重是商家自己改一下就能解决的问题。
+    """
+    ctx = await _prepare(client, session)
+    express = {"expressCompany": "顺丰速运", "expressNo": "SF-DUP-0001"}
+
+    first_order = await _create_order(client, ctx, idem="idem-dup-1")
+    await _pay(client, ctx, first_order["orderMainNo"])
+    first_sub = first_order["subs"][0]["orderSubNo"]
+    ok = await client.post(
+        f"/api/merchant/order-subs/{first_sub}/ship", json=express, headers=ctx["merchant_headers"]
+    )
+    assert ok.status_code == 200, ok.text
+
+    # 第二单用同一个单号
+    second_order = await _create_order(client, ctx, idem="idem-dup-2")
+    await _pay(client, ctx, second_order["orderMainNo"])
+    second_sub = second_order["subs"][0]["orderSubNo"]
+
+    dup = await client.post(
+        f"/api/merchant/order-subs/{second_sub}/ship", json=express, headers=ctx["merchant_headers"]
+    )
+    assert dup.status_code == 400, dup.text
+    assert dup.json()["code"] == "VALIDATION_ERROR"
+    assert "快递单号" in dup.json()["message"]
+
+    # ★ 被拒之后子单必须**还停在待发货** —— 预检要发生在状态机之前，
+    #   否则单号被拒了状态却已经推到「待收货」，商家再也发不了货。
+    _, sub_status = await _db_statuses(second_order["orderMainNo"])
+    assert sub_status == ORDER_WAIT_DELIVER
+
+
+async def test_deleted_product_leaves_history_orders_intact(client: AsyncClient, session) -> None:
+    """★ 商品软删后历史订单必须完好 —— 订单读的是商品快照。
+
+    这也是"删除为什么必须是软删"的直接证据：物理删掉 product.spu 那一行之后，
+    所有指向它的订单项就都悬空了。
+    """
+    ctx = await _prepare(client, session)
+    order = await _create_order(client, ctx)
+    await _pay(client, ctx, order["orderMainNo"])
+
+    # 软删要求先下架（在售的不让直接删）
+    spu = (await client.get("/api/merchant/spus", headers=ctx["merchant_headers"])).json()["data"][
+        "items"
+    ][0]
+    off = await client.post(
+        f"/api/merchant/spus/{spu['id']}/off-shelf", headers=ctx["merchant_headers"]
+    )
+    assert off.status_code == 200, off.text
+    gone = await client.delete(f"/api/merchant/spus/{spu['id']}", headers=ctx["merchant_headers"])
+    assert gone.status_code == 200, gone.text
+
+    # 买家侧：订单还在，商品名/规格/金额一个不少
+    detail = (
+        await client.get(f"/api/orders/{order['orderMainNo']}", headers=ctx["buyer_headers"])
+    ).json()["data"]
+    items = detail["subs"][0]["items"]
+    assert len(items) == 1
+    assert items[0]["title"] == spu["title"]
+    assert items[0]["skuId"] == ctx["sku_ids"][0]
+
+    # 商家仍然能把这一单发出去 —— 发货读订单，不读商品
+    shipped = await client.post(
+        f"/api/merchant/order-subs/{order['subs'][0]['orderSubNo']}/ship",
+        json={"expressCompany": "顺丰速运", "expressNo": "SF-DEL-0001"},
+        headers=ctx["merchant_headers"],
+    )
+    assert shipped.status_code == 200, shipped.text
+
+
 async def test_cannot_ship_unpaid_order(client: AsyncClient, session) -> None:
     """没付款不能发货。"""
     ctx = await _prepare(client, session)
@@ -1101,3 +1175,29 @@ async def test_order_rejected_when_stock_insufficient(client: AsyncClient, sessi
         headers={**ctx["buyer_headers"], "Idempotency-Key": "over-stock"},
     )
     assert resp.status_code in (410, 422), resp.text
+
+
+async def test_order_item_snapshot_carries_fallback_cover(
+    client: AsyncClient, session
+) -> None:
+    """★ 下单快照存的必须是**回落后的**封面图（SKU 没设图就用商品主图）。
+
+    快照写的是算价行里的 ``cover_image``，而那个值来自
+    ``product.service.batch_get_skus``。少了这层回落，订单详情和售后页
+    （读的是同一份快照）里就全是空白图。
+    """
+    ctx = await _prepare(client, session)
+    sku_id = int(ctx["sku_ids"][0])
+    async with get_session_factory()() as s, s.begin():
+        await s.execute(
+            text("UPDATE product.sku SET cover_image = '' WHERE id = :id"), {"id": sku_id}
+        )
+
+    order = await _create_order(client, ctx)
+
+    async with get_session_factory()() as s:
+        img = await s.scalar(
+            text("SELECT cover_image_snap FROM trade.order_item WHERE order_main_no = :n"),
+            {"n": order["orderMainNo"]},
+        )
+    assert img == "/media/ip16.webp", "快照该是回落后的商品主图，不是空串"

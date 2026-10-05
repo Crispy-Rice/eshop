@@ -1,17 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
+import { fetchShops } from '@/api/auth'
 import { isBizError } from '@/api/errors'
 import { fetchCategoryTree, searchProducts, type Category, type SearchSort, type SpuCard } from '@/api/product'
+import BannerCarousel from '@/components/BannerCarousel.vue'
 import { formatPriceRange, yuanToFen } from '@/utils/money'
 import { onImageError } from '@/utils/placeholder'
 
 const router = useRouter()
+const route = useRoute()
 
 const categories = ref<Category[]>([])
 const items = ref<SpuCard[]>([])
+/** shopId → 店铺名。卡片上任它显示卖家是谁 */
+const shopNames = ref<Record<string, string>>({})
 const loading = ref(false)
 const loadingMore = ref(false)
 const nextCursor = ref<string | null>(null)
@@ -58,6 +63,28 @@ const resultText = computed(() => {
   return hasMore.value ? `已显示 ${items.value.length} 件商品` : `共 ${items.value.length} 件商品`
 })
 
+/**
+ * 解析这批商品所属的店铺名，显示在卡片上。
+ *
+ * ★ **一次批量请求**，不要每张卡各发一个 —— 一页十来个商品往往只来自一两个店，
+ *   去重之后通常只有一个 id 要查。已经查过的直接跳过，"加载更多"不会重复请求。
+ *
+ * 店名只是附加信息：拉不到只是卡片上少一行，不该弹错、更不该拖住列表。
+ */
+async function loadShopNames(list: SpuCard[]): Promise<void> {
+  const missing = [...new Set(list.map((item) => item.shopId))].filter(
+    (id) => shopNames.value[id] === undefined,
+  )
+  if (missing.length === 0) return
+  try {
+    for (const shop of await fetchShops(missing)) {
+      shopNames.value[shop.id] = shop.name
+    }
+  } catch {
+    // 静默降级
+  }
+}
+
 async function load(reset: boolean): Promise<void> {
   if (reset) {
     loading.value = true
@@ -82,6 +109,8 @@ async function load(reset: boolean): Promise<void> {
     nextCursor.value = result.nextCursor
     hasMore.value = result.hasMore
     searched.value = true
+    // 不 await：商品先渲染出来，店名稍后补上，别为了附加信息拖住列表
+    void loadShopNames(result.items)
   } catch (e) {
     ElMessage.error(isBizError(e) ? e.message : '加载失败')
   } finally {
@@ -93,6 +122,64 @@ async function load(reset: boolean): Promise<void> {
 function onSearch(): void {
   void load(true)
 }
+
+/**
+ * 当前选中类目的**祖先链**（含自身）。
+ *
+ * ★ 用它反查选中状态，而不是另存一份"当前点的是哪个胶囊"：`filters.categoryId`
+ *   是唯一事实来源，所以用上面搜索栏的 cascader 选一个类目，下面的胶囊也会跟着亮。
+ */
+const activeChain = computed<Category[]>(() => {
+  const id = filters.categoryId
+  if (!id) return []
+
+  const walk = (nodes: Category[], trail: Category[]): Category[] | null => {
+    for (const node of nodes) {
+      const next = [...trail, node]
+      if (node.id === id) return next
+      const found = walk(node.children ?? [], next)
+      if (found) return found
+    }
+    return null
+  }
+  return walk(categories.value, []) ?? []
+})
+
+const activeIds = computed(() => new Set(activeChain.value.map((c) => c.id)))
+
+/**
+ * 逐层展开的类目行：第一行固定是一级类目，之后每一行是"选中节点"的下一层。
+ * 选一级 → 出二级；再选二级 → 出三级。最多三行（类目最多三级）。
+ */
+const catRows = computed<Category[][]>(() => {
+  const rows: Category[][] = [categories.value]
+  let children = activeChain.value[0]?.children ?? []
+  for (let depth = 0; depth < 2 && children.length > 0; depth += 1) {
+    rows.push(children)
+    children = activeChain.value[depth + 1]?.children ?? []
+  }
+  return rows
+})
+
+/** 点胶囊 = 设类目 + 立刻搜。后端会把选中类目的整棵子树一起算上 */
+function pickCategory(id: string): void {
+  filters.categoryId = id
+  onSearch()
+}
+
+/**
+ * 类目同步进 URL。
+ *
+ * ★ 这样「banner 指向 /?categoryId=xxx」这种站内链接才有意义 —— 否则跳过来
+ *   只是换了个 query，列表照样是全量。顺带筛选结果可以刷新保留 / 直接分享。
+ *   只在这里写、不在 route.query 上挂 watcher，所以不会来回打架。
+ */
+watch(
+  () => filters.categoryId,
+  (id) => {
+    void router.replace({ query: { ...route.query, categoryId: id || undefined } })
+  },
+)
 
 function onReset(): void {
   filters.keyword = ''
@@ -115,6 +202,10 @@ function detailHref(spu: SpuCard): string {
 }
 
 onMounted(async () => {
+  // 先认 URL 上的类目（banner / 分享链接会带过来），再拉第一屏
+  const fromQuery = route.query.categoryId
+  if (typeof fromQuery === 'string') filters.categoryId = fromQuery
+
   try {
     categories.value = await fetchCategoryTree()
   } catch {
@@ -126,6 +217,9 @@ onMounted(async () => {
 
 <template>
   <div class="page">
+    <!-- 轮播图：App 壳里的营销带在它上方，所以这里天然是"营销带下方" -->
+    <BannerCarousel />
+
     <div class="toolbar">
       <el-input
         v-model="filters.keyword"
@@ -161,6 +255,32 @@ onMounted(async () => {
       </div>
     </div>
 
+    <!-- 类目导航：按层展开，点任意一层即筛商品（后端会连整棵子树一起算）。
+         放在搜索栏下面、商品网格上面 —— 紧挨着它筛选的那片结果，"点了会变"最直观 -->
+    <nav v-if="categories.length > 0" class="cat-nav">
+      <div v-for="(row, depth) in catRows" :key="depth" class="cat-row" :class="{ sub: depth > 0 }">
+        <button
+          v-if="depth === 0"
+          type="button"
+          class="cat-chip"
+          :class="{ picked: !filters.categoryId }"
+          @click="pickCategory('')"
+        >
+          全部
+        </button>
+        <button
+          v-for="c in row"
+          :key="c.id"
+          type="button"
+          class="cat-chip"
+          :class="{ picked: activeIds.has(c.id) }"
+          @click="pickCategory(c.id)"
+        >
+          {{ c.name }}
+        </button>
+      </div>
+    </nav>
+
     <div class="result-bar">
       <span class="result-count">{{ resultText }}</span>
       <span class="result-hint">价格区间：{{ priceRange }}</span>
@@ -183,6 +303,13 @@ onMounted(async () => {
           </div>
           <div class="card-body">
             <h3 class="card-title" :title="item.title">{{ item.title }}</h3>
+            <div
+              v-if="shopNames[item.shopId]"
+              class="card-shop"
+              :title="shopNames[item.shopId]"
+            >
+              {{ shopNames[item.shopId] }}
+            </div>
             <div class="card-price tnum">{{ formatPriceRange(item.priceMin, item.priceMax) }}</div>
             <div class="card-meta">
               <span class="tnum">已售 {{ item.totalSold }}</span>
@@ -203,6 +330,58 @@ onMounted(async () => {
 /* --------------------------------------------------------------------------
  * 筛选工具栏
  * ------------------------------------------------------------------------*/
+
+/* --------------------------------------------------------------------------
+ * 类目导航
+ *
+ * 一行一层：第一行是一级类目，往下跟着当前选中的祖先链逐层展开。
+ * 用胶囊而不是树：层数最多三级，胶囊在首屏占的高度可控，也不会把商品网格挤到折叠线以下。
+ * ------------------------------------------------------------------------*/
+
+.cat-nav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.cat-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* 子级往右缩一点，层级一眼能看出来 */
+.cat-row.sub {
+  padding-left: var(--space-4);
+}
+
+.cat-chip {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out);
+}
+
+.cat-chip:hover {
+  color: var(--color-accent);
+  background: var(--color-accent-soft);
+}
+
+.cat-chip.picked {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+}
 
 .toolbar {
   display: flex;
@@ -348,6 +527,15 @@ onMounted(async () => {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+/* 卖家。锁单行省略 —— 店名长短不一会把同一排卡片撑得参差 */
+.card-shop {
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .card-price {

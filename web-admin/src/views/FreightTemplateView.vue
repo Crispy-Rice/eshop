@@ -277,9 +277,7 @@ onMounted(load)
         <el-table-column label="模板" min-width="200">
           <template #default="{ row }">
             <div class="cell-title">{{ row.name }}</div>
-            <span class="bind-link" @click="openBinds(row)">
-              已绑定 {{ row.boundSkuCount }} 个 SKU
-            </span>
+            <div class="cell-sub">已绑定 {{ row.boundSkuCount }} 个 SKU</div>
           </template>
         </el-table-column>
 
@@ -328,8 +326,11 @@ onMounted(load)
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="90" align="right">
+        <el-table-column label="操作" width="170" align="right">
           <template #default="{ row }">
+            <!-- 绑定入口放在操作列："已绑定 N 个 SKU" 那行是状态，不是按钮。
+                 之前把它做成可点的副标题，商家根本找不到绑定的地方。 -->
+            <el-button link type="primary" @click="openBinds(row)">绑定商品</el-button>
             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
           </template>
         </el-table-column>
@@ -650,16 +651,6 @@ onMounted(load)
 }
 
 /* ---------- 绑定抽屉 ---------- */
-
-.bind-link {
-  font-size: var(--text-xs);
-  color: var(--color-accent);
-  cursor: pointer;
-}
-
-.bind-link:hover {
-  text-decoration: underline;
-}
 
 .bind-body {
   display: flex;

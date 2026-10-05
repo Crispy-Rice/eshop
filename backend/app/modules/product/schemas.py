@@ -106,7 +106,8 @@ class SkuIn(CamelModel):
         min_length=1, max_length=MAX_SPEC_GROUPS, description="每个规格组各选一个值"
     )
     price: Price
-    cover_image: str = Field(min_length=1, max_length=255)
+    # 可空：SKU 不单独设图时，展示层回落商品主图（product.service.batch_get_skus）
+    cover_image: str = Field(default="", max_length=255)
     weight_g: Weight
 
 
@@ -114,7 +115,9 @@ class SpuCreateRequest(CamelModel):
     category_id: SnowflakeId
     title: str = Field(min_length=1, max_length=120)
     sub_title: str | None = Field(default=None, max_length=255)
-    main_image: str = Field(min_length=1, max_length=255)
+    # 可空：允许"先发布、后补图"。空值由展示层兜底成占位图，
+    # 但不能反过来把占位图当真实图片存进来（那会一路传染到购物车和订单快照）
+    main_image: str = Field(default="", max_length=255)
     spec_groups: list[SpecGroupIn] = Field(min_length=1, max_length=MAX_SPEC_GROUPS)
     skus: list[SkuIn] = Field(min_length=1, max_length=MAX_SKUS)
 
@@ -173,7 +176,8 @@ class SpuUpdateRequest(CamelModel):
     category_id: SnowflakeId | None = None
     title: str | None = Field(default=None, min_length=1, max_length=120)
     sub_title: str | None = Field(default=None, max_length=255)
-    main_image: str | None = Field(default=None, min_length=1, max_length=255)
+    # None = 不改；"" = 清空（清空后展示层回落占位图）
+    main_image: str | None = Field(default=None, max_length=255)
     sort_weight: int | None = None
 
 
@@ -181,7 +185,8 @@ class SkuUpdateRequest(CamelModel):
     """单个 SKU 的可改字段。价格改动**不影响已下单订单**（订单读快照）。"""
 
     price: Price | None = None
-    cover_image: str | None = Field(default=None, min_length=1, max_length=255)
+    # None = 不改；"" = 清空后回落商品主图
+    cover_image: str | None = Field(default=None, max_length=255)
     weight_g: Weight | None = None
     status: int | None = Field(default=None, ge=1, le=2)
 
@@ -229,6 +234,8 @@ class SpuDetailOut(CamelModel):
     price_max: int
     total_sold: int
     status: int
+    # 最近一次审核意见，**只对店主返回**（买家视角恒为 null）—— 见 service.get_spu_detail
+    audit_remark: str | None = None
     spec_groups: list[SpecGroupOut]
     skus: list[SkuDetailOut]
 

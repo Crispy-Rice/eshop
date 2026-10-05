@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 
 import { isBizError } from '@/api/errors'
 import { useAuthStore } from '@/stores/auth'
+import { rememberPasswordInBrowser } from '@/utils/credential'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -66,6 +67,24 @@ const rules: FormRules = {
   ],
 }
 
+/**
+ * 手机号的实时指示：绿勾 / 红叉。和商城那边是同一套做法。
+ *
+ * ★ 用的是**后端同一条规则**（1[3-9] 开头 + 9 位数字），而不是"够 11 位就行" ——
+ *   号段是真实约束，11 位但开头是 2 照样提交不上去。空着不显示图标。
+ */
+const phoneState = computed<'idle' | 'ok' | 'bad'>(() => {
+  if (!form.phone) return 'idle'
+  return /^1[3-9]\d{9}$/.test(form.phone) ? 'ok' : 'bad'
+})
+
+/**
+ * 提交。**绑在表单的 submit 上，不是按钮的 click 上**。
+ *
+ * 早先只绑了 `@click` 而表单是 `@submit.prevent`，于是**回车提交是死的** ——
+ * 浏览器自动填充完账号密码、用户顺手一敲回车，什么都不会发生。这既是最自然的
+ * 登录手势，也是浏览器判断"这是一次登录、要不要存密码"的信号之一。
+ */
 async function onSubmit(): Promise<void> {
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) return
@@ -73,6 +92,8 @@ async function onSubmit(): Promise<void> {
   try {
     if (mode.value === 'login') {
       await auth.login(form.phone, form.password)
+      // 交给系统钥匙串保管，我们自己不留密码副本
+      rememberPasswordInBrowser(form.phone, form.password)
       if (rememberPhone.value) {
         localStorage.setItem(REMEMBERED_PHONE_KEY, form.phone)
       } else {
@@ -101,19 +122,34 @@ function switchMode(): void {
     <el-card class="card" shadow="never">
       <h2 class="title">{{ mode === 'login' ? '登录' : '注册' }}</h2>
 
-      <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent>
+      <el-form
+        ref="formRef"
+        :model="form"
+        :rules="rules"
+        label-position="top"
+        @submit.prevent="onSubmit"
+      >
         <el-form-item label="手机号" prop="phone">
           <el-input
             v-model="form.phone"
+            name="username"
             placeholder="11 位手机号"
             maxlength="11"
             autocomplete="username"
-          />
+          >
+            <template #suffix>
+              <span v-if="phoneState === 'ok'" class="phone-hint ok" title="手机号格式正确">✓</span>
+              <span v-else-if="phoneState === 'bad'" class="phone-hint bad" title="手机号格式不对"
+                >✕</span
+              >
+            </template>
+          </el-input>
         </el-form-item>
 
         <el-form-item label="密码" prop="password">
           <el-input
             v-model="form.password"
+            name="password"
             type="password"
             show-password
             placeholder="至少 8 位，含字母/数字/符号中的两类"
@@ -139,13 +175,8 @@ function switchMode(): void {
           <el-input v-model="form.nickname" maxlength="64" />
         </el-form-item>
 
-        <el-button
-          type="primary"
-          class="submit"
-          :loading="auth.loading"
-          native-type="submit"
-          @click="onSubmit"
-        >
+        <!-- 提交交给表单的 submit：点按钮和按回车走的是同一条路径 -->
+        <el-button type="primary" class="submit" :loading="auth.loading" native-type="submit">
           {{ mode === 'login' ? '登录' : '注册并登录' }}
         </el-button>
       </el-form>
@@ -170,6 +201,21 @@ function switchMode(): void {
 .card {
   width: 380px;
   max-width: 100%;
+}
+
+/* 手机号的实时指示。颜色走语义 token */
+.phone-hint {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  line-height: 1;
+}
+
+.phone-hint.ok {
+  color: var(--color-success);
+}
+
+.phone-hint.bad {
+  color: var(--color-danger);
 }
 
 .title {

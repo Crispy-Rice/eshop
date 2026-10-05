@@ -119,6 +119,19 @@ class ShopCreateRequest(CamelModel):
     description: str | None = Field(default=None, max_length=255)
 
 
+class ShopUpdateRequest(CamelModel):
+    """店铺设置。部分更新 —— 只改传了的字段，和 ``UpdateProfileRequest`` 一致。
+
+    ``logo`` / ``description`` 是可空的**选填**字段：服务端靠 ``model_fields_set``
+    区分"没传"和"显式传 null"（后者表示清空），所以这里不能把 None 当成"不改"。
+    ``name`` 相反 —— 店铺不能没有名字，传 None 直接当作不改。
+    """
+
+    name: str | None = Field(default=None, min_length=2, max_length=64)
+    logo: str | None = Field(default=None, max_length=255)
+    description: str | None = Field(default=None, max_length=255)
+
+
 class ShopOut(CamelModel):
     id: SnowflakeId
     name: str

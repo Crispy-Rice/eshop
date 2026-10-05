@@ -15,6 +15,7 @@ from sqlalchemy import text
 
 from app.core.db import get_session_factory
 from app.core.snowflake import next_id
+from app.modules.freight import repository as repo
 from app.modules.freight import service
 from app.modules.freight.schemas import (
     ExcludeRegionIn,
@@ -236,8 +237,16 @@ async def test_update_template_reports_affected_skus() -> None:
     wh_id = await _make_warehouse(shop_id)
 
     async with get_session_factory()() as s, s.begin():
-        await service.bind_sku(
-            s, shop_id, sku_id=12345, template_id=tpl_id, warehouse_id=wh_id
+        # 直接用 repo 建绑定行：这条用例只关心"计数反映绑定数"。
+        # 走 service.bind_sku 的话它现在会校验 SKU 归属（防跨店绑定），
+        # 那就得先造一件真商品，跟这条用例要验的东西无关。
+        await repo.upsert_bind(
+            s,
+            sku_id=12345,
+            template_id=tpl_id,
+            warehouse_id=wh_id,
+            priority=0,
+            bind_id=next_id(),
         )
 
     async with get_session_factory()() as s, s.begin():
@@ -588,3 +597,121 @@ async def test_list_binds_of_other_shop_is_404(client: AsyncClient, session) -> 
     )
     assert resp.status_code == 404
     assert resp.json()["code"] == "NOT_FOUND"
+
+
+# ============================================================
+# ⑩ 已软删商品在运费绑定上的表现
+#
+# 软删只改 ``product.spu.deleted``，**不会**去删 ``freight.sku_freight_bind``
+# 里的行 —— 模块边界规定 freight 的表只有 freight 自己能写，product 不能反向
+# 依赖它。所以"删了就该消失"这件事只能在 freight 的读侧做。
+# ============================================================
+async def _only_spu_id(client: AsyncClient, mh: dict[str, str]) -> str:
+    """这个商家唯一那件商品的 id（``_merchant_with_sku`` 只造一件）。"""
+    resp = await client.get("/api/merchant/spus", params={"limit": 10}, headers=mh)
+    items = resp.json()["data"]["items"]
+    assert len(items) == 1, f"预期正好一件商品，实际 {len(items)}"
+    return str(items[0]["id"])
+
+
+async def test_deleted_product_leaves_bind_list_and_count(
+    client: AsyncClient, session
+) -> None:
+    """★ 商品软删后，它的运费绑定不该再出现在明细里，"已绑定 N 个 SKU"要一起减。
+
+    残留行还在 ``freight.sku_freight_bind`` 里，商家却看不到 —— 这正是
+    "删了却像没删干净"的来源。
+    """
+    mh, shop_id, sku_id, wh_id = await _merchant_with_sku(
+        client, session, phone="13800138044"
+    )
+    tpl_id = await _make_template(shop_id)
+    bound = await client.post(
+        "/api/merchant/freight/bind",
+        json={"skuId": str(sku_id), "templateId": str(tpl_id), "warehouseId": str(wh_id)},
+        headers=mh,
+    )
+    assert bound.status_code == 200, bound.text
+
+    # 删之前先确认这条链路本来是通的，否则下面的空断言会空过
+    rows = (
+        await client.get(f"/api/merchant/freight/templates/{tpl_id}/binds", headers=mh)
+    ).json()["data"]
+    assert len(rows) == 1
+    count = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"][
+        0
+    ]["boundSkuCount"]
+    assert count == 1
+
+    spu_id = await _only_spu_id(client, mh)
+    assert (await client.delete(f"/api/merchant/spus/{spu_id}", headers=mh)).status_code == 200
+
+    rows = (
+        await client.get(f"/api/merchant/freight/templates/{tpl_id}/binds", headers=mh)
+    ).json()["data"]
+    assert rows == []
+    count = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"][
+        0
+    ]["boundSkuCount"]
+    assert count == 0, "计数必须和明细一致，否则商家看到空明细配个 1"
+    # 行本身留在库里：将来若做"恢复已删商品"，绑定关系还在
+    assert (
+        await session.scalar(
+            text("SELECT count(*) FROM freight.sku_freight_bind WHERE template_id = :t"),
+            {"t": tpl_id},
+        )
+        == 1
+    )
+
+
+async def test_bind_rejects_deleted_sku(client: AsyncClient, session) -> None:
+    """★ 给已删商品建绑定没有意义 —— 那件商品连下单都下不了。"""
+    mh, shop_id, sku_id, wh_id = await _merchant_with_sku(
+        client, session, phone="13800138045"
+    )
+    tpl_id = await _make_template(shop_id)
+    spu_id = await _only_spu_id(client, mh)
+    assert (await client.delete(f"/api/merchant/spus/{spu_id}", headers=mh)).status_code == 200
+
+    resp = await client.post(
+        "/api/merchant/freight/bind",
+        json={"skuId": str(sku_id), "templateId": str(tpl_id), "warehouseId": str(wh_id)},
+        headers=mh,
+    )
+    assert resp.status_code == 404
+
+
+async def test_bind_rejects_another_shops_sku(client: AsyncClient, session) -> None:
+    """★ 只校验模板归属不够：拿别人的 sku_id 就能把竞争对手的商品绑到自己的
+    模板上 —— 建个 0 元模板、优先级拉满，对方的商品对买家就包邮了。"""
+    mh_a, shop_a, sku_a, wh_a = await _merchant_with_sku(
+        client, session, phone="13800138046"
+    )
+    # 先证明这组参数在"自己的 SKU + 自己的模板"下是能绑上的，
+    # 否则下面的 404 可能是别的原因造成的，白过
+    tpl_a = await _make_template(shop_a)
+    ok = await client.post(
+        "/api/merchant/freight/bind",
+        json={"skuId": str(sku_a), "templateId": str(tpl_a), "warehouseId": str(wh_a)},
+        headers=mh_a,
+    )
+    assert ok.status_code == 200, ok.text
+
+    merchant_b = await register(client, phone="13800138047")
+    shop_b = int(await open_shop(client, merchant_b["accessToken"], name="另一家店"))
+    mh_b = auth_header(merchant_b["accessToken"])
+    tpl_b = await _make_template(shop_b)
+
+    resp = await client.post(
+        "/api/merchant/freight/bind",
+        json={"skuId": str(sku_a), "templateId": str(tpl_b), "warehouseId": str(wh_a)},
+        headers=mh_b,
+    )
+    assert resp.status_code == 404
+    assert (
+        await session.scalar(
+            text("SELECT count(*) FROM freight.sku_freight_bind WHERE template_id = :t"),
+            {"t": tpl_b},
+        )
+        == 0
+    )

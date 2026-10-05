@@ -159,6 +159,22 @@ async def update_spu_fields(session: AsyncSession, spu_id: int, values: dict[str
     await session.execute(update(Spu).where(Spu.id == spu_id).values(**values))
 
 
+async def soft_delete_spu(session: AsyncSession, spu_id: int) -> None:
+    """软删商品 —— 只置 ``deleted``，**不物理删**。
+
+    ``product.spu.deleted`` 这个字段一直存在、读侧也全都接好了（每处查询都带
+    ``deleted = false``），只是一直没有代码去写它。物理删除会破坏订单语义
+    （订单里存的是商品快照，行没了历史订单就指向空气），而且误删不可逆。
+
+    连带影响都已经被读侧处理好了，不需要在这里补：
+    - 商城搜索/详情：过滤 ``deleted``，直接消失
+    - 平台的商品列表：同一条路径，一起消失
+    - 库存页 / 运费绑定：别的模块调 ``list_deleted_sku_ids`` 把残留行一起排掉
+    - 历史订单/售后：读快照，不受影响
+    """
+    await update_spu_fields(session, spu_id, {"deleted": True})
+
+
 async def list_spus_by_ids(session: AsyncSession, spu_ids: Sequence[int]) -> list[Spu]:
     if not spu_ids:
         return []
@@ -259,13 +275,42 @@ async def list_skus_by_spus(session: AsyncSession, spu_ids: Sequence[int]) -> li
 
 
 async def list_skus_by_shop(session: AsyncSession, shop_id: int, *, limit: int = 500) -> list[Sku]:
-    """按店铺列 SKU。
+    """按店铺列 SKU —— **不含已软删商品**的 SKU。
 
     给 inventory 用：商家发布商品后要在库存页看到它，而库存页是按 SKU 驱动的，
     所以需要"这个店铺有哪些 SKU"这个查询。加上限避免店铺很大时一次拉爆。
+
+    ★ 必须排掉已软删的商品：这个结果是被拿去**补建库存行**的
+      （``inventory.service.ensure_stock_rows``）。不排掉的话，商家刚删掉一个
+      还没建过库存的商品，一打开库存页就会凭空多出几行 0 库存的残留行。
+
+      已经建过库存行的已删商品是另一回事：那些行留在 ``inventory.sku_stock``
+      里，由库存页的读侧用 ``list_deleted_sku_ids`` 排掉，也不在这里补新的。
     """
     result = await session.scalars(
-        select(Sku).where(Sku.shop_id == shop_id).order_by(Sku.id).limit(limit)
+        select(Sku)
+        .join(Spu, Spu.id == Sku.spu_id)
+        .where(Sku.shop_id == shop_id, Spu.deleted.is_(False))
+        .order_by(Sku.id)
+        .limit(limit)
+    )
+    return list(result)
+
+
+async def list_deleted_sku_ids(session: AsyncSession, shop_id: int) -> list[int]:
+    """**已软删商品**下面的 SKU id。
+
+    给别的模块的读侧做过滤用：软删不动别的 schema，所以 ``inventory.sku_stock``、
+    ``freight.sku_freight_bind`` 里可能还留着这些 SKU 的行。行不能删（见
+    ``soft_delete_spu``），但也不该再出现在商家的操作界面上。
+
+    走 id 列表而不是让调用方自己 join ``product`` 的表 —— 别的模块不许碰 product
+    schema（docs/01 §2），这里是那扇门。
+    """
+    result = await session.scalars(
+        select(Sku.id)
+        .join(Spu, Spu.id == Sku.spu_id)
+        .where(Sku.shop_id == shop_id, Spu.deleted.is_(True))
     )
     return list(result)
 

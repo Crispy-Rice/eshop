@@ -97,7 +97,7 @@ async function onLogout(): Promise<void> {
             <a v-if="backendEntry" :href="backendEntry.url" class="backend-link">
               {{ backendEntry.label }}
             </a>
-            <span class="nickname">{{ auth.user?.nickname }}</span>
+            <RouterLink to="/account" class="nickname" title="个人中心">{{ auth.user?.nickname }}</RouterLink>
             <el-button link type="primary" @click="onLogout">退出</el-button>
           </template>
           <RouterLink v-else to="/login">
@@ -162,20 +162,33 @@ async function onLogout(): Promise<void> {
   color: var(--color-text-tertiary);
 }
 
+/* 导航：hover 给一块浅底，当前项给一块**实心强调色胶囊**。
+ *
+ * ★ 原来是"灰字 + 当前项一条 2px 下划线"。在满是卡片、输入框、按钮的头部里，
+ *   一组纯文字几乎读不出"这是可以点的"，当前项也只有一根细线。
+ *   改成实心胶囊后有两个好处：位置一眼可见；而且胶囊跟着皮肤换色
+ *   （中性=墨黑、618=红、双11=紫、年货节=橙）—— 换肤在头部就有了第二个信号，
+ *   不用只靠品牌字那一处。
+ */
 .nav {
   display: flex;
-  gap: var(--space-5);
+  align-items: center;
+  gap: var(--space-1);
   flex: 0 0 auto;
 }
 
 .nav-link {
-  position: relative;
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
   font-size: var(--text-base);
   color: var(--color-text-secondary);
-  transition: color var(--dur-fast) var(--ease-out);
+  white-space: nowrap;
+  transition:
+    background-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
 }
 
 /* 角标：跟着强调色走，换肤时自动变色 */
@@ -192,23 +205,19 @@ async function onLogout(): Promise<void> {
 
 .nav-link:hover {
   color: var(--color-text);
+  background: var(--color-bg-subtle);
 }
 
 .nav-link.router-link-exact-active {
-  color: var(--color-text);
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
   font-weight: var(--weight-medium);
 }
 
-/* 当前页用一条短下划线标记，比加粗更清晰 */
-.nav-link.router-link-exact-active::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -21px;
-  height: 2px;
-  background: var(--color-accent);
-  border-radius: var(--radius-pill);
+/* ★ 购物车是当前项时，胶囊和角标都是强调色 —— 同色叠同色会看不见，要反过来 */
+.nav-link.router-link-exact-active .badge {
+  background: var(--color-accent-contrast);
+  color: var(--color-accent);
 }
 
 .spacer {
@@ -292,6 +301,12 @@ async function onLogout(): Promise<void> {
 .nickname {
   font-size: var(--text-base);
   color: var(--color-text);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+/* 昵称是通往个人中心的入口 —— 给个 hover 提示，否则看不出能点 */
+.nickname:hover {
+  color: var(--color-accent);
 }
 
 /* ---------- 内容 ---------- */

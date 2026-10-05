@@ -42,6 +42,64 @@ const lines = computed<CartItem[]>(() =>
 
 const payableCoupons = computed(() => myCoupons.value.filter((c) => c.status === CODE_UNUSED && !c.expired))
 
+/** 券的来源类型，与后端 `promotion/models.py` 的 DISCOUNT_COUPON_* 一致 */
+const COUPON_PLATFORM = 'COUPON_PLATFORM'
+const COUPON_SHOP = 'COUPON_SHOP'
+
+interface CouponGroup {
+  key: string
+  title: string
+  coupons: MyCoupon[]
+}
+
+const shopNames = computed<Record<string, string>>(() =>
+  Object.fromEntries((cart.value?.groups ?? []).map((g) => [g.shopId, g.shopName])),
+)
+
+/**
+ * 券按「平台券 / 各店券」分组。
+ *
+ * ★ 分组不是为了好看：**同一个冲突组里只能用一张**（后端 `_conflict_group` 的
+ *   上限就是 1，规则表里 COUPON_PLATFORM×COUPON_PLATFORM 也是不可叠加）。
+ *   以前所有券堆成一排随便多选，选了两张只减一张 —— 看着像"叠加坏了"，
+ *   实际是规则如此。按组摆出来，规则自己就说明白了。
+ */
+const couponGroups = computed<CouponGroup[]>(() => {
+  const groups: CouponGroup[] = []
+  const platform = payableCoupons.value.filter((c) => c.shopId === '0')
+  if (platform.length > 0) groups.push({ key: 'platform', title: '平台券', coupons: platform })
+
+  const byShop = new Map<string, MyCoupon[]>()
+  for (const c of payableCoupons.value) {
+    if (c.shopId === '0') continue
+    const list = byShop.get(c.shopId) ?? []
+    list.push(c)
+    byShop.set(c.shopId, list)
+  }
+  for (const [shopId, list] of byShop) {
+    groups.push({
+      key: `shop:${shopId}`,
+      title: `店铺券 · ${shopNames.value[shopId] ?? '店铺'}`,
+      coupons: list,
+    })
+  }
+  return groups
+})
+
+/**
+ * 真正生效的券 id。
+ *
+ * ★ 高亮以**算价结果**为准，不是以"用户点过哪些"为准 —— 点过的券可能门槛不够
+ *   没生效，那种情况下高亮它等于骗人。这样"看到的"和"减掉的"永远一致。
+ */
+const appliedCouponIds = computed(() => {
+  const ids = new Set<string>()
+  for (const d of calc.value?.discounts ?? []) {
+    if (d.sourceType === COUPON_PLATFORM || d.sourceType === COUPON_SHOP) ids.add(d.sourceId)
+  }
+  return ids
+})
+
 const currentAddress = computed(() => addresses.value.find((a) => a.id === addressId.value) ?? null)
 
 async function recalc(): Promise<void> {
@@ -80,11 +138,20 @@ async function load(): Promise<void> {
   }
 }
 
-/** 切换选券后重新算价 —— 优惠是叠加计算的，不能在前端估算 */
-async function toggleCoupon(c: MyCoupon): Promise<void> {
-  const idx = selectedCoupons.value.indexOf(c.id)
-  if (idx >= 0) selectedCoupons.value.splice(idx, 1)
-  else selectedCoupons.value.push(c.id)
+/**
+ * 选券：**组内单选**，再点一次 = 这一组不用券。
+ *
+ * ★ 组内只能有一张生效（后端 `_conflict_group` 的上限就是 1，规则表里
+ *   COUPON_PLATFORM×COUPON_PLATFORM 也是不可叠加）。跨组（平台券 + 店铺券）
+ *   可以叠加，引擎会分别按作用域分摊。
+ * ★ 空列表 = **不用券**：后端的 `_load_coupons` 收到空 id 列表就直接不加载任何券，
+ *   所以"取消勾选"是真的取消，不会变成"后端替我挑一张"。
+ */
+async function pickCoupon(c: MyCoupon, group: CouponGroup): Promise<void> {
+  const groupIds = new Set(group.coupons.map((x) => x.id))
+  const others = selectedCoupons.value.filter((id) => !groupIds.has(id))
+  const picked = selectedCoupons.value.includes(c.id)
+  selectedCoupons.value = picked ? others : [...others, c.id]
   await recalc()
 }
 
@@ -226,20 +293,29 @@ onMounted(async () => {
         <div v-if="payableCoupons.length === 0" class="empty-line">
           没有可用券，<RouterLink to="/coupons" class="link">去领券</RouterLink>
         </div>
-        <div v-else class="coupons">
-          <button
-            v-for="c in payableCoupons"
-            :key="c.id"
-            type="button"
-            class="coupon-chip"
-            :class="{ picked: selectedCoupons.includes(c.id) }"
-            @click="toggleCoupon(c)"
-          >
-            <span class="chip-value tnum">
-              {{ c.couponType === 2 ? `${(c.discountValue / 1000).toFixed(1).replace(/\.0$/, '')}折` : `¥${formatYuan(c.discountValue)}` }}
-            </span>
-            <span class="chip-name">{{ c.name }}</span>
-          </button>
+        <div v-else class="coupon-groups">
+          <!-- 按组摆：同一组只能用一张（平台券一张、每店券一张），跨组可叠加 -->
+          <div v-for="g in couponGroups" :key="g.key" class="coupon-group">
+            <div class="group-head">
+              <span class="group-title">{{ g.title }}</span>
+              <span v-if="g.coupons.length > 1" class="group-hint">选一张</span>
+            </div>
+            <div class="coupons">
+              <button
+                v-for="c in g.coupons"
+                :key="c.id"
+                type="button"
+                class="coupon-chip"
+                :class="{ picked: appliedCouponIds.has(c.id) }"
+                @click="pickCoupon(c, g)"
+              >
+                <span class="chip-value tnum">
+                  {{ c.couponType === 2 ? `${(c.discountValue / 1000).toFixed(1).replace(/\.0$/, '')}折` : `¥${formatYuan(c.discountValue)}` }}
+                </span>
+                <span class="chip-name">{{ c.name }}</span>
+              </button>
+            </div>
+          </div>
         </div>
 
         <!-- 不可用的券要说清原因，尤其"还差多少"——那能促使用户凑单 -->
@@ -495,11 +571,35 @@ onMounted(async () => {
 
 /* ---------- 选券 ---------- */
 
+/* 一组 = 一个冲突组（平台券 / 某个店的券）。组内只能选一张，组间可叠加。 */
+.coupon-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4);
+}
+
+.group-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.group-title {
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.group-hint {
+  font-size: var(--text-xs);
+  color: var(--color-text-placeholder);
+}
+
 .coupons {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-3);
-  padding: var(--space-4);
 }
 
 .coupon-chip {

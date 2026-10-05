@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Header, Request
+from fastapi import APIRouter, Header, Query, Request
 
 from app.core.deps import CurrentUserDep, DbSession, client_ip
 from app.core.response import ApiResponse
@@ -20,6 +20,7 @@ from app.modules.account.schemas import (
     RegisterRequest,
     ShopCreateRequest,
     ShopOut,
+    ShopUpdateRequest,
     TokenResponse,
     UpdateProfileRequest,
     UserOut,
@@ -134,6 +135,20 @@ async def delete_address(address_id: int, user: CurrentUserDep, session: DbSessi
 # ============================================================
 # 店铺（公开只读）
 # ============================================================
+@router.get("/api/shops", response_model=ApiResponse[list[ShopOut]], summary="批量取店铺信息")
+async def list_shops(
+    session: DbSession,
+    ids: list[int] = Query(default=[], max_length=100, description="要查询的店铺 ID"),
+) -> ApiResponse[list[ShopOut]]:
+    """商品列表页一次显示 N 个商品，逐个请求就是 N+1，所以给一个批量的。
+
+    参数字形是**重复参数**（``?ids=1&ids=2``）。axios 默认会序列化成带方括号的
+    ``ids[]=1``，FastAPI 不认 —— 前端那边配 ``paramsSerializer: { indexes: null }``
+    即可，比两边各自解析逗号分隔的字符串干净。
+    """
+    return ApiResponse.ok(await service.list_public_shops(session, ids))
+
+
 @router.get("/api/shops/{shop_id}", response_model=ApiResponse[ShopOut], summary="店铺公开信息")
 async def get_shop(shop_id: int, session: DbSession) -> ApiResponse[ShopOut]:
     """不需要登录：商品详情页要显示"这件商品是哪家店的"。
@@ -156,3 +171,15 @@ async def create_shop(
 @router.get("/api/merchant/shop", response_model=ApiResponse[ShopOut], summary="我的店铺")
 async def get_my_shop(user: CurrentUserDep, session: DbSession) -> ApiResponse[ShopOut]:
     return ApiResponse.ok(await service.get_my_shop(session, user.id))
+
+
+@router.put("/api/merchant/shop", response_model=ApiResponse[ShopOut], summary="修改店铺设置")
+async def update_my_shop(
+    body: ShopUpdateRequest, user: CurrentUserDep, session: DbSession
+) -> ApiResponse[ShopOut]:
+    """改名 / 换 LOGO / 改简介，部分更新。
+
+    用 ``CurrentUserDep`` 而不是 ``CurrentShopIdDep``：归属是「我的店」这一层语义，
+    由 service 按 owner_user_id 查库确定，取不到就是没开店（404）。
+    """
+    return ApiResponse.ok(await service.update_my_shop(session, user.id, body))

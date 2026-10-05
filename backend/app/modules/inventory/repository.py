@@ -93,14 +93,23 @@ async def list_stock(
     *,
     warehouse_id: int | None = None,
     sku_id: int | None = None,
+    exclude_sku_ids: Sequence[int] = (),
     cursor: str | None = None,
     limit: int = 20,
 ) -> list[SkuStock]:
+    """库存行，**按 id 倒序**（键集游标）。
+
+    ``exclude_sku_ids`` 是已软删商品的 SKU（由 ``product.service`` 给，见那边的
+    ``list_deleted_sku_ids``）：它们的库存行还在表里，但不该再出现在库存页。
+    必须在这一层过滤而不是取回来再筛 —— 那样每页会少几条，游标翻页会错位。
+    """
     stmt: Select = select(SkuStock).where(SkuStock.shop_id == shop_id)
     if warehouse_id is not None:
         stmt = stmt.where(SkuStock.warehouse_id == warehouse_id)
     if sku_id is not None:
         stmt = stmt.where(SkuStock.sku_id == sku_id)
+    if exclude_sku_ids:
+        stmt = stmt.where(SkuStock.sku_id.not_in(exclude_sku_ids))
     if cursor is not None:
         stmt = stmt.where(SkuStock.id < int(cursor))
     stmt = stmt.order_by(SkuStock.id.desc()).limit(limit)

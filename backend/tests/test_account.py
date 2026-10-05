@@ -342,3 +342,121 @@ async def test_public_shop_info_needs_no_login(client: AsyncClient) -> None:
 async def test_public_shop_info_unknown_id_404(client: AsyncClient) -> None:
     resp = await client.get("/api/shops/999999999")
     assert resp.status_code == 404
+
+
+async def test_batch_public_shops(client: AsyncClient) -> None:
+    """商品列表页一次要显示 N 个商品，逐个请求就是 N+1 —— 批量接口是给这个用的。"""
+    first = await register(client)
+    second = await register(client, phone="13900139099")
+    shop_a = (
+        await client.post(
+            "/api/merchant/shop", json={"name": "A 店"}, headers=auth_header(first["accessToken"])
+        )
+    ).json()["data"]
+    shop_b = (
+        await client.post(
+            "/api/merchant/shop", json={"name": "B 店"}, headers=auth_header(second["accessToken"])
+        )
+    ).json()["data"]
+
+    # 重复参数形状：?ids=1&ids=2
+    resp = await client.get(f"/api/shops?ids={shop_a['id']}&ids={shop_b['id']}")
+    assert resp.status_code == 200, resp.text
+    assert {s["name"] for s in resp.json()["data"]} == {"A 店", "B 店"}
+
+
+async def test_batch_public_shops_without_ids_returns_empty(client: AsyncClient) -> None:
+    """★ 不传 ids 要返回空数组，而不是把整张店铺表捞出来。"""
+    resp = await client.get("/api/shops")
+    assert resp.status_code == 200
+    assert resp.json()["data"] == []
+
+
+# ============================================================
+# 店铺设置（改名 / LOGO / 简介）
+# ============================================================
+
+
+async def test_update_shop_settings(client: AsyncClient) -> None:
+    tokens = await register(client)
+    headers = auth_header(tokens["accessToken"])
+    await client.post("/api/merchant/shop", json={"name": "旧店名"}, headers=headers)
+
+    resp = await client.put(
+        "/api/merchant/shop",
+        json={"name": "新店名", "description": "只卖好东西"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["name"] == "新店名"
+    assert resp.json()["data"]["description"] == "只卖好东西"
+
+    # 落库：再从"我的店铺"读一次
+    shop = (await client.get("/api/merchant/shop", headers=headers)).json()["data"]
+    assert shop["name"] == "新店名"
+
+    # 公开接口跟着变 —— 商品详情页/列表卡片显示的就是它
+    public = await client.get(f"/api/shops/{shop['id']}")
+    assert public.json()["data"]["name"] == "新店名"
+
+
+async def test_update_shop_is_partial(client: AsyncClient) -> None:
+    """★ 只传 name 时，不能顺手把 logo 和简介清掉。"""
+    tokens = await register(client)
+    headers = auth_header(tokens["accessToken"])
+    await client.post(
+        "/api/merchant/shop",
+        json={"name": "老店", "logo": "/media/shops/1/a.webp", "description": "简介"},
+        headers=headers,
+    )
+
+    resp = await client.put("/api/merchant/shop", json={"name": "改名了"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    shop = (await client.get("/api/merchant/shop", headers=headers)).json()["data"]
+    assert shop["name"] == "改名了"
+    assert shop["logo"] == "/media/shops/1/a.webp"
+    assert shop["description"] == "简介"
+
+
+async def test_update_shop_can_clear_optional_fields(client: AsyncClient) -> None:
+    """★ 显式传 null 是**清空**，跟"没传"不是一回事 —— 这正是 model_fields_set 的意义。"""
+    tokens = await register(client)
+    headers = auth_header(tokens["accessToken"])
+    await client.post(
+        "/api/merchant/shop",
+        json={"name": "老店", "logo": "/media/shops/1/a.webp", "description": "简介"},
+        headers=headers,
+    )
+
+    resp = await client.put(
+        "/api/merchant/shop", json={"logo": None, "description": None}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+
+    shop = (await client.get("/api/merchant/shop", headers=headers)).json()["data"]
+    assert shop["logo"] is None
+    assert shop["description"] is None
+    # 没传 name，名字不动
+    assert shop["name"] == "老店"
+
+
+async def test_update_shop_without_shop_404(client: AsyncClient) -> None:
+    tokens = await register(client)
+    resp = await client.put(
+        "/api/merchant/shop", json={"name": "新店名"}, headers=auth_header(tokens["accessToken"])
+    )
+    assert resp.status_code == 404
+
+
+async def test_update_shop_rejects_short_name(client: AsyncClient) -> None:
+    tokens = await register(client)
+    headers = auth_header(tokens["accessToken"])
+    await client.post("/api/merchant/shop", json={"name": "正常店名"}, headers=headers)
+
+    resp = await client.put("/api/merchant/shop", json={"name": "x"}, headers=headers)
+    assert resp.status_code == 400
+
+
+async def test_update_shop_requires_login(client: AsyncClient) -> None:
+    assert (await client.put("/api/merchant/shop", json={"name": "新店名"})).status_code == 401

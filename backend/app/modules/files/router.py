@@ -29,7 +29,7 @@ router = APIRouter()
 async def upload_image(
     user: CurrentUserDep,
     file: Annotated[UploadFile, File()],
-    biz: str = Query(default="reviews", description="业务线：reviews / aftersale / products"),
+    biz: str = Query(default="reviews", description="业务线：reviews / aftersale / products / shops"),
 ) -> ApiResponse[ImageUploadOut]:
     """上传单张图片。
 

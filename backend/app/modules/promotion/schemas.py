@@ -257,3 +257,36 @@ class PromoActivityCreateRequest(CamelModel):
     start_at: datetime
     end_at: datetime
     priority: int = 0
+
+
+# ============================================================
+# 首页 Banner
+# ============================================================
+class BannerOut(CamelModel):
+    """轮播图。公开接口与管理端共用 —— 字段就这么几个，没必要维护两套。"""
+
+    id: SnowflakeId
+    title: str
+    image: str
+    link_url: str | None = None
+    sort: int = 0
+    status: int = 1
+
+
+class BannerCreateRequest(CamelModel):
+    title: str = Field(min_length=1, max_length=64, description="运营看的名字，也当图片 alt")
+    image: str = Field(min_length=1, max_length=255, description="完整 url")
+    # ★ 只接受**站内路径**（或以空串清空）。外链要处理新窗口、referrer、白名单，
+    #   当前场景用不到；不限制的话运营填个 https:// 就会在前端变成死链。
+    link_url: str | None = Field(default=None, max_length=255, pattern=r"^(/.*)?$")
+    sort: int = 0
+
+
+class BannerUpdateRequest(CamelModel):
+    """部分更新：只写传了的字段（``link_url`` 传空串表示清空）。"""
+
+    title: str | None = Field(default=None, min_length=1, max_length=64)
+    image: str | None = Field(default=None, min_length=1, max_length=255)
+    link_url: str | None = Field(default=None, max_length=255, pattern=r"^(/.*)?$")
+    sort: int | None = None
+    status: int | None = Field(default=None, ge=1, le=2)

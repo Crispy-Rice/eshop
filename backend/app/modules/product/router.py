@@ -159,6 +159,20 @@ async def off_shelf(spu_id: int, shop_id: CurrentShopIdDep, session: DbSession) 
     return ApiResponse.ok(None)
 
 
+@router.delete("/api/merchant/spus/{spu_id}", response_model=ApiResponse[None], summary="删除商品")
+async def delete_spu(spu_id: int, shop_id: CurrentShopIdDep, session: DbSession) -> ApiResponse[None]:
+    """软删商品。
+
+    删完它会从商城、商家自己的列表、平台审核列表里一起消失，但：
+    - **历史订单不受影响** —— 订单读的是商品快照
+    - 库存页、运费模板的绑定列表里也不再出现它（残留行还在库里，只是不展示）
+
+    在售的和审核中的不让删（见 ``service.delete_spu``）。
+    """
+    await service.delete_spu(session, shop_id, spu_id)
+    return ApiResponse.ok(None)
+
+
 # ============================================================
 # 平台运营端
 # ============================================================
@@ -214,9 +228,32 @@ async def delete_category(category_id: int, admin: AdminDep, session: DbSession)
     return ApiResponse.ok(None)
 
 
+@router.get("/api/admin/spus", response_model=ApiResponse[SpuListOut], summary="商品列表（平台）")
+async def list_admin_spus(
+    admin: AdminDep,
+    session: DbSession,
+    status: int | None = Query(default=None, ge=1, le=5),
+    keyword: str | None = Query(default=None, max_length=60),
+    cursor: str | None = Query(default=None, max_length=200),
+    limit: int = Query(default=20, ge=1, le=60),
+) -> ApiResponse[SpuListOut]:
+    """跨店铺的商品列表，平台运营的审核队列用它。
+
+    ★ 之前只有 ``/api/merchant/spus``（限本店），平台侧**一个能列出商品的接口都没有** ——
+      ``/api/admin/spus/{id}/audit`` 只能靠调用方自己知道 spu_id，
+      所以审核一直是有接口、没页面。
+    """
+    return ApiResponse.ok(
+        await service.list_admin_spus(
+            session, status=status, keyword=keyword, cursor=cursor, limit=limit
+        )
+    )
+
+
 @router.post("/api/admin/spus/{spu_id}/audit", response_model=ApiResponse[None], summary="商品审核")
 async def audit_spu(
     spu_id: int, body: SpuAuditRequest, admin: AdminDep, session: DbSession
 ) -> ApiResponse[None]:
+    """通过 → 上架；驳回 → 退回草稿。``remark`` 会存进 ``audit_remark`` 给商家看。"""
     await service.audit_spu(session, spu_id, body)
     return ApiResponse.ok(None)

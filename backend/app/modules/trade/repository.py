@@ -604,6 +604,27 @@ async def list_discount_snapshots(
 # ============================================================
 # 发货
 # ============================================================
+async def delivery_express_exists(
+    session: AsyncSession, express_company: str, express_no: str
+) -> bool:
+    """这个「快递公司 + 单号」是否已经被用过。
+
+    ``uk_delivery_express`` 是全局唯一约束（运单号本来就不该重复）。
+    ★ 这里**预检**而不是等约束报错：唯一冲突会中断整个 PG 事务，冒出去就是 500 ——
+      而单号填重是商家改一下就能解决的问题，应该回一句能看懂的话
+      （本仓库既有约定，见 product.repository.category_name_exists）。
+    """
+    found = await session.scalar(
+        select(DeliveryOrder.id)
+        .where(
+            DeliveryOrder.express_company == express_company,
+            DeliveryOrder.express_no == express_no,
+        )
+        .limit(1)
+    )
+    return found is not None
+
+
 async def insert_delivery(session: AsyncSession, delivery: DeliveryOrder) -> DeliveryOrder:
     session.add(delivery)
     await session.flush()

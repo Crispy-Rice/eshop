@@ -50,7 +50,15 @@ MAX_PIXELS = 40_000_000
 #
 # products 是商品主图与 SKU 封面（商家上传）。在此之前商品图只能靠手填 URL，
 # 而部署环境是 IP 直连、没有图床 —— 等于商家放不了真图。
-ALLOWED_BIZ = frozenset({"reviews", "aftersale", "products"})
+#
+# shops 是店铺 LOGO（商家上传，店铺设置页）。和 products 一样存的是完整 url，
+# 因为它在商品详情页/列表卡片上直接当 <img src> 用。
+#
+# avatars 是用户头像（商城与后台的「个人资料」共用同一张）。同样存完整 url ——
+# 它在导航栏、账号页、评价区都直接当 <img src> 用。
+#
+# banners 是首页轮播图（平台运营上传）。存完整 url，商城主页直接当 <img src> 用。
+ALLOWED_BIZ = frozenset({"reviews", "aftersale", "products", "shops", "avatars", "banners"})
 
 # Pillow 的全局保护：模块级设置一次。
 # 注意不要设成 None —— 那等于把炸弹保护整个关掉

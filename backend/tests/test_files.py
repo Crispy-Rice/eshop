@@ -280,3 +280,38 @@ async def test_uploaded_file_lands_on_disk_as_webp(client: AsyncClient, buyer: d
 
     # url 只是给前端拼的，路径前缀与 media_url_prefix 一致即可
     assert data["url"] == f"/media/{data['path']}"
+
+
+async def test_upload_accepts_avatars_biz(client: AsyncClient, buyer: dict) -> None:
+    """头像走同一个接口，落盘前缀是 avatars/{uid}/。
+
+    这条是补的：在此之前 biz 白名单没有头像，「个人资料」里的头像就只能手填
+    图片 URL —— 部署环境是 IP 直连、没有图床，等于用户换不了头像。
+    """
+    resp = await client.post(
+        "/api/files/images?biz=avatars",
+        files={"file": ("me.jpg", _image_bytes(size=(400, 400)), "image/jpeg")},
+        headers=buyer,
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["path"].startswith("avatars/"), "落盘前缀要跟着 biz 走"
+    assert data["url"] == f"/media/{data['path']}"
+
+
+async def test_upload_accepts_banners_biz(client: AsyncClient, buyer: dict) -> None:
+    """运营上传的首页轮播图，落盘前缀是 banners/{uid}/。
+
+    轮播图要的是宽图（首页整幅横幅），但仍按通用规则归一化：长边超 1280 才缩，
+    所以这里传一张 1200×360 的宽图，断言它**不被缩小**、且比例保持不变。
+    """
+    resp = await client.post(
+        "/api/files/images?biz=banners",
+        files={"file": ("banner.jpg", _image_bytes(size=(1200, 360)), "image/jpeg")},
+        headers=buyer,
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["path"].startswith("banners/"), "落盘前缀要跟着 biz 走"
+    assert data["url"] == f"/media/{data['path']}"
+    assert (data["width"], data["height"]) == (1200, 360), "长边没超 1280，不该被缩"

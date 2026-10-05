@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 
 import { isBizError } from '@/api/errors'
-import { uploadImage } from '@/api/files'
+import { uploadImage, type BizLine } from '@/api/files'
 import { onImageError } from '@/utils/placeholder'
 
 /**
@@ -20,8 +20,8 @@ import { onImageError } from '@/utils/placeholder'
 const props = withDefaults(
   defineProps<{
     modelValue: string
-    /** 业务线，进服务端路径白名单；商品图用 products */
-    biz: 'products' | 'reviews' | 'aftersale'
+    /** 业务线，进服务端路径白名单；商品图用 products，店铺 LOGO 用 shops */
+    biz: BizLine
     size?: 'large' | 'small'
     disabled?: boolean
     /** 选填字段才给清除按钮；必填字段（商品主图）不给，清了也提交不了 */

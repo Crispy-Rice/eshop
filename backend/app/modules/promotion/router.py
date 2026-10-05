@@ -22,6 +22,7 @@ from app.modules.promotion import checkout, service
 from app.modules.promotion import repository as repo
 from app.modules.promotion.models import (
     ACTIVITY_STATUS_TEXT,
+    BANNER_ENABLED,
     CALC_TYPE_TEXT,
     COUPON_TPL_ONGOING,
     COUPON_TPL_STATUS_TEXT,
@@ -30,6 +31,7 @@ from app.modules.promotion.models import (
     LEVEL_TEXT,
     VALID_DAYS_AFTER,
     VALID_FIXED,
+    Banner,
     CouponTemplate,
     PromoActivity,
 )
@@ -39,6 +41,9 @@ from app.modules.promotion.schemas import (
     AdminIssueRequest,
     AdminPromoActivityListOut,
     AdminPromoActivityOut,
+    BannerCreateRequest,
+    BannerOut,
+    BannerUpdateRequest,
     CalcPriceOut,
     CalcPriceRequest,
     CouponReceiveOut,
@@ -401,3 +406,97 @@ async def create_activity(
     )
     await repo.insert_activity(session, activity)
     return ApiResponse.ok({"id": str(activity.id), "name": activity.name})
+
+
+# ============================================================
+# 首页 Banner
+#
+# 买家侧只读启用中的；运营侧（admin / finance，与营销同角色）可增删改。
+# 写操作直接落在这一层 —— promotion 模块的运营 CRUD 一贯是"路由 + repository"，
+# 中间没有 service 中转，这里保持一致。
+# ============================================================
+def _to_banner_out(banner: Banner) -> BannerOut:
+    return BannerOut(
+        id=banner.id,
+        title=banner.title,
+        image=banner.image,
+        link_url=banner.link_url,
+        sort=banner.sort,
+        status=banner.status,
+    )
+
+
+@router.get("/api/banners", response_model=ApiResponse[list[BannerOut]], summary="首页轮播图")
+async def list_banners(session: DbSession) -> ApiResponse[list[BannerOut]]:
+    """**公开接口**：只返回启用中的，按 sort、id 升序；没配就是空数组。"""
+    rows = await repo.list_banners(session, only_enabled=True)
+    return ApiResponse.ok([_to_banner_out(b) for b in rows])
+
+
+@router.get(
+    "/api/admin/banners",
+    response_model=ApiResponse[list[BannerOut]],
+    summary="轮播图列表（含停用）",
+)
+async def list_admin_banners(session: DbSession, _: AdminDep) -> ApiResponse[list[BannerOut]]:
+    """管理端要能看到停用过的 —— 否则停用一张图就再也找不回来了。"""
+    rows = await repo.list_banners(session)
+    return ApiResponse.ok([_to_banner_out(b) for b in rows])
+
+
+@router.post("/api/admin/banners", response_model=ApiResponse[BannerOut], summary="新增轮播图")
+async def create_banner(
+    session: DbSession, body: BannerCreateRequest, _: AdminDep
+) -> ApiResponse[BannerOut]:
+    banner = Banner(
+        id=next_id(),
+        title=body.title,
+        image=body.image,
+        # 空串统一存成 NULL："没配链接"只有一种表示
+        link_url=body.link_url or None,
+        sort=body.sort,
+        status=BANNER_ENABLED,
+    )
+    await repo.insert_banner(session, banner)
+    return ApiResponse.ok(_to_banner_out(banner))
+
+
+@router.put(
+    "/api/admin/banners/{banner_id}",
+    response_model=ApiResponse[BannerOut],
+    summary="修改轮播图",
+)
+async def update_banner(
+    session: DbSession, banner_id: int, body: BannerUpdateRequest, _: AdminDep
+) -> ApiResponse[BannerOut]:
+    banner = await repo.get_banner(session, banner_id)
+    if banner is None:
+        raise BizError(ErrorCode.NOT_FOUND, "轮播图不存在")
+
+    values: dict[str, Any] = {}
+    if body.title is not None:
+        values["title"] = body.title
+    if body.image is not None:
+        values["image"] = body.image
+    if body.link_url is not None:
+        # 空串 = 清空链接。None 表示"不改"，两者语义不同，不能合
+        values["link_url"] = body.link_url or None
+    if body.sort is not None:
+        values["sort"] = body.sort
+    if body.status is not None:
+        values["status"] = body.status
+
+    await repo.update_banner_fields(session, banner_id, values)
+    # 上面走的是批量 UPDATE，identity map 里的对象要显式刷一下才拿到新值
+    await session.refresh(banner)
+    return ApiResponse.ok(_to_banner_out(banner))
+
+
+@router.delete(
+    "/api/admin/banners/{banner_id}", response_model=ApiResponse[None], summary="删除轮播图"
+)
+async def delete_banner(session: DbSession, banner_id: int, _: AdminDep) -> ApiResponse[None]:
+    if await repo.get_banner(session, banner_id) is None:
+        raise BizError(ErrorCode.NOT_FOUND, "轮播图不存在")
+    await repo.delete_banner(session, banner_id)
+    return ApiResponse.ok(None)

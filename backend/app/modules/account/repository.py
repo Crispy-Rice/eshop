@@ -174,6 +174,14 @@ async def insert_shop_member(session: AsyncSession, member: ShopMember) -> None:
     await session.flush()
 
 
+async def update_shop_fields(session: AsyncSession, shop_id: int, values: dict[str, object]) -> None:
+    """只更新传入的字段。service 负责决定哪些字段可以改。"""
+    if not values:
+        return
+    values["updated_at"] = func.now()
+    await session.execute(update(Shop).where(Shop.id == shop_id).values(**values))
+
+
 # ============================================================
 # 收货地址
 # ============================================================

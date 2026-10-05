@@ -128,6 +128,9 @@ class Spu(Base):
         server_default=text("1"),
         comment="1草稿 2上架 3下架 4违规下架 5待审核",
     )
+    # 最近一次审核意见。驳回时写理由、通过时清空 —— 商家要在自己的商品上看到它，
+    # 否则商品只是悄悄回到"草稿"，商家不知道改什么（接口一直收 remark，但原先没存）
+    audit_remark: Mapped[str | None] = mapped_column(String(255))
     sort_weight: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # 搜索用：标题 + 副标题 + 类目路径 + 所有在售 SKU 的规格值，写入时维护
     search_text: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))

@@ -65,6 +65,8 @@ _TRUNCATE = (
     "promotion.coupon_code",
     "promotion.coupon_template",
     "promotion.promo_activity",
+    # Banner 是运营建的内容，用例会自己造 —— 不清的话会串到下一个用例
+    "promotion.banner",
     "freight.freight_exclude_region",
     "freight.sku_freight_bind",
     "freight.freight_region_rule",

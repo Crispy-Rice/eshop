@@ -176,16 +176,23 @@ async def list_binds_by_template(
     )
 
 
-async def count_binds_of_template(session: AsyncSession, template_id: int) -> int:
-    """该模板绑了多少 SKU。改模板时给商家看影响面。"""
-    return int(
-        await session.scalar(
-            select(func.count())
-            .select_from(SkuFreightBind)
-            .where(SkuFreightBind.template_id == template_id)
-        )
-        or 0
+async def count_binds_of_template(
+    session: AsyncSession, template_id: int, *, exclude_sku_ids: Sequence[int] = ()
+) -> int:
+    """该模板绑了多少 SKU。
+
+    ``exclude_sku_ids`` 传已软删商品的 SKU 时，数字与抽屉里能看到的明细一致
+    （软删不动 ``sku_freight_bind``，残留行会一直挂着）。改模板时的"影响面"
+    提示不传这个参数 —— 那种场景算的是"有多少行会被改写"，绑几行算几行。
+    """
+    stmt = (
+        select(func.count())
+        .select_from(SkuFreightBind)
+        .where(SkuFreightBind.template_id == template_id)
     )
+    if exclude_sku_ids:
+        stmt = stmt.where(SkuFreightBind.sku_id.not_in(exclude_sku_ids))
+    return int(await session.scalar(stmt) or 0)
 
 
 async def upsert_bind(

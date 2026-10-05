@@ -82,3 +82,12 @@ export interface ShopInfo {
 }
 
 export const fetchShop = (shopId: string) => get<ShopInfo>(`/shops/${shopId}`)
+
+/**
+ * 批量取店铺信息 —— 商品列表页一次显示 N 个商品，逐个请求就是 N+1。
+ *
+ * ★ 必须带 paramsSerializer：axios 默认把数组序列化成 `ids[]=1&ids[]=2`，
+ *   而 FastAPI 认的是重复参数 `ids=1&ids=2`。`indexes: null` 就是"不要方括号"。
+ */
+export const fetchShops = (shopIds: string[]) =>
+  get<ShopInfo[]>('/shops', { params: { ids: shopIds }, paramsSerializer: { indexes: null } })

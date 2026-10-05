@@ -1,15 +1,17 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
 import { setUnauthorizedHandler } from '@/api/http'
+import ProfileEditDialog from '@/components/ProfileEditDialog.vue'
 import { MALL_APP_URL } from '@/utils/siblingApp'
 import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
 const router = useRouter()
 const route = useRoute()
+const profileVisible = ref(false)
 
 /** 营销中心只有平台运营能进：后端接口只放给 admin / finance */
 const isAdmin = computed(() => auth.user?.role === 'admin' || auth.user?.role === 'finance')
@@ -29,6 +31,30 @@ const isPlatformAdmin = computed(() => auth.user?.role === 'admin')
  *   运营维护的是平台数据（类目、营销），不该假装能管某个店的库存和运费。
  */
 const hasShop = computed(() => Boolean(auth.user?.shopId))
+
+/**
+ * 顶栏身份标签。
+ *
+ * ★ 平台侧显示**角色**而不是"开没开店" —— 运营账号本来就不该有店铺，
+ *   给它标「未开店」像是在提示一件没做完的事。
+ */
+const identityTag = computed(() => {
+  const role = auth.user?.role
+  if (role === 'admin') return { text: '平台运营', type: 'warning' as const }
+  if (role === 'finance') return { text: '财务', type: 'warning' as const }
+  return hasShop.value
+    ? { text: '商家', type: 'success' as const }
+    : { text: '未开店', type: 'info' as const }
+})
+
+/** 昵称下拉：个人资料 / 退出登录 */
+function onUserCommand(command: 'profile' | 'logout'): void {
+  if (command === 'profile') {
+    profileVisible.value = true
+    return
+  }
+  void onLogout()
+}
 
 setUnauthorizedHandler(() => {
   auth.clearLocal()
@@ -63,10 +89,13 @@ async function onLogout(): Promise<void> {
           <RouterLink v-if="hasShop" to="/aftersales" class="nav-link">售后</RouterLink>
           <!-- 评价两边都能看：商家看本店、运营看审核队列，页面内部自己分会话 -->
           <RouterLink v-if="hasShop || isAdmin" to="/reviews" class="nav-link">评价</RouterLink>
+          <RouterLink v-if="isPlatformAdmin" to="/audits" class="nav-link">商品审核</RouterLink>
           <RouterLink v-if="isPlatformAdmin" to="/categories" class="nav-link">类目</RouterLink>
           <RouterLink v-if="isAdmin" to="/promotions" class="nav-link">营销</RouterLink>
+          <RouterLink v-if="isAdmin" to="/banners" class="nav-link">轮播图</RouterLink>
           <RouterLink v-if="hasShop" to="/inventory" class="nav-link">库存</RouterLink>
           <RouterLink v-if="hasShop" to="/freight" class="nav-link">运费</RouterLink>
+          <RouterLink v-if="hasShop" to="/shop" class="nav-link">店铺设置</RouterLink>
         </nav>
 
         <div class="spacer" />
@@ -75,11 +104,19 @@ async function onLogout(): Promise<void> {
         <a :href="MALL_APP_URL" class="mall-link">去商城</a>
 
         <div v-if="auth.isLoggedIn" class="user">
-          <span class="nickname">{{ auth.user?.nickname }}</span>
-          <el-tag :type="auth.user?.shopId ? 'success' : 'info'" size="small" disable-transitions>
-            {{ auth.user?.shopId ? '商家' : '未开店' }}
+          <!-- 昵称是个人资料的入口：点开是下拉，和后台控制台的惯例一致 -->
+          <el-dropdown trigger="click" @command="onUserCommand">
+            <span class="nickname" title="个人资料">{{ auth.user?.nickname }}</span>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="profile">个人资料</el-dropdown-item>
+                <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <el-tag :type="identityTag.type" size="small" disable-transitions>
+            {{ identityTag.text }}
           </el-tag>
-          <el-button link type="primary" @click="onLogout">退出</el-button>
         </div>
         <RouterLink v-else to="/login">
           <el-button type="primary" size="small">登录</el-button>
@@ -91,12 +128,7 @@ async function onLogout(): Promise<void> {
       <RouterView />
     </main>
 
-    <footer class="footer">
-      <div class="footer-inner">
-        <span class="footer-copy">eshop 商家 / 运营后台 · 演示环境</span>
-        <RouterLink to="/status" class="footer-link">系统状态</RouterLink>
-      </div>
-    </footer>
+    <ProfileEditDialog v-model="profileVisible" />
   </div>
 </template>
 
@@ -147,38 +179,43 @@ async function onLogout(): Promise<void> {
   color: var(--color-text-tertiary);
 }
 
+/* 导航：hover 给一块浅底，当前项给一块实心强调色胶囊。
+ *
+ * ★ 原来是"灰字 + 当前项一条 2px 下划线"，一组纯文字在头部里读不出可点性。
+ *
+ * 横向内边距比商城那边紧一档（8px vs 12px）：后台菜单最多的时候有 10 项
+ * （商家账号），而 header 内容宽只有 1200px —— 用 12px 会把「去商城」和用户区
+ * 挤出可视区。
+ */
 .nav {
   display: flex;
-  gap: var(--space-5);
+  align-items: center;
+  gap: var(--space-1);
   flex: 0 0 auto;
 }
 
 .nav-link {
-  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-pill);
   font-size: var(--text-base);
   color: var(--color-text-secondary);
-  transition: color var(--dur-fast) var(--ease-out);
+  white-space: nowrap;
+  transition:
+    background-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
 }
 
 .nav-link:hover {
   color: var(--color-text);
+  background: var(--color-bg-subtle);
 }
 
 .nav-link.router-link-exact-active {
-  color: var(--color-text);
-  font-weight: var(--weight-medium);
-}
-
-/* 当前模块用一条短下划线标记位置 */
-.nav-link.router-link-exact-active::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -19px;
-  height: 2px;
   background: var(--color-accent);
-  border-radius: var(--radius-pill);
+  color: var(--color-accent-contrast);
+  font-weight: var(--weight-medium);
 }
 
 .spacer {
@@ -207,6 +244,13 @@ async function onLogout(): Promise<void> {
 .nickname {
   font-size: var(--text-base);
   color: var(--color-text);
+  cursor: pointer;
+  outline: none;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.nickname:hover {
+  color: var(--color-accent);
 }
 
 /* ---------- 内容 ---------- */
@@ -217,33 +261,6 @@ async function onLogout(): Promise<void> {
   max-width: var(--layout-max);
   margin: 0 auto;
   padding: var(--space-5) var(--layout-gutter) var(--space-8);
-}
-
-/* ---------- 页脚 ---------- */
-
-.footer {
-  border-top: 1px solid var(--color-border);
-  background: var(--color-bg-surface);
-}
-
-.footer-inner {
-  max-width: var(--layout-max);
-  margin: 0 auto;
-  padding: var(--space-4) var(--layout-gutter);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-}
-
-.footer-copy,
-.footer-link {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-}
-
-.footer-link:hover {
-  color: var(--color-text-secondary);
 }
 
 @media (max-width: 768px) {

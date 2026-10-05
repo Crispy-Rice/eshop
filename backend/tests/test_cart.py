@@ -425,3 +425,32 @@ async def test_cart_count(client: AsyncClient, session) -> None:
 async def test_cart_requires_login(client: AsyncClient, session) -> None:
     resp = await client.get("/api/cart")
     assert resp.status_code == 401
+
+
+async def test_cover_falls_back_to_spu_main_image(client: AsyncClient, session) -> None:
+    """★ SKU 没单独设封面时，购物车该显示商品主图，而不是空白/灰块。
+
+    商家的习惯是只传一张主图，规格图是选填的。回落做在
+    ``product.service.batch_get_skus`` 里 —— 购物车、结算算价、下单快照共用它，
+    让每个页面自己写 ``coverImage || mainImage`` 迟早漏一个。
+    """
+    ctx = await _setup(client, session)
+    sku_id = ctx["sku_ids"][0]
+    buyer = ctx["buyer_headers"]
+
+    async def set_cover(value: str) -> None:
+        async with get_session_factory()() as s, s.begin():
+            await s.execute(
+                text("UPDATE product.sku SET cover_image = :v WHERE id = :id"),
+                {"v": value, "id": int(sku_id)},
+            )
+
+    await set_cover("")
+    await _add(client, buyer, sku_id)
+    assert _find(await _cart(client, buyer), sku_id)["coverImage"] == "/media/ip16.webp", (
+        "SKU 没封面时该回落成商品主图"
+    )
+
+    # 反证：SKU 有自己的封面时不能被主图顶掉
+    await set_cover("/media/own.webp")
+    assert _find(await _cart(client, buyer), sku_id)["coverImage"] == "/media/own.webp"

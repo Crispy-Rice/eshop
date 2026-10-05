@@ -11,13 +11,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import Select, func, select, text, update
+from sqlalchemy import Select, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.promotion.models import (
+    BANNER_ENABLED,
     CODE_LOCKED,
+    Banner,
     CouponCode,
     CouponFlow,
     CouponTemplate,
@@ -401,3 +404,39 @@ async def list_stack_rules(session: AsyncSession, *, now: datetime) -> list[Prom
             )
         )
     )
+
+
+# ============================================================
+# 首页 Banner
+# ============================================================
+def _banner_order() -> tuple:
+    """排序：sort 小的在前，同序按 id 保证确定性（分页与展示都不会跳）。"""
+    return (Banner.sort, Banner.id)
+
+
+async def list_banners(session: AsyncSession, *, only_enabled: bool = False) -> list[Banner]:
+    stmt = select(Banner)
+    if only_enabled:
+        stmt = stmt.where(Banner.status == BANNER_ENABLED)
+    return list(await session.scalars(stmt.order_by(*_banner_order())))
+
+
+async def get_banner(session: AsyncSession, banner_id: int) -> Banner | None:
+    return await session.get(Banner, banner_id)
+
+
+async def insert_banner(session: AsyncSession, banner: Banner) -> Banner:
+    session.add(banner)
+    await session.flush()
+    return banner
+
+
+async def update_banner_fields(session: AsyncSession, banner_id: int, values: dict[str, Any]) -> None:
+    if not values:
+        return
+    values["updated_at"] = func.now()
+    await session.execute(update(Banner).where(Banner.id == banner_id).values(**values))
+
+
+async def delete_banner(session: AsyncSession, banner_id: int) -> None:
+    await session.execute(delete(Banner).where(Banner.id == banner_id))
