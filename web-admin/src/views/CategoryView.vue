@@ -198,80 +198,88 @@ onMounted(load)
       <el-button size="small" type="primary" @click="openCreate(null)">新建一级类目</el-button>
     </div>
 
-    <div v-loading="loading" class="panel">
+    <div class="panel">
       <el-empty v-if="!loading && tree.length === 0" description="还没有类目">
         <p class="empty-hint">商家发布商品时要选末级类目，先把树建起来</p>
       </el-empty>
 
-      <template v-else>
-        <!-- 表头。树没法真做成 el-table，但把这一条加上，读起来就是后台那一套表格 -->
-        <div class="panel-head">
-          <span class="col-name">类目</span>
-          <span class="col-count">商品数</span>
-          <span class="col-status">状态</span>
-          <span class="node-actions">操作</span>
-        </div>
+      <!--
+        用 el-table 的**树模式**，而不是 el-tree 外面套一层手写的假表头。
 
-        <el-tree
-          class="cat-tree"
-          :data="tree"
-          node-key="id"
-          default-expand-all
-          :expand-on-click-node="false"
-          :indent="18"
-        >
-          <template #default="{ data }">
-            <div class="node">
-              <span class="node-name col-name" :class="{ off: data.status !== 1 }">
-                {{ data.name }}
-              </span>
+        ★ 原来是 el-tree + 自己拼的四列，等于在后台十几个表格中间手搓了第十四个：
+          表头底色、行高、悬停、分隔线、展开箭头全要自己对齐，还对不齐
+          （Element Plus 给 el-tree 的行打的是**内联** padding-left，外面的
+          padding 规则根本压不过它）。换成 el-table 之后这些全部白送，
+          而且和「商品审核」「轮播图」那几页是同一种观感。
+      -->
+      <el-table
+        v-else
+        v-loading="loading"
+        :data="tree"
+        row-key="id"
+        :tree-props="{ children: 'children' }"
+        default-expand-all
+      >
+        <el-table-column label="类目" min-width="220">
+          <template #default="{ row }">
+            <span class="node-name" :class="{ off: row.status !== 1, top: row.level === 1 }">
+              {{ row.name }}
+            </span>
+          </template>
+        </el-table-column>
 
-              <!-- 列宽固定，没内容时也占位 —— 一列看下来数字与状态才对齐 -->
-              <span class="col-count">
-                <el-tag v-if="data.spuCount > 0" size="small" effect="plain" disable-transitions>
-                  <span class="tnum">{{ data.spuCount }}</span> 件
-                </el-tag>
-                <span v-else class="muted">—</span>
-              </span>
+        <el-table-column label="商品数" width="110">
+          <template #default="{ row }">
+            <el-tag v-if="row.spuCount > 0" size="small" round disable-transitions>
+              <span class="tnum">{{ row.spuCount }}</span> 件
+            </el-tag>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
 
-              <span class="col-status">
-                <el-tag
-                  v-if="data.status !== 1"
-                  type="info"
-                  size="small"
-                  effect="plain"
-                  disable-transitions
-                >
-                  停用
-                </el-tag>
-                <span v-else class="muted">启用</span>
-              </span>
+        <el-table-column label="状态" width="90">
+          <template #default="{ row }">
+            <el-tag
+              :type="row.status === 1 ? 'success' : 'info'"
+              size="small"
+              round
+              disable-transitions
+            >
+              {{ row.status === 1 ? '启用' : '停用' }}
+            </el-tag>
+          </template>
+        </el-table-column>
 
-              <div class="node-actions">
-                <el-button
-                  v-if="data.level < MAX_CATEGORY_LEVEL"
-                  class="act-create"
-                  link
-                  type="primary"
-                  size="small"
-                  @click.stop="openCreate(data)"
-                >
-                  新增子类目
-                </el-button>
-                <el-button class="act-edit" link type="primary" size="small" @click.stop="openEdit(data)">
-                  编辑
-                </el-button>
-                <el-button class="act-move" link type="primary" size="small" @click.stop="openMove(data)">
-                  移动
-                </el-button>
-                <el-button class="act-del" link type="danger" size="small" @click.stop="onDelete(data)">
-                  删除
-                </el-button>
-              </div>
+        <el-table-column label="操作" width="296" align="right">
+          <template #default="{ row }">
+            <!--
+              四个动作各占一个**固定槽位**。
+              ★ 不能只靠右对齐：三级类目没有「新增子类目」，缺这一个按钮，后面三个
+                就会整体右移 —— 一列行看下来按钮参差不齐。
+                用 grid 显式指定列，缺的那个位置空着即可。
+
+              按钮用 el-button 的默认样式（白底描边），不是 `link` 纯文字：
+              一行四个纯文字挤在一起，读起来像一串词，看不出哪块能点。
+              同类的「售后处理」页也是这么做的。
+            -->
+            <div class="row-actions">
+              <el-button
+                v-if="row.level < MAX_CATEGORY_LEVEL"
+                class="act-create"
+                size="small"
+                @click="openCreate(row)"
+              >
+                新增子类目
+              </el-button>
+              <el-button class="act-edit" size="small" @click="openEdit(row)">编辑</el-button>
+              <el-button class="act-move" size="small" @click="openMove(row)">移动</el-button>
+              <el-button class="act-del" size="small" type="danger" plain @click="onDelete(row)">
+                删除
+              </el-button>
             </div>
           </template>
-        </el-tree>
-      </template>
+        </el-table-column>
+      </el-table>
     </div>
 
     <!-- 新建 -->
@@ -395,8 +403,8 @@ onMounted(load)
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  /* 内边距交给表头和行自己，这里留 0，行分隔线才能通到两侧 */
-  padding: 0;
+  /* 与「商品审核」「轮播图」一致：面板只留一格上下呼吸，表头自己带内边距 */
+  padding: var(--space-1) 0;
 }
 
 .panel :deep(.el-empty) {
@@ -410,85 +418,17 @@ onMounted(load)
 }
 
 /* --------------------------------------------------------------------------
- * 类目树
- *
- * 后台其它页都是 el-table：表头、带分隔线的行、悬停高亮、一致的行高。
- * 树在结构上不是表格，但把这四样凑齐，读起来就还是同一套东西。
- *
- * ★ 再加一条：**列要对齐**。商品数和状态原来是紧跟在类目名后面的，
- *   名字长短一变，后面就参差不齐 —— 一级看下来像几行散落的标签，不像表格。
- *   所以给它们固定列宽（表头与行共用同一组宽度），数字才会排成一竖列。
+ * 类目名
  * ------------------------------------------------------------------------*/
-
-.panel-head {
-  display: flex;
-  align-items: center;
-  padding: var(--space-2) var(--space-4);
-  border-bottom: 1px solid var(--color-border);
-  background: var(--color-bg-subtle);
-  font-size: var(--text-sm);
-  color: var(--color-text-secondary);
-}
-
-/* 四列的宽度在**表头与行之间共用** —— 两边各写一份，早晚会漂移 */
-.col-name {
-  flex: 1;
-  min-width: 0;
-}
-
-.col-count {
-  flex: 0 0 auto;
-  width: 96px;
-}
-
-.col-status {
-  flex: 0 0 auto;
-  width: 64px;
-}
-
-.node-actions {
-  flex: 0 0 auto;
-  width: 204px;
-  display: grid;
-  grid-template-columns: 78px 42px 42px 42px;
-  align-items: center;
-  justify-items: end;
-}
-
-/* 表头那一格只是个标签，别套按钮网格，右对齐即可 */
-.panel-head .node-actions {
-  display: block;
-  text-align: right;
-}
-
-.cat-tree {
-  /* 最后一行底下留一点，免得它的分隔线与 panel 的边框贴成一条粗线 */
-  padding-bottom: var(--space-1);
-}
-
-/* 左内边距与表头一致，根类目才能和「类目」二字对齐 */
-.cat-tree :deep(.el-tree-node__content) {
-  height: 44px;
-  padding-left: var(--space-4);
-  border-bottom: 1px solid var(--color-border);
-  border-radius: 0;
-}
-
-.cat-tree :deep(.el-tree-node__content:hover) {
-  background: var(--color-bg-hover);
-}
-
-.node {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  width: 100%;
-  padding-right: var(--space-4);
-}
 
 .node-name {
   font-size: var(--text-base);
   color: var(--color-text);
+}
+
+/* 一级类目名加重一档 —— 32 行一路铺下来，只靠缩进分不出层级 */
+.node-name.top {
+  font-weight: var(--weight-medium);
 }
 
 /* 停用的类目还留在树上，但视觉上退到后面 */
@@ -503,30 +443,41 @@ onMounted(load)
 }
 
 /*
- * 四个操作各占一个**固定槽位**（宽度在 `.node-actions` 里统一给）。
+ * 四个操作各占一个**固定槽位**。
  *
  * ★ 不能只靠右对齐：三级类目没有「新增子类目」，缺这一个按钮，后面三个就会整体
  *   右移 —— 一列行看下来按钮的左边缘参差不齐。
  *   用 grid 显式指定列，缺的那个位置空着即可。
+ *   每格比按钮略宽，多出来的落在按钮左边，于是格与格之间自然留出间距。
  */
-.node-actions :deep(.act-create) {
+.row-actions {
+  display: grid;
+  width: 264px;
+  /* 单元格是右对齐的，网格自己也得贴到右边，否则留白会落在它右侧 */
+  margin-left: auto;
+  grid-template-columns: 90px 58px 58px 58px;
+  align-items: center;
+  justify-items: end;
+}
+
+.row-actions :deep(.act-create) {
   grid-column: 1;
 }
 
-.node-actions :deep(.act-edit) {
+.row-actions :deep(.act-edit) {
   grid-column: 2;
 }
 
-.node-actions :deep(.act-move) {
+.row-actions :deep(.act-move) {
   grid-column: 3;
 }
 
-.node-actions :deep(.act-del) {
+.row-actions :deep(.act-del) {
   grid-column: 4;
 }
 
 /* Element Plus 默认给相邻按钮加 margin-left，网格里要清掉 */
-.node-actions :deep(.el-button) {
+.row-actions :deep(.el-button) {
   margin-left: 0;
 }
 
