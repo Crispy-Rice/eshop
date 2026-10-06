@@ -56,6 +56,7 @@ CREATE SCHEMA IF NOT EXISTS trade;        -- 母单、子单、订单项、发�
 CREATE SCHEMA IF NOT EXISTS payment;      -- 支付单、回调日志、退款、对账
 CREATE SCHEMA IF NOT EXISTS aftersale;    -- 售后单
 CREATE SCHEMA IF NOT EXISTS review;       -- 评价
+CREATE SCHEMA IF NOT EXISTS support;      -- 客服会话（工单、消息、状态流水）
 CREATE SCHEMA IF NOT EXISTS settlement;   -- 商家账单（二期）
 CREATE SCHEMA IF NOT EXISTS notify;       -- 站内信
 CREATE SCHEMA IF NOT EXISTS core;         -- 基础设施（本地消息表等）
@@ -63,38 +64,38 @@ CREATE SCHEMA IF NOT EXISTS ops;          -- 运维（告警、降级开关）
 
 -- ---------- 4. 授权 ----------
 GRANT USAGE ON SCHEMA account, product, inventory, cart, promotion, freight,
-                       trade, payment, aftersale, review, settlement, notify, core, ops
+                       trade, payment, aftersale, review, support, settlement, notify, core, ops
       TO :"app_user";
 GRANT USAGE ON SCHEMA account, product, inventory, cart, promotion, freight,
-                       trade, payment, aftersale, review, settlement, notify, core, ops
+                       trade, payment, aftersale, review, support, settlement, notify, core, ops
       TO :"ro_user";
 
 -- 已存在对象的权限
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA
       account, product, inventory, cart, promotion, freight, trade, payment,
-      aftersale, review, settlement, notify, core, ops
+      aftersale, review, support, settlement, notify, core, ops
       TO :"app_user";
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA
       account, product, inventory, cart, promotion, freight, trade, payment,
-      aftersale, review, settlement, notify, core, ops
+      aftersale, review, support, settlement, notify, core, ops
       TO :"app_user";
 GRANT SELECT ON ALL TABLES IN SCHEMA
       account, product, inventory, cart, promotion, freight, trade, payment,
-      aftersale, review, settlement, notify, core, ops
+      aftersale, review, support, settlement, notify, core, ops
       TO :"ro_user";
 
 -- 将来由 eshop_owner（即当前用户）创建的对象，自动授予上述权限，
 -- 这样 Alembic 迁移新建的表不需要每次手工 GRANT
 ALTER DEFAULT PRIVILEGES IN SCHEMA account, product, inventory, cart, promotion, freight,
-                                      trade, payment, aftersale, review, settlement, notify, core, ops
+                                      trade, payment, aftersale, review, support, settlement, notify, core, ops
       GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"app_user";
 ALTER DEFAULT PRIVILEGES IN SCHEMA account, product, inventory, cart, promotion, freight,
-                                      trade, payment, aftersale, review, settlement, notify, core, ops
+                                      trade, payment, aftersale, review, support, settlement, notify, core, ops
       GRANT USAGE, SELECT ON SEQUENCES TO :"app_user";
 ALTER DEFAULT PRIVILEGES IN SCHEMA account, product, inventory, cart, promotion, freight,
-                                      trade, payment, aftersale, review, settlement, notify, core, ops
+                                      trade, payment, aftersale, review, support, settlement, notify, core, ops
       GRANT SELECT ON TABLES TO :"ro_user";
 
 EOSQL
 
-echo ">>> eshop 数据库初始化完成：角色、扩展、14 个 schema、权限"
+echo ">>> eshop 数据库初始化完成：角色、扩展、15 个 schema、权限"

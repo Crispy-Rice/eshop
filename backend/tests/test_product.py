@@ -883,6 +883,61 @@ async def test_invalid_cursor_rejected(client: AsyncClient) -> None:
     assert resp.status_code == 400
 
 
+async def test_search_filters_by_shop(client: AsyncClient, session) -> None:
+    """按店铺筛商品（店铺页用）：只回这家店的**已上架**商品。
+
+    ★ 盯的是"店铺页不要另写查询"：``shopId`` 必须走搜索那套 ``_spu_filters``。
+      另写一条查询几乎必然漏掉 ``deleted = false`` 与 ``status = 2``（已上架），
+      表现就是**店铺页陈列着已下架商品** —— 少一个 where 而已，肉眼极难发现。
+    """
+    spu_a, merchant_a = await _create_and_publish(client, session)
+    headers_a = auth_header(merchant_a["accessToken"])
+    shop_a = (await client.get("/api/merchant/shop", headers=headers_a)).json()["data"]["id"]
+    # 甲店商品挂在哪个类目下，乙店就跟着用（省得再建一棵类目树）
+    category_id = (await client.get(f"/api/spus/{spu_a}")).json()["data"]["categoryId"]
+
+    # 乙店：同一类目下另发一件，标题不同，好区分
+    merchant_b = await register(client, phone="13800138012")
+    shop_b = await open_shop(client, merchant_b["accessToken"], name="乙店")
+    headers_b = auth_header(merchant_b["accessToken"])
+    payload = {**_spu_payload(category_id), "title": "乙店的帆布包"}
+    resp = await client.post("/api/merchant/spus", json=payload, headers=headers_b)
+    assert resp.status_code == 200, resp.text
+    spu_b = resp.json()["data"]["id"]
+    await client.post(f"/api/merchant/spus/{spu_b}/submit", headers=headers_b)
+    admin = await make_admin(client, session, phone="13900139002")
+    assert (
+        await client.post(
+            f"/api/admin/spus/{spu_b}/audit",
+            json={"approved": True},
+            headers=auth_header(admin["accessToken"]),
+        )
+    ).status_code == 200
+
+    # 两家店各自只看到自己的
+    data_a = (await client.get("/api/search", params={"shopId": shop_a, "limit": 50})).json()["data"]
+    assert [i["id"] for i in data_a["items"]] == [spu_a]
+    assert data_a["total"] == 1
+
+    data_b = (await client.get("/api/search", params={"shopId": shop_b, "limit": 50})).json()["data"]
+    assert [i["id"] for i in data_b["items"]] == [spu_b]
+    assert data_b["total"] == 1
+
+    # 下架之后从店铺页消失 —— 这一条就是"有没有共用那套过滤条件"的判据
+    assert (
+        await client.post(f"/api/merchant/spus/{spu_a}/off-shelf", headers=headers_a)
+    ).status_code == 200
+    after = (await client.get("/api/search", params={"shopId": shop_a, "limit": 50})).json()["data"]
+    assert after["items"] == []
+    assert after["total"] == 0, "总数也要跟着过滤，否则店铺页会写「共 1 件」却一件都不显示"
+
+    # 不存在的店铺 → 空列表。★ 搜索接口**不校验店铺是否存在**：它只负责筛，
+    #   实体校验是店铺页自己的事（那边拿不到店铺会报"店铺不存在"）。
+    unknown = (await client.get("/api/search", params={"shopId": 999999})).json()["data"]
+    assert unknown["items"] == []
+    assert unknown["total"] == 0
+
+
 # ============================================================
 # SKU 批量查询与改价
 # ============================================================

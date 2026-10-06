@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { codeToText, regionData } from 'element-china-area-data'
 
@@ -7,16 +8,21 @@ import * as authApi from '@/api/auth'
 import type { Address, AddressInput } from '@/api/auth'
 import { ErrorCode, isBizError } from '@/api/errors'
 import { post } from '@/api/http'
+import ChangePasswordDialog from '@/components/ChangePasswordDialog.vue'
 import ProfileEditDialog from '@/components/ProfileEditDialog.vue'
 import { useAuthStore } from '@/stores/auth'
 import { onImageError } from '@/utils/placeholder'
+import { ADMIN_APP_URL } from '@/utils/siblingApp'
 
 const auth = useAuthStore()
+const router = useRouter()
 const addresses = ref<Address[]>([])
 const loading = ref(false)
 const shopLoading = ref(false)
 const dialogVisible = ref(false)
 const profileVisible = ref(false)
+const pwdVisible = ref(false)
+const deactivating = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
 
@@ -265,6 +271,138 @@ async function openShop(): Promise<void> {
   }
 }
 
+/**
+ * 注销账号。三道关：
+ *
+ * 1. **先问后端能不能注销**（`GET /me/deactivation`）。被挡就弹一个**能点去处理**的
+ *    对话框然后结束 —— ★ 不能等输完密码才说，那等于让用户白输一次；原先还只是一句
+ *    转瞬即逝的 toast，既不说去哪儿处理、用户也无从照着做。
+ * 2. `confirm` 讲清后果（不可恢复、会匿名化什么、订单保留、手机号 30 天冷静期）；
+ * 3. `prompt` 要当前密码 —— 没有短信验证码，这是唯一能证明"是本人操作"的手段，
+ *    免得别人拿着你的登录态把你的号注销掉。
+ *
+ * ★ 提交时**仍可能**被挡（第 1 步与第 3 步之间状态会变：刚下单、刚开店），
+ *   那里走同一套话术，而不是弹一句 toast。
+ * ★ 三条守卫只有后端一份（`account/router._deactivation_blockers`），预检与提交共用
+ *   —— 两处各写一遍必然漂，漂的后果是"说能注销、提交却被拒"，比没有预检更糟。
+ */
+async function onDeactivate(): Promise<void> {
+  deactivating.value = true
+  let check: authApi.DeactivationCheck
+  try {
+    check = await authApi.fetchDeactivationCheck()
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '暂时无法检查注销条件')
+    return
+  } finally {
+    deactivating.value = false
+  }
+
+  if (!check.canDeactivate) {
+    await showDeactivationBlockers(check)
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      '注销后不可恢复：手机号、昵称、历史地址都会被匿名化，历史评价会显示为「已注销用户」。' +
+        '订单与售后记录按法规保留。同一手机号 30 天之后才能重新注册。确定继续吗？',
+      '注销账号',
+      { type: 'warning', confirmButtonText: '继续', confirmButtonClass: 'el-button--danger' },
+    )
+  } catch {
+    return // 用户取消
+  }
+
+  let password: string
+  try {
+    const { value } = await ElMessageBox.prompt('请输入当前密码以确认是本人操作', '注销账号', {
+      inputType: 'password',
+      inputPlaceholder: '当前登录密码',
+      confirmButtonText: '确认注销',
+      confirmButtonClass: 'el-button--danger',
+      inputValidator: (v: string) => (v ? true : '请输入密码'),
+    })
+    password = value
+  } catch {
+    return
+  }
+
+  deactivating.value = true
+  try {
+    await auth.deactivate(password)
+    ElMessage.success('账号已注销')
+    await router.push('/')
+  } catch (e) {
+    if (
+      isBizError(e, ErrorCode.ACCOUNT_HAS_UNFINISHED) ||
+      isBizError(e, ErrorCode.SHOP_OWNER_CANNOT_DEACTIVATE)
+    ) {
+      // 预检之后状态又变了。**重新查一次**再按同一套话术说 ——
+      // 这样"去哪处理"的按钮仍然是点得动的（错误体里只有句子，没有数量）
+      try {
+        await showDeactivationBlockers(await authApi.fetchDeactivationCheck())
+      } catch {
+        await ElMessageBox.alert(e.message, '还不能注销', { confirmButtonText: '知道了' })
+      }
+      return
+    }
+    ElMessage.error(isBizError(e) ? e.message : '注销失败')
+  } finally {
+    deactivating.value = false
+  }
+}
+
+/** 被挡时的「下一步去哪」：按被挡的项给一个主按钮（店铺 > 订单 > 售后）。 */
+function blockerAction(
+  check: authApi.DeactivationCheck,
+): { label: string; go: () => void } | null {
+  if (check.hasShop) {
+    // 店主在商城端没有可操作的地方，得去商家后台
+    return {
+      label: '去商家后台',
+      go: () => {
+        window.location.href = ADMIN_APP_URL
+      },
+    }
+  }
+  if (check.orderCount > 0) {
+    return { label: '去看我的订单', go: () => void router.push({ name: 'orders' }) }
+  }
+  if (check.refundCount > 0) {
+    return { label: '去看退款/售后', go: () => void router.push({ name: 'refunds' }) }
+  }
+  return null
+}
+
+/**
+ * 说清被什么挡着，并给一个**能点着去处理**的按钮。
+ *
+ * ★ 这正是这次改动要解决的问题：原先只弹一句 toast —— 转瞬即逝、不说去哪、
+ *   也没告诉用户有几笔。现在看得到数量，也有下一步。
+ */
+async function showDeactivationBlockers(check: authApi.DeactivationCheck): Promise<void> {
+  const lines: string[] = []
+  if (check.hasShop) lines.push('名下有店铺（要先下架商品、结清订单）')
+  if (check.orderCount > 0) lines.push(`${check.orderCount} 笔未完成订单`)
+  if (check.refundCount > 0) lines.push(`${check.refundCount} 笔进行中的售后`)
+  const action = blockerAction(check)
+  try {
+    await ElMessageBox.alert(
+      `暂时不能注销，你还有：${lines.join('、')}。处理完之后才能注销。`,
+      '还不能注销',
+      {
+        confirmButtonText: action?.label ?? '知道了',
+        showCancelButton: action !== null,
+        cancelButtonText: '知道了',
+      },
+    )
+    action?.go()
+  } catch {
+    // 点了「知道了」
+  }
+}
+
 onMounted(() => {
   void auth.restore()
   void load()
@@ -312,6 +450,59 @@ onMounted(() => {
           <span class="hint">你还没有店铺。开通后可以在商家后台上架商品。</span>
           <el-button type="primary" :loading="shopLoading" @click="openShop">成为商家</el-button>
         </template>
+      </div>
+    </el-card>
+
+    <el-card shadow="never">
+      <template #header>
+        <div class="card-header">
+          <span>账号安全</span>
+          <el-button size="small" @click="pwdVisible = true">修改密码</el-button>
+        </div>
+      </template>
+
+      <div class="safety-row">
+        <div>
+          <p class="safety-title">登录密码</p>
+          <p class="hint">定期更换更安全。改完密码后，你在其它设备上的登录会被退出。</p>
+        </div>
+      </div>
+
+      <el-divider />
+
+      <!-- 危险区：分隔线 + 灰色底 + danger 文字按钮，与上面的常规设置明确分开 -->
+      <div class="safety-row danger">
+        <div>
+          <p class="safety-title">注销账号</p>
+          <p class="hint">
+            不可恢复：手机号、昵称、历史地址会被匿名化，评价显示为「已注销用户」；
+            订单与售后记录按法规保留。有未完成的订单或售后、或名下有店铺时无法注销。
+          </p>
+        </div>
+        <el-button type="danger" plain :loading="deactivating" @click="onDeactivate">
+          注销账号
+        </el-button>
+      </div>
+    </el-card>
+
+    <el-card shadow="never">
+      <template #header>
+        <div class="card-header">
+          <span>咨询与客服</span>
+        </div>
+      </template>
+
+      <div class="safety-row">
+        <div>
+          <p class="safety-title">联系客服</p>
+          <p class="hint">
+            对订单、售后有疑问，或需要平台协助，在会话里说明即可，客服会回复你。
+            如果账号登不进来（比如被冻结），请用登录页上的联系方式。
+          </p>
+        </div>
+        <el-button type="primary" plain @click="$router.push({ name: 'support' })">
+          去客服
+        </el-button>
       </div>
     </el-card>
 
@@ -395,6 +586,7 @@ onMounted(() => {
     </el-dialog>
 
     <ProfileEditDialog v-model="profileVisible" />
+    <ChangePasswordDialog v-model="pwdVisible" />
   </div>
 </template>
 
@@ -452,6 +644,31 @@ onMounted(() => {
 .hint {
   font-size: var(--text-sm);
   color: var(--color-text-tertiary);
+}
+
+/* 「账号安全」卡里的一行设置：左边标题+说明，右边动作 */
+.safety-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.safety-title {
+  margin-bottom: var(--space-1);
+  font-size: var(--text-base);
+  color: var(--color-text);
+}
+
+/* 危险区靠底色调区分，不靠边框 —— 与后台的分层约定一致 */
+.safety-row.danger {
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-danger-soft);
+}
+
+.safety-row.danger .hint {
+  color: var(--color-text-secondary);
 }
 
 /* 级联控件默认只有内容宽，撑满才和上面的输入框对齐 */

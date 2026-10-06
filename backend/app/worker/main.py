@@ -41,6 +41,7 @@ from app.modules.trade.tasks import (
     close_order_if_unpaid,
     scan_timeout_orders,
 )
+from app.worker.outbox_delivery import deliver_outbox
 
 logger = get_logger(__name__)
 
@@ -96,6 +97,9 @@ FUNCTIONS: list[Any] = [
     reconcile_refunds,
     # 评价：统计全量重算
     recompute_spu_stats,
+    # outbox 投递：把 core.local_message 里积压的事件就地分派出去
+    # （cron 每 5 秒叫一次，这里也登记一份，便于手工 enqueue 一次）
+    deliver_outbox,
 ]
 
 # 定时任务。
@@ -135,6 +139,12 @@ CRON_JOBS: list[Any] = [
     # ---------- 评价 ----------
     # 统计全量重算：增量靠业务代码，正确性靠它，低峰期每日一次
     cron(recompute_spu_stats, hour=3, minute=40, second=0, unique=True),
+    # ---------- outbox 投递 ----------
+    # 每 5 秒一轮。**只对"新积压"敏感**，所以可以稀疏；之所以不是每分钟：
+    # 用户支付完马上就会去点消息中心，站内信迟到几秒是能感觉到的。
+    # ★ minute=None 而不是省略 —— ARQ 的 cron 把省略的 minute 当成 0（只在
+    #   每小时的 0 分跑），不是"每分钟"。省略它就变成一小时一次了。
+    cron(deliver_outbox, minute=None, second=set(range(0, 60, 5)), unique=True),
 ]
 
 

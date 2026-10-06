@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import shutil
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -68,7 +69,12 @@ MAX_PIXELS = 40_000_000
 # 它在导航栏、账号页、评价区都直接当 <img src> 用。
 #
 # banners 是首页轮播图（平台运营上传）。存完整 url，商城主页直接当 <img src> 用。
-ALLOWED_BIZ = frozenset({"reviews", "aftersale", "products", "shops", "avatars", "banners"})
+#
+# support 是客服会话里的凭证图（买家与商家都传）。与 reviews/aftersale 同口径：
+# 存**相对 path**（后端只当路径拼 media 前缀，不做 <img src> 直用）。
+ALLOWED_BIZ = frozenset(
+    {"reviews", "aftersale", "products", "shops", "avatars", "banners", "support"}
+)
 
 # Pillow 的全局保护：模块级设置一次。
 # 注意不要设成 None —— 那等于把炸弹保护整个关掉
@@ -237,3 +243,23 @@ def save_image(relative: str, rendered: Rendered) -> None:
     target.write_bytes(rendered.full)
     absolute_path(mid_path_of(relative)).write_bytes(rendered.mid)
     absolute_path(thumb_path_of(relative)).write_bytes(rendered.thumb)
+
+
+def remove_user_dir(*, biz: str, user_id: int) -> None:
+    """删除某用户在**一条业务线**下的整个目录 ``{biz}/{user_id}/``。
+
+    目前唯一的调用方是账号注销（清掉头像，见 account.service.close_account）。
+    **只删这一个目录**：评价图 ``reviews/`` 与售后凭证 ``aftersale/`` 属于交易
+    记录，不在注销的清理范围内。
+
+    ★ 幂等：目录不存在就直接返回 —— 注销回调重试、或多进程都调到都不会出错。
+    ★ 路径安全：``biz`` 必须来自白名单（它会进路径），``user_id`` 是整型；
+      最后仍走 ``absolute_path`` 的"不许越出 media_root"双保险。
+    """
+    if biz not in ALLOWED_BIZ:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "不支持的文件类型")
+    target = absolute_path(f"{biz}/{user_id}")
+    if not target.is_dir():
+        return
+    shutil.rmtree(target, ignore_errors=True)
+    logger.info("已删除用户文件目录", extra={"biz": biz, "userId": user_id})

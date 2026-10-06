@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
 import { setUnauthorizedHandler } from '@/api/http'
 import ProfileEditDialog from '@/components/ProfileEditDialog.vue'
+import { usePoll } from '@/composables/usePoll'
 import { MALL_APP_URL } from '@/utils/siblingApp'
 import { onImageError } from '@/utils/placeholder'
 import { useAuthStore } from '@/stores/auth'
+import { useSupportStore } from '@/stores/support'
 
 const auth = useAuthStore()
+const support = useSupportStore()
 const router = useRouter()
 const route = useRoute()
 const profileVisible = ref(false)
@@ -59,14 +62,32 @@ function onUserCommand(command: 'profile' | 'logout'): void {
 
 setUnauthorizedHandler(() => {
   auth.clearLocal()
+  support.reset()
   ElMessage.warning('登录已过期，请重新登录')
   void router.push({ name: 'login', query: { redirect: route.fullPath } })
 })
 
-onMounted(() => auth.restore())
+onMounted(async () => {
+  await auth.restore()
+  // 角标要等登录态恢复之后再拉，否则未登录时白跑一次
+  await support.refresh()
+})
+
+/**
+ * 「待回复」角标：60 秒一轮（切到后台会停）+ 每次路由切换补一次。
+ *
+ * `immediate: false`：初次拉取交给上面 onMounted 那次（它排在 auth.restore 之后），
+ * 否则轮询件会赶在恢复登录态之前拿着空令牌白跑一遍。
+ */
+usePoll(() => support.refresh(), 60_000, { immediate: false })
+watch(
+  () => route.fullPath,
+  () => void support.refresh(),
+)
 
 async function onLogout(): Promise<void> {
   await auth.logout()
+  support.reset()
   ElMessage.success('已退出登录')
   void router.push({ name: 'login' })
 }
@@ -91,12 +112,22 @@ async function onLogout(): Promise<void> {
           <RouterLink v-if="hasShop" to="/products/new" class="nav-link">发布商品</RouterLink>
           <RouterLink v-if="hasShop" to="/orders" class="nav-link">订单</RouterLink>
           <RouterLink v-if="hasShop" to="/aftersales" class="nav-link">售后</RouterLink>
+          <!-- 客服两边都能看：商家看本店队列、平台运营看全部（页面内部按身份换端点） -->
+          <RouterLink v-if="hasShop || isAdmin" to="/support" class="nav-link">
+            客服
+            <span v-if="support.pending > 0" class="badge tnum">
+              {{ support.pending > 99 ? '99+' : support.pending }}
+            </span>
+          </RouterLink>
           <!-- 评价两边都能看：商家看本店、运营看审核队列，页面内部自己分会话 -->
           <RouterLink v-if="hasShop || isAdmin" to="/reviews" class="nav-link">评价</RouterLink>
           <RouterLink v-if="isPlatformAdmin" to="/categories" class="nav-link">类目</RouterLink>
+          <!-- 用户管理只给 admin（不含 finance）：能看营销数据不等于能封人 -->
+          <RouterLink v-if="isPlatformAdmin" to="/users" class="nav-link">用户</RouterLink>
           <RouterLink v-if="isAdmin" to="/promotions" class="nav-link">营销</RouterLink>
           <RouterLink v-if="isAdmin" to="/banners" class="nav-link">轮播图</RouterLink>
           <RouterLink v-if="hasShop" to="/inventory" class="nav-link">库存</RouterLink>
+          <RouterLink v-if="hasShop" to="/warehouses" class="nav-link">仓库</RouterLink>
           <RouterLink v-if="hasShop" to="/freight" class="nav-link">运费</RouterLink>
           <RouterLink v-if="hasShop" to="/shop" class="nav-link">店铺设置</RouterLink>
         </nav>
@@ -228,6 +259,28 @@ async function onLogout(): Promise<void> {
   background: var(--color-accent);
   color: var(--color-accent-contrast);
   font-weight: var(--weight-medium);
+}
+
+/* 角标。被激活的导航项底色就是强调色，所以那里要**反相**，否则数字和底同色看不见 */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  margin-left: var(--space-1);
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  line-height: 1;
+}
+
+.nav-link.router-link-exact-active .badge {
+  background: var(--color-accent-contrast);
+  color: var(--color-accent);
 }
 
 .spacer {

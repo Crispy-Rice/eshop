@@ -352,8 +352,17 @@ onMounted(async () => {
             <dd class="tnum">¥{{ formatYuan(calc.freight) }}</dd>
           </div>
 
-          <!-- 本期未实现的两项后端会标注，直接透传给用户，别让人以为算漏了 -->
-          <div v-for="n in calc.notices" :key="n" class="notice">{{ n }}</div>
+          <!-- 本期未实现的两项后端会标注，直接透传给用户，别让人以为算漏了。
+               ★ 缺货那条是**阻断性**的（后端已按仓判过：这单没有哪个仓能一次发齐），
+                 所以它要显眼一点，而不是混在一堆灰色小字里。 -->
+          <div
+            v-for="n in calc.notices"
+            :key="n"
+            class="notice"
+            :class="{ blocking: !!addressId && calc.canSubmit === false }"
+          >
+            {{ n }}
+          </div>
 
           <div class="row total">
             <dt>应付</dt>
@@ -375,10 +384,16 @@ onMounted(async () => {
           type="primary"
           size="large"
           :loading="submitting"
-          :disabled="!addressId"
+          :disabled="!addressId || !calc || calc.canSubmit === false"
           @click="onCheckout"
         >
-          {{ addressId ? '提交订单' : '请先选择地址' }}
+          {{
+            !addressId
+              ? '请先选择地址'
+              : calc && calc.canSubmit === false
+                ? '暂时无法下单'
+                : '提交订单'
+          }}
         </el-button>
       </footer>
     </template>
@@ -696,6 +711,11 @@ onMounted(async () => {
 .notice {
   font-size: var(--text-xs);
   color: var(--color-text-placeholder);
+}
+
+/* 阻断性的那条（缺货 → 不能下单）要看得见，不能混在灰色小字里 */
+.notice.blocking {
+  color: var(--color-warning);
 }
 
 .total {

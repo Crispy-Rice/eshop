@@ -79,6 +79,13 @@ async def search(
     # ★ 查询参数名必须显式写 alias：FastAPI 默认用函数参数名（snake_case），
     #   而外部约定是 camelCase，不写 alias 的话前端传 categoryId 会被静默忽略。
     category_id: int | None = Query(default=None, alias="categoryId"),
+    # 店铺页用：只看这家店的商品。
+    # ★ 走的是与搜索完全相同的 service/repository 路径（`_spu_filters` 里本来就有
+    #   `shop_id` 这一条），**不要为店铺页另写查询** —— 另写一条必然漏掉
+    #   `deleted = false` 与 `status = 2`（已上架）两个过滤，于是店铺页会陈列已下架商品。
+    # ★ 这里**不校验店铺是否存在**：查不到就是空列表。店铺页自己会去取店铺信息、
+    #   在那儿报"店铺不存在" —— 搜索接口保持"只负责筛，不做实体校验"这一条。
+    shop_id: int | None = Query(default=None, alias="shopId"),
     price_from: int | None = Query(default=None, alias="priceFrom", ge=0, description="价格下限（分）"),
     price_to: int | None = Query(default=None, alias="priceTo", ge=0, description="价格上限（分）"),
     sort: str = Query(default="relevance", pattern="^(relevance|sales|newest|price_asc|price_desc)$"),
@@ -89,6 +96,7 @@ async def search(
         session,
         keyword=keyword,
         category_id=category_id,
+        shop_id=shop_id,
         price_from=price_from,
         price_to=price_to,
         sort=sort,

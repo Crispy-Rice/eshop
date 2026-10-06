@@ -35,6 +35,7 @@ from app.modules.promotion.schemas import CalcPriceRequest
 from app.modules.trade import repository as repo
 from app.modules.trade.models import (
     AUTO_RECEIVE_DAYS,
+    BLOCKING_ORDER_STATUSES,
     DELIVERY_ORDER_SENT,
     OPERATOR_MERCHANT,
     OPERATOR_SYSTEM,
@@ -125,6 +126,9 @@ class SubDraft:
     coupon_amount: int = 0
     point_deduction: int = 0
     freight_amount: int = 0
+    # ★ 下单时**路由**到的发货仓（见 ``inventory.routing``）。在 create_order 里定，
+    #   随后写进 ``order_sub.warehouse_id`` —— 发货与售后都读那个记录值，不再路由。
+    warehouse_id: int | None = None
 
     @property
     def payable_amount(self) -> int:
@@ -138,12 +142,86 @@ class SubDraft:
         )
 
 
-def _require_warehouse(warehouses: dict[int, int], sku_id: int) -> int:
-    """取 SKU 的发货仓。没有就直接拒绝 —— 不知道该从哪发，预占与回补都无从谈起。"""
-    wh_id = warehouses.get(sku_id)
-    if wh_id is None:
-        raise BizError(ErrorCode.SKU_NOT_SUPPORTED, "商品没有可用的发货仓，无法下单")
-    return wh_id
+def _no_warehouse_can_ship(sub: SubDraft, split_across: bool) -> BizError:
+    """没有任何候选仓能**一次**盖住这个子单的货 —— 把话说准。
+
+    ★ 两种原因的**补救办法不同**，所以文案必须分开：
+
+    - ``split_across``：每条商品各自都有仓够，只是凑不到**同一个**仓 →
+      **分开下单真的能解决**。因为择仓是**按这一单**判的：把其中一件单独下一单，
+      它自己的候选链会兜到有那个货的仓。
+    - 否则：哪个仓都不够 → 只能等补货。
+
+    ★ **不再提"更换收货地址"** —— 兜底已经把该店所有启用的仓都试过了，换地址没用。
+      那句话在 v1（路由只看规则、只认那一个仓）成立，现在成了假话。
+    """
+    if split_across:
+        return BizError(
+            ErrorCode.STOCK_SOLD_OUT,
+            f"「{sub.shop_name}」这单的商品分散在不同仓库，没有哪个仓库能一次发齐。"
+            "可以联系商家，或把商品分开下单",
+        )
+    return BizError(
+        ErrorCode.STOCK_SOLD_OUT,
+        f"「{sub.shop_name}」这单的商品库存不足，暂时无法下单。可以联系商家补货",
+    )
+
+
+def _stock_taken_error(subs: list[SubDraft]) -> BizError:
+    """预占时才发现不够 —— 只可能是**并发抢空**（择仓时刚查过，那时是够的）。
+
+    ★ 错误码保持不变（``STOCK_SOLD_OUT``），前端已有对应处理。
+    ★ 顺带接管 ``STOCK_INSUFFICIENT``：它是 Redis 放行、DB 条件更新失败时抛的，
+      原先会**原样漏出去** —— 带着数字 SKU id、没有仓名、也没有可操作的话。
+    """
+    shops = "、".join(dict.fromkeys(f"「{s.shop_name}」" for s in subs))
+    return BizError(
+        ErrorCode.STOCK_SOLD_OUT,
+        f"{shops}的商品库存刚刚被抢完了，请重新提交。也可以联系商家补货",
+    )
+
+
+async def _sub_warehouses(session: AsyncSession, subs: list[OrderSub]) -> dict[str, int]:
+    """子单号 → 发货仓。**已记录的优先**，没记录的（迁移前的老单）回退该店默认仓。
+
+    ★ 回退目标是**默认仓**，不是重新路由：默认仓是显式配置、不随区域规则变化，
+      所以不会出现"退货退到一个当初根本没发货的仓"。
+    """
+    resolved: dict[str, int] = {}
+    need_default: set[int] = set()
+    for sub in subs:
+        if sub.warehouse_id:
+            resolved[str(sub.order_sub_no)] = int(sub.warehouse_id)
+        else:
+            need_default.add(int(sub.shop_id))
+
+    for shop_id in need_default:
+        default_id = await inventory_service.default_warehouse_id(session, shop_id)
+        if default_id is None:
+            raise BizError(
+                ErrorCode.SKU_NOT_SUPPORTED, "该商品所属店铺未配置发货仓库，暂时无法处理"
+            )
+        for sub in subs:
+            if not sub.warehouse_id and int(sub.shop_id) == shop_id:
+                resolved[str(sub.order_sub_no)] = default_id
+    return resolved
+
+
+async def _sub_warehouse_id(session: AsyncSession, sub: OrderSub) -> int:
+    """一个子单的发货仓（发货单要写它）。迁移前的老单没记录，回退到该店默认仓。"""
+    return (await _sub_warehouses(session, [sub]))[str(sub.order_sub_no)]
+
+
+async def warehouse_id_of_sub(session: AsyncSession, order_sub_no: str) -> int:
+    """按子单号取发货仓。**给 aftersale 用**（退货入库要回到当初发货的那个仓）。
+
+    对外暴露是因为订单的仓归 trade 管，aftersale 不该自己去读 ``order_sub`` 表 ——
+    模块边界（docs/01 §2）。老单 ``warehouse_id`` 为空时回退该店默认仓。
+    """
+    sub = await repo.get_sub(session, order_sub_no)
+    if sub is None:
+        raise BizError(ErrorCode.ORDER_ITEM_NOT_FOUND, "订单不存在")
+    return await _sub_warehouse_id(session, sub)
 
 
 # ============================================================
@@ -315,20 +393,49 @@ async def create_order(
     now = datetime.now(UTC)
     pay_deadline = now + timedelta(minutes=30)
 
-    # ④ 预占库存（Redis 预扣 + DB 条件更新，biz_key 幂等）
-    sku_ids = [int(it.sku_id) for it in calc.items]
-    warehouses = await inventory_service.batch_sku_warehouses(session, sku_ids)
-    stock_items = [
-        StockItem(
-            sku_id=int(it.sku_id),
-            warehouse_id=_require_warehouse(warehouses, int(it.sku_id)),
-            num=it.num,
+    # ④ 定发货仓 → 预占库存
+    #
+    # ★ 仓**按店铺**定：候选顺序是「规则仓 → 默认仓 → 其余启用仓」，取**第一个能一次
+    #   盖住这个子单全部货**的仓（见 inventory.routing / service.route_warehouse）。
+    #   因为一个子单只有一个收货地址、也只有一个仓，所以同一个子单里的商品必然同仓 ——
+    #   这正是"仓可以记在子单上"的依据。
+    # ★ 定完就写进子单（_write_subs）：**这是唯一一次择仓**。发货与售后读那个记录值，
+    #   商家事后改区域规则不会影响在途订单，也不会让退货入错仓。
+    stock_items: list[StockItem] = []
+    for sub in subs:
+        choice = await inventory_service.route_warehouse(
+            session,
+            shop_id=sub.shop_id,
+            region_code=address.region_code,
+            need={int(it.sku_id): int(it.num) for it in sub.items},
         )
-        for it in calc.items
-    ]
-    await inventory_service.lock(
-        session, stock_items, f"LOCK:{main_no}", user_id=user_id, order_no=main_no
-    )
+        if choice.warehouse is None:
+            raise BizError(
+                ErrorCode.SKU_NOT_SUPPORTED,
+                f"「{sub.shop_name}」还没有配置发货仓库，暂时无法下单",
+            )
+        if not choice.covered:
+            # ★ 提前抛，不留给 lock 去失败：文案要点对（见 _no_warehouse_can_ship），
+            #   而且省掉一次必然失败的 Redis 往返。
+            raise _no_warehouse_can_ship(sub, choice.split_across)
+        sub.warehouse_id = int(choice.warehouse.id)
+        stock_items.extend(
+            StockItem(
+                sku_id=int(it.sku_id), warehouse_id=int(choice.warehouse.id), num=int(it.num)
+            )
+            for it in sub.items
+        )
+
+    try:
+        await inventory_service.lock(
+            session, stock_items, f"LOCK:{main_no}", user_id=user_id, order_no=main_no
+        )
+    except BizError as exc:
+        # 走到这里说明**每个子单择仓时都够、预占时不够** —— 只能是并发抢空。
+        # （"没有仓盖得住"在上面的循环里就已经抛了，不会落到这儿。）
+        if exc.code in (ErrorCode.STOCK_SOLD_OUT, ErrorCode.STOCK_INSUFFICIENT):
+            raise _stock_taken_error(subs) from exc
+        raise
 
     # ⑤ 锁券（未支付时占用，关单会解锁）
     for code_id in req.coupon_code_ids:
@@ -446,13 +553,17 @@ async def _split(session: AsyncSession, calc) -> list[SubDraft]:
         for shop_id, items in by_shop.items()
     ]
 
-    # 运费已按仓库算好并归属到店铺（freight 模块的 packages 带 warehouse 但不带 shop），
-    # 这里按运费明细里的店铺归属取。第一期单仓单店，直接全部归第一个子单即可，
-    # 多店铺时按商品金额占比分摊（与平台优惠同理）。
+    # ★ 子单运费 = **它自己那个包裹的运费**，不是按商品金额占比摊出来的。
+    #   两店各发各的包裹、各收一次首重（docs/06 §6），所以"乙店买东西少"不会让
+    #   乙店少付运费、甲店替它多付。这个数必须准 —— 退款退的就是它（docs/06 §8）：
+    #   按金额摊会让"实收 10 元运费"的店只退 6.36 元，母单总额却是平的，
+    #   守恒断言拦不住（它只校验 Σ 子单 == 母单）。
+    #   ``calc.freight`` 是**运费券抵扣后**的合计，而 base 是抵扣前的各店运费 ——
+    #   比例分摊恰好把那张券按各店的运费分掉，总额仍严格相等（``allocate`` 保证）。
     if len(subs) == 1:
         subs[0].freight_amount = calc.freight
     elif calc.freight > 0:
-        base = [s.total_amount for s in subs]
+        base = [int(calc.freight_by_shop.get(int(s.shop_id), 0)) for s in subs]
         for sub, amount in zip(subs, allocate(calc.freight, base), strict=True):
             sub.freight_amount = amount
 
@@ -500,6 +611,7 @@ async def _write_subs(
             user_id=user_id,
             shop_id=sub.shop_id,
             shop_name_snap=sub.shop_name,
+            warehouse_id=sub.warehouse_id,
             total_amount=sub.total_amount,
             item_discount=sub.item_discount,
             shop_discount=sub.shop_discount,
@@ -626,15 +738,23 @@ async def _stock_items_of_sub(session: AsyncSession, order_sub_no: str) -> list[
 
 
 async def _to_stock_items(session: AsyncSession, items: list[OrderItem]) -> list[StockItem]:
+    """订单项 → 库存模块要的行（SKU + 发货仓 + 数量）。
+
+    ★ **不重新路由**：读每个订单项**所属子单**记录的 ``warehouse_id``。改成路由的话，
+      商家事后调整区域规则就会让"从 A 仓预占、往 B 仓回补"变成可能 —— 而本函数的三个
+      调用方（关单回补 / 支付确认 / 发货扣减）必须拿到与下单时**同一套**仓库归属。
+
+    ★ 必须**逐条**取子单的仓：一个母单可能跨多个店铺，各子单的仓不同
+      （``_stock_items_of_main`` 拿的就是整个母单的项），所以这里不能算一张全局 map。
+    """
     if not items:
         return []
-    warehouses = await inventory_service.batch_sku_warehouses(
-        session, [int(it.sku_id) for it in items]
-    )
+    subs = await repo.list_subs_by_nos(session, list({str(it.order_sub_no) for it in items}))
+    warehouses = await _sub_warehouses(session, subs)
     return [
         StockItem(
             sku_id=int(it.sku_id),
-            warehouse_id=_require_warehouse(warehouses, int(it.sku_id)),
+            warehouse_id=warehouses[str(it.order_sub_no)],
             num=it.num,
         )
         for it in items
@@ -733,7 +853,9 @@ async def ship(
             order_sub_no=order_sub_no,
             order_main_no=sub.order_main_no,
             shop_id=shop_id,
-            warehouse_id=0,  # 第一期单仓，发货单不细分仓库
+            # 发货单记的是**子单在下单时路由到的那个仓**（不再是写死的 0）。
+            # 一个子单的所有商品必然同仓，所以一张发货单一个仓就够（见 inventory.routing）。
+            warehouse_id=await _sub_warehouse_id(session, sub),
             express_company=express_company,
             express_no=express_no,
             status=DELIVERY_ORDER_SENT,
@@ -1043,6 +1165,11 @@ async def list_shop_orders(
     for d in deliveries:
         deliv_by_sub.setdefault(d.order_sub_no, []).append(d)
 
+    # 发货仓名（一次查全）：商家要知道"这单从哪个仓打包"
+    warehouse_names = {
+        int(w.id): w.name for w in await inventory_service.list_warehouses(session, shop_id)
+    }
+
     return MerchantOrderListOut(
         items=[
             to_merchant_order_out(
@@ -1050,6 +1177,7 @@ async def list_shop_orders(
                 mains[s.order_main_no],
                 by_sub.get(s.order_sub_no, []),
                 deliv_by_sub.get(s.order_sub_no, []),
+                warehouse_name=warehouse_names.get(int(s.warehouse_id or 0), ""),
             )
             for s in page
             if s.order_main_no in mains
@@ -1072,11 +1200,15 @@ async def get_shop_order(
     main = mains.get(sub.order_main_no)
     if main is None:
         raise BizError(ErrorCode.ORDER_ITEM_NOT_FOUND, "订单不存在")
+    warehouse_names = {
+        int(w.id): w.name for w in await inventory_service.list_warehouses(session, shop_id)
+    }
     return to_merchant_order_out(
         sub,
         main,
         await repo.list_items_of_subs(session, [order_sub_no]),
         await repo.list_deliveries(session, order_sub_no),
+        warehouse_name=warehouse_names.get(int(sub.warehouse_id or 0), ""),
     )
 
 
@@ -1126,3 +1258,15 @@ async def mark_sub_reviewed(
 async def list_items_of_sub(session: AsyncSession, order_sub_no: str) -> list[OrderItem]:
     """取子单的订单项（评价模块判断"整单是否评完"用）。"""
     return await repo.list_items_of_subs(session, [order_sub_no])
+
+
+async def count_blocking_orders(session: AsyncSession, user_id: int) -> int:
+    """该用户还有多少笔**没走完**的订单（待付款 / 待发货 / 待收货 / 退款中）。
+
+    ★ 给账号注销做前置守卫。方向是"下游提供只读查询、上游（account 的路由层）
+      来编排" —— account 不能 import trade（trade → … → product，反向即环，
+      docs/01 §2），所以这个函数只能由 trade 主动暴露。
+
+    只回数字不回单号：守卫需要的是"拦不拦 + 提示几句"，把订单号漏出去没有必要。
+    """
+    return await repo.count_user_mains_in_statuses(session, user_id, BLOCKING_ORDER_STATUSES)

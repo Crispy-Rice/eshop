@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
 import { fetchShop, type ShopInfo } from '@/api/auth'
@@ -8,6 +8,7 @@ import { addToCart } from '@/api/cart'
 import { isBizError } from '@/api/errors'
 import { fetchSkuStock } from '@/api/inventory'
 import { fetchSpu, type SkuDetail, type SpuDetail } from '@/api/product'
+import { TICKET_SOURCE } from '@/api/support'
 import {
   FILTERS,
   SORTS,
@@ -39,6 +40,25 @@ const quantity = ref(1)
 const selected = ref<Record<string, string>>({})
 
 const spuId = computed(() => String(route.params.spuId))
+
+/**
+ * 联系**这家店的**客服：跳到客服页并带上店铺与商品名。
+ *
+ * ★ 客服页（`SupportView`）认这几个查询参数，会直接开会话并跳进去 ——
+ *   所以这里只是"把上下文放进 URL"，开会话的逻辑只有一处。
+ * ★ 带上商品名：不带的话会话标题只会是「商品咨询」，商家看不出买家在问哪件商品。
+ */
+function contactShop(): void {
+  if (!shop.value) return
+  void router.push({
+    name: 'support',
+    query: {
+      shopId: shop.value.id,
+      source: TICKET_SOURCE.PRODUCT,
+      subject: `关于「${spu.value?.title ?? '这件商品'}」`,
+    },
+  })
+}
 
 /**
  * 某个规格值当前是否可选。
@@ -134,6 +154,14 @@ const mainImage = computed(() => currentSku.value?.coverImage || spu.value?.main
 /** 库存档位文案。后端只给档位不给真实库存（docs/03 §9）。 */
 const stockText = ref<string | null>(null)
 
+/**
+ * 售罄标记。
+ *
+ * ★ 以前**只用了档位文案、没用这个布尔** —— 于是售罄时「加入购物车」还点得动，
+ *   点了才弹错误。后端已经给了这个判断，用起来。
+ */
+const soldOut = ref(false)
+
 // 评价区
 const reviewStats = ref<ReviewStats | null>(null)
 const reviews = ref<Review[]>([])
@@ -146,13 +174,18 @@ const reviewLoadingMore = ref(false)
 watch(currentSku, async (sku) => {
   if (!sku) {
     stockText.value = null
+    soldOut.value = false
     return
   }
   try {
-    stockText.value = (await fetchSkuStock(sku.id)).text
+    const stock = await fetchSkuStock(sku.id)
+    stockText.value = stock.text
+    soldOut.value = stock.soldOut
   } catch {
-    // 库存查不到不该挡住浏览商品，静默降级为不展示
+    // 库存查不到不该挡住浏览商品：静默降级为"不展示档位"，**也不禁用按钮** ——
+    // 拿不到判断就当有货，否则一次网络抖动会让商品临时不可买
     stockText.value = null
+    soldOut.value = false
   }
 })
 
@@ -358,19 +391,26 @@ watch(spuId, load)
             size="large"
             class="buy"
             :loading="adding"
+            :disabled="soldOut"
             @click="onAddToCart"
           >
-            加入购物车
+            {{ soldOut ? '已售罄' : '加入购物车' }}
           </el-button>
 
-          <!-- 卖家是谁。店铺接口匿名可读，没登录也看得到 -->
-          <div v-if="shop" class="shop">
-            <img v-if="shop.logo" :src="shop.logo" class="shop-logo" alt="" @error="onImageError" />
-            <span v-else class="shop-logo shop-logo-fallback">{{ shop.name.slice(0, 1) }}</span>
-            <div class="shop-text">
-              <div class="shop-name">{{ shop.name }}</div>
-              <div v-if="shop.description" class="shop-desc">{{ shop.description }}</div>
-            </div>
+          <!-- 卖家是谁 + 进店 / 联系客服。店铺接口匿名可读，没登录也看得到 -->
+          <div v-if="shop" class="shop-row">
+            <RouterLink :to="{ name: 'shop', params: { shopId: shop.id } }" class="shop">
+              <img v-if="shop.logo" :src="shop.logo" class="shop-logo" alt="" @error="onImageError" />
+              <span v-else class="shop-logo shop-logo-fallback">{{ shop.name.slice(0, 1) }}</span>
+              <div class="shop-text">
+                <div class="shop-name">{{ shop.name }}</div>
+                <div v-if="shop.description" class="shop-desc">{{ shop.description }}</div>
+              </div>
+              <span class="shop-enter">进店逛逛 ›</span>
+            </RouterLink>
+            <!-- ★ 必须是店铺块的**兄弟节点**，不能放进上面那个 <RouterLink> 里：
+                 链接里嵌按钮是无效 HTML，而且点一下会同时触发进店跳转 -->
+            <button type="button" class="shop-service" @click="contactShop">联系客服</button>
           </div>
         </div>
       </div>
@@ -654,15 +694,65 @@ watch(spuId, load)
  * 店铺
  *
  * 放在购买区下面：先让人把东西买了，再回答"这是哪家店"。
+ * 现在整块是**进店入口**（RouterLink），不再只是展示。
  * ------------------------------------------------------------------------*/
 
-.shop {
+.shop-row {
   margin-top: var(--space-5);
   padding-top: var(--space-4);
   border-top: 1px solid var(--color-border);
   display: flex;
   align-items: center;
   gap: var(--space-3);
+}
+
+.shop {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  /* 它是 <a>：抹掉链接默认样式，让整块看起来还是一块信息 */
+  text-decoration: none;
+  color: inherit;
+}
+
+/* 「联系客服」：描边小胶囊 —— 它跳出商品页去客服会话，和「进店逛逛 ›」这种
+   站内跳转不是一回事，用盒子区分开 */
+.shop-service {
+  flex: 0 0 auto;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-surface);
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+
+.shop-service:hover {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+.shop:hover .shop-name {
+  color: var(--color-accent);
+}
+
+/* "进店逛逛"常驻可见，而不是只在 hover 时冒出来 —— 触屏上没有 hover */
+.shop-enter {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.shop:hover .shop-enter {
+  color: var(--color-accent);
 }
 
 .shop-logo {

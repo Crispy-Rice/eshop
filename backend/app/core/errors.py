@@ -40,6 +40,23 @@ class ErrorCode(StrEnum):
     INTERNAL_ERROR = ("INTERNAL_ERROR", 500, "系统繁忙，请稍后再试")
     SYSTEM_BUSY = ("SYSTEM_BUSY", 503, "当前访问人数过多，请稍后再试")
 
+    # ---------- 账号状态 ----------
+    # 封禁与注销分开，不再统一借用 FORBIDDEN：前者可解封、文案会拼上理由
+    # （由 account/service 动态覆盖 message），后者是终态。前端据此给不同提示。
+    #
+    # ★ 码名保留 ACCOUNT_BANNED，但**买家看到的措辞用「冻结」**：封禁是运营侧的
+    #   动作术语（后台按钮、审计流水都用它），对买家偏重；而 account.user.status
+    #   那一列的建表注释从第一天写的就是「2冻结」。改的是措辞，不是状态语义。
+    ACCOUNT_BANNED = ("ACCOUNT_BANNED", 403, "该账号已被冻结，暂时无法登录")
+    ACCOUNT_CLOSED = ("ACCOUNT_CLOSED", 403, "账号已注销")
+    # 注销后同号重注册的冷静期。**这条会泄露"该号曾注册过"** —— 但注册接口
+    # 本来就会回"该手机号已注册"，泄漏面没有变大，换来的是用户能看懂原因。
+    PHONE_IN_COOLDOWN = ("PHONE_IN_COOLDOWN", 409, "该手机号注销未满 30 天，暂时不能重新注册")
+    # 注销前置守卫：还有未完成的订单或进行中的售后
+    ACCOUNT_HAS_UNFINISHED = ("ACCOUNT_HAS_UNFINISHED", 409, "还有未完成的订单或售后，处理完才能注销")
+    # 店主不能自助注销（没有"停用店铺"机制，先自行关店/处理商品）
+    SHOP_OWNER_CANNOT_DEACTIVATE = ("SHOP_OWNER_CANNOT_DEACTIVATE", 409, "你名下有店铺，暂不能注销账号")
+
     # ---------- 幂等 ----------
     REQUEST_PROCESSING = ("REQUEST_PROCESSING", 409, "请求处理中，请稍候")
 
@@ -110,6 +127,12 @@ class ErrorCode(StrEnum):
     IN_AFTERSALE = ("IN_AFTERSALE", 422, "售后处理中，暂不能评价")
     REPLY_LIMIT_EXCEEDED = ("REPLY_LIMIT_EXCEEDED", 422, "该评价的回复次数已达上限")
     REVIEW_STATUS_INVALID = ("REVIEW_STATUS_INVALID", 422, "当前评价状态不允许该操作")
+
+    # ---------- 客服 ----------
+    # 只新增这一个码：「关闭后再发」按设计是**重开同一条**（超 30 天才新建），
+    # 不是错误；归属不对一律复用 NOT_FOUND（不给遍历探测留口子）；
+    # 正文长度/空值由 pydantic 兜成 VALIDATION_ERROR。见 docs/19 §4。
+    SUPPORT_RATE_LIMITED = ("SUPPORT_RATE_LIMITED", 429, "发送太频繁，请稍后再试")
 
     # ---------- 文件上传 ----------
     INVALID_IMAGE = ("INVALID_IMAGE", 422, "图片格式不支持或已损坏")

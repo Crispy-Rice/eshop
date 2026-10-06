@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { isBizError } from '@/api/errors'
+import { TICKET_SOURCE } from '@/api/support'
 import {
   ORDER_CLOSED,
   ORDER_FINISHED,
@@ -133,6 +134,24 @@ function goProduct(skuId: string): void {
 /** 申请售后。**按子单申请** —— 跨店订单要分别对各店发起 */
 function goRefund(orderSubNo: string): void {
   void router.push({ name: 'refund-apply', params: { orderSubNo } })
+}
+
+/**
+ * 联系客服。**按子单**带上下文 —— 跨店订单的每个子单属于不同的店，
+ * 想找哪家店就点哪一行的按钮。
+ *
+ * ★ 标题不用传：后端按 `source` + 订单号生成「关于订单 M…」，再传一遍是冗余。
+ */
+function goSupport(sub: { orderSubNo: string; shopId: string }): void {
+  void router.push({
+    name: 'support',
+    query: {
+      shopId: sub.shopId,
+      orderMainNo: orderMainNo.value,
+      orderSubNo: sub.orderSubNo,
+      source: TICKET_SOURCE.ORDER,
+    },
+  })
 }
 
 /** 这三个状态的子单可以申请售后（待付款走取消订单，已退款/已关闭没得退） */
@@ -275,6 +294,7 @@ onBeforeUnmount(() => {
           <el-button v-if="canApplyRefund(sub)" size="small" @click="goRefund(sub.orderSubNo)">
             申请售后
           </el-button>
+          <el-button size="small" @click="goSupport(sub)">联系客服</el-button>
           <el-button v-if="canReview(sub)" size="small" @click="goReviews">评价</el-button>
         </footer>
       </section>

@@ -24,7 +24,7 @@ Redis 与 DB 都要做（docs/03 §4.2）：只有 Redis 会在 AOF 丢写入时
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from redis.asyncio import Redis
@@ -37,7 +37,7 @@ from app.core.errors import BizError, ErrorCode
 from app.core.logging import get_logger
 from app.core.redis import get_lua, get_redis
 from app.core.snowflake import next_id
-from app.modules.inventory import redis_stock
+from app.modules.inventory import redis_stock, routing
 from app.modules.inventory import repository as repo
 from app.modules.inventory.models import (
     CHANGE_ADJUST,
@@ -50,18 +50,24 @@ from app.modules.inventory.models import (
     CHANGE_RELEASE,
     CHANGE_RETURN_IN,
     CHANGE_TYPE_TEXT,
+    WAREHOUSE_DISABLED,
+    WAREHOUSE_ENABLED,
     SkuStock,
     Warehouse,
+    WarehouseRegionRule,
 )
 from app.modules.inventory.schemas import (
+    RegionRuleOut,
     StockAdjustOut,
     StockAdjustRequest,
     StockFlowListOut,
     StockFlowOut,
     StockItemOut,
     StockListOut,
+    WarehouseCreatedOut,
     WarehouseCreateRequest,
     WarehouseOut,
+    WarehouseUpdateRequest,
     display_stock_text,
 )
 
@@ -672,43 +678,319 @@ async def _sync_one_to_redis(
 # ============================================================
 
 
-async def list_warehouses(session: AsyncSession, shop_id: int) -> list[WarehouseOut]:
-    rows = await repo.list_warehouses(session, shop_id)
-    return [
-        WarehouseOut(
-            id=w.id,
-            name=w.name,
-            region_code=w.region_code,
-            is_default=w.is_default,
-            status=w.status,
-            created_at=w.created_at,
-        )
-        for w in rows
-    ]
+def _to_rule_out(rule: WarehouseRegionRule) -> RegionRuleOut:
+    return RegionRuleOut(
+        id=rule.id, region_code=rule.region_code, region_level=rule.region_level
+    )
 
 
-async def create_warehouse(
-    session: AsyncSession, shop_id: int, req: WarehouseCreateRequest
+def _to_warehouse_out(
+    warehouse: Warehouse, rules: list[RegionRuleOut] | None = None
 ) -> WarehouseOut:
-    warehouse = await repo.create_warehouse(session, shop_id, req.name, req.region_code)
     return WarehouseOut(
         id=warehouse.id,
         name=warehouse.name,
         region_code=warehouse.region_code,
+        province=warehouse.province,
+        city=warehouse.city,
+        district=warehouse.district,
+        detail=warehouse.detail,
+        contact_name=warehouse.contact_name,
+        contact_phone=warehouse.contact_phone,
         is_default=warehouse.is_default,
         status=warehouse.status,
         created_at=warehouse.created_at,
+        rules=rules or [],
     )
 
 
+async def _require_warehouse(
+    session: AsyncSession, shop_id: int, warehouse_id: int
+) -> Warehouse:
+    """取本店的仓。带上 shop_id 查，顺手做了越权校验。"""
+    warehouse = await repo.get_warehouse(session, shop_id, warehouse_id)
+    if warehouse is None:
+        raise BizError(ErrorCode.NOT_FOUND, "仓库不存在")
+    return warehouse
+
+
+async def list_warehouses(session: AsyncSession, shop_id: int) -> list[WarehouseOut]:
+    """仓列表（含每个仓覆盖的区划）。
+
+    规则**一次查全再分组**，不逐个仓查 —— 一家店没几个仓也没几条规则，
+    逐个查才是 N+1。
+    """
+    warehouses = await repo.list_warehouses(session, shop_id)
+    by_warehouse: dict[int, list[RegionRuleOut]] = {}
+    for rule in await repo.list_region_rules(session, shop_id):
+        by_warehouse.setdefault(int(rule.warehouse_id), []).append(_to_rule_out(rule))
+    return [_to_warehouse_out(w, by_warehouse.get(int(w.id), [])) for w in warehouses]
+
+
+async def create_warehouse(
+    session: AsyncSession, shop_id: int, req: WarehouseCreateRequest
+) -> WarehouseCreatedOut:
+    """建仓。**顺手给该店全部 SKU 在这个仓补 0 库存行**。
+
+    ★ 为什么建仓就要铺货：路由可能把这个仓指定给某些地区，而"路由到的仓里某商品
+      没有库存行"会让那些订单**整单失败**。预建行让商家只需去库存页填数量。
+      但**光靠这一步不够** —— 建仓之后新发布的 SKU 不会自动有这个仓的行，
+      所以下单前还有一道惰性补齐（`ensure_stock_rows(..., sku_ids=...)`）。
+    """
+    warehouse = await repo.create_warehouse(session, shop_id, values=req.model_dump())
+    stocked = await ensure_stock_rows(session, shop_id, warehouse.id)
+    out = _to_warehouse_out(warehouse)
+    return WarehouseCreatedOut(**out.model_dump(), stocked_skus=stocked)
+
+
+async def update_warehouse(
+    session: AsyncSession, shop_id: int, warehouse_id: int, req: WarehouseUpdateRequest
+) -> WarehouseOut:
+    """改仓（名称 / 地址 / 联系人）。部分更新：只写传了的字段。
+
+    ★ 地址里的空串是**有意义的**（清空那一项），所以过滤时只丢 ``None``（= 没传）。
+    """
+    warehouse = await _require_warehouse(session, shop_id, warehouse_id)
+    values = {
+        key: value
+        for key, value in req.model_dump(exclude_unset=True).items()
+        if value is not None
+    }
+    await repo.update_warehouse_fields(session, warehouse.id, values)
+    refreshed = await _require_warehouse(session, shop_id, warehouse_id)
+    return _to_warehouse_out(refreshed, await _rules_of(session, shop_id, warehouse_id))
+
+
+async def set_warehouse_default(
+    session: AsyncSession, shop_id: int, warehouse_id: int
+) -> WarehouseOut:
+    """把某个仓设为默认仓（路由的兜底）。
+
+    停用的仓不能当默认仓 —— 兜底的本意是"总有一个能发货的仓"。
+    """
+    warehouse = await _require_warehouse(session, shop_id, warehouse_id)
+    if warehouse.status != WAREHOUSE_ENABLED:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "停用的仓不能设为默认仓，请先启用它")
+    await repo.set_default_warehouse(session, shop_id, warehouse_id)
+    refreshed = await _require_warehouse(session, shop_id, warehouse_id)
+    return _to_warehouse_out(refreshed, await _rules_of(session, shop_id, warehouse_id))
+
+
+async def set_warehouse_status(
+    session: AsyncSession, shop_id: int, warehouse_id: int, status: int
+) -> WarehouseOut:
+    """启用 / 停用。
+
+    ★ **默认仓不允许停用**："每店必有默认仓"是路由兜底的前提，停了它这个店就没仓可发。
+      要停就先设另一个为默认。
+    ★ 停用只影响**新订单**的路由；历史订单落在这个仓的照常发货、售后照常回补 ——
+      那些路径读的是订单上记录的仓，根本不看仓状态。
+    """
+    warehouse = await _require_warehouse(session, shop_id, warehouse_id)
+    if status == WAREHOUSE_DISABLED and warehouse.is_default:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            "默认仓不能停用 —— 收货地址没命中任何区域规则时，订单要靠它兜底。请先把别的仓设为默认",
+        )
+    await repo.update_warehouse_fields(session, warehouse.id, {"status": status})
+    refreshed = await _require_warehouse(session, shop_id, warehouse_id)
+    return _to_warehouse_out(refreshed, await _rules_of(session, shop_id, warehouse_id))
+
+
+async def _rules_of(
+    session: AsyncSession, shop_id: int, warehouse_id: int
+) -> list[RegionRuleOut]:
+    return [
+        _to_rule_out(r)
+        for r in await repo.list_region_rules(session, shop_id)
+        if int(r.warehouse_id) == warehouse_id
+    ]
+
+
+async def replace_region_rules(
+    session: AsyncSession, shop_id: int, warehouse_id: int, codes: Sequence[str]
+) -> list[RegionRuleOut]:
+    """**整体替换**这个仓覆盖的区划（照 freight 的 region rules 编辑方式）。
+
+    ★ 唯一键是 ``(shop_id, region_code)``：一个地方只能由一个仓发货。所以提交前先查
+      "这些区划有没有被别的仓占着"，占了就报**人话**（哪个地区、归哪个仓），
+      而不是丢一个数据库唯一约束错误给商家。
+    """
+    warehouse = await _require_warehouse(session, shop_id, warehouse_id)
+    unique_codes = list(dict.fromkeys(codes))  # 同一份提交里的重复项
+
+    taken = await repo.region_rule_owners(
+        session, shop_id=shop_id, codes=unique_codes, exclude_warehouse_id=warehouse.id
+    )
+    if taken:
+        names = {int(w.id): w.name for w in await repo.list_warehouses(session, shop_id)}
+        detail = "、".join(
+            f"{code}（现在是「{names.get(wh_id, '其它仓')}」发货）" for code, wh_id in taken.items()
+        )
+        raise BizError(ErrorCode.VALIDATION_ERROR, f"这些地区已经分给别的仓了：{detail}")
+
+    await repo.delete_region_rules_of_warehouse(session, warehouse.id)
+    await repo.insert_region_rules(
+        session, shop_id=shop_id, warehouse_id=warehouse.id, codes=unique_codes
+    )
+    return await _rules_of(session, shop_id, warehouse_id)
+
+
+# ============================================================
+# 发货仓路由
+# ============================================================
+@dataclass(frozen=True, slots=True)
+class WarehouseChoice:
+    """按仓择仓的结果。
+
+    ★ **三种结局必须分开**，因为补救办法不同（文案见 ``trade`` 与 ``promotion.checkout``）：
+
+    - ``warehouse is None`` —— 该店连一个启用的仓都没有 → "还没配置发货仓库"
+    - ``covered=True`` —— ``warehouse`` 能一次盖住这一单的全部货 → 正常发货
+    - ``covered=False`` —— **没有任何候选仓**能盖住全部。``warehouse`` 仍给出**首个候选**
+      （报错时用来点名），``short_sku_ids`` 列出**哪个仓都盖不住**的那些 SKU。
+
+    ``short_sku_ids`` 为空而仍未覆盖，就是 :attr:`split_across`：每条商品各自都有仓够、
+    只是凑不到同一个仓 —— 那种情况**分开下单真的能解决**（择仓是按整单判的）。
+    """
+
+    warehouse: Warehouse | None
+    covered: bool
+    short_sku_ids: frozenset[int] = frozenset()
+
+    @property
+    def split_across(self) -> bool:
+        """没盖住，但**没有哪一条是"哪儿都没货"** → 只是分散在不同仓，分开下单可解。"""
+        return not self.covered and not self.short_sku_ids
+
+
+async def route_warehouse(
+    session: AsyncSession,
+    *,
+    shop_id: int,
+    region_code: str | None,
+    need: Mapping[int, int],
+) -> WarehouseChoice:
+    """该店发往这个区划用哪个仓 —— **规则优先，规则仓盖不住时按候选链往后退**。
+
+    ``need`` 是 ``{sku_id: num}``：**整单必须能落进同一个仓**，所以判定是"这个仓对这些
+    SKU 的 available 都 >= 各自的数量"；不做逐件挑仓（那要把一个子单拆成多张发货单，
+    见 ``routing`` 的模块文档）。
+
+    ★ 判据用 **DB 的 ``available``**（``sku_stock`` 是账本，Redis 只是前置闸）。
+    ★ 只读、不锁。真正的扣减在下单的 ``lock`` 里；两者之间被抢空是可能的，那时下单会
+      失败 —— 这是接受的（不重试，理由见 ``trade.service.create_order``）。
+    """
+    warehouses = await repo.list_warehouses(session, shop_id)
+    enabled = {int(w.id): w for w in warehouses if routing.is_enabled(w)}
+    default_wh = next((w for w in warehouses if w.is_default), None)
+    rules = await repo.list_region_rules(session, shop_id)
+    candidates = routing.warehouse_candidates(
+        rules=rules, enabled=enabled, default_wh=default_wh, region_code=region_code or ""
+    )
+    if not candidates:
+        return WarehouseChoice(warehouse=None, covered=False)
+
+    items = {int(sku_id): int(num) for sku_id, num in need.items() if int(num) > 0}
+    if not items:  # 没有要发的货 —— 只按规则给仓，不必查库存
+        return WarehouseChoice(warehouse=candidates[0], covered=True)
+
+    avail = await repo.available_of(
+        session,
+        warehouse_ids=[int(w.id) for w in candidates],
+        sku_ids=list(items),
+    )
+    for warehouse in candidates:
+        wid = int(warehouse.id)
+        if all(avail.get((sku_id, wid), 0) >= num for sku_id, num in items.items()):
+            return WarehouseChoice(warehouse=warehouse, covered=True)
+
+    # 一个仓都盖不住：把"哪条是哪儿都没货"记下来 —— 文案要按它分两种（见 WarehouseChoice）
+    short = frozenset(
+        sku_id
+        for sku_id, num in items.items()
+        if not any(avail.get((sku_id, int(w.id)), 0) >= num for w in candidates)
+    )
+    return WarehouseChoice(warehouse=candidates[0], covered=False, short_sku_ids=short)
+
+
+async def route_warehouses(
+    session: AsyncSession,
+    *,
+    region_code: str | None,
+    sku_to_shop: Mapping[int, int],
+    need: Mapping[int, int],
+) -> dict[int, WarehouseChoice]:
+    """``sku_id → WarehouseChoice``。按店铺分组，**每店只算一次**择仓。
+
+    调用方本来就知道每个 SKU 属于哪个店（算价拿的是 CalcItem / SKU 快照），
+    所以这里收 ``sku_to_shop`` 而不是自己去查商品 —— 省一次批量查询。
+
+    ★ ``need``（``{sku_id: num}``）决定了"这一单要多少" —— **择仓是按整单判的**，
+      这正是"分开下单能解决货分散在不同仓"的原因。
+    ★ 没有可用仓的店铺，它的 SKU **不会出现在返回值里**；调用方按"这个商品没有发货仓"
+      处理（``trade`` 会拒单）。
+    ★ 同一个店的所有 SKU 一定拿到**同一个** choice —— 择仓只由（店铺, 收货区划, 整单数量）
+      决定，与 SKU 逐个无关。这正是"仓可以记在子单上"的依据。
+    """
+    if not sku_to_shop:
+        return {}
+    by_shop: dict[int, list[int]] = {}
+    for sku_id, shop_id in sku_to_shop.items():
+        by_shop.setdefault(int(shop_id), []).append(int(sku_id))
+
+    result: dict[int, WarehouseChoice] = {}
+    for shop_id, sku_ids in by_shop.items():
+        choice = await route_warehouse(
+            session,
+            shop_id=shop_id,
+            region_code=region_code,
+            need={sku_id: int(need[sku_id]) for sku_id in sku_ids if sku_id in need},
+        )
+        if choice.warehouse is None:
+            continue
+        for sku_id in sku_ids:
+            result[sku_id] = choice
+    return result
+
+
+def warehouses_of(choices: Mapping[int, WarehouseChoice]) -> dict[int, int]:
+    """把择仓结果压成 ``sku_id → warehouse_id`` —— 给 ``freight.estimate`` 用。
+
+    ★ 没盖住（``covered=False``）的也照样带上它**首个候选**的 id：算价仍要算出一个完整
+      的运费给买家看，是否可下单由 ``can_submit`` 单独说（失败文案也由 ``trade`` 统一给）。
+      该店没有仓的 SKU 不在返回值里，与改造前一致。
+    """
+    return {
+        int(sku_id): int(choice.warehouse.id)
+        for sku_id, choice in choices.items()
+        if choice.warehouse is not None
+    }
+
+
+async def default_warehouse_id(session: AsyncSession, shop_id: int) -> int | None:
+    """该店默认仓的 id（没有仓时 ``None``）。
+
+    给"迁移前的老订单"回退用：那些 ``order_sub.warehouse_id`` 为空，发货/回补要落一个仓。
+    ★ 回退到**默认仓**而不是重新路由 —— 默认仓是显式配置、不随区域规则变，
+      所以不会把退货退到一个当初根本没发货的仓。
+    """
+    warehouse = await repo.get_default_warehouse(session, shop_id)
+    return int(warehouse.id) if warehouse is not None else None
+
+
 async def ensure_stock_rows(session: AsyncSession, shop_id: int, warehouse_id: int) -> int:
-    """给该店铺**还没有库存记录**的 SKU 补一条 0 库存。返回新建条数。
+    """给该仓库**还没有库存记录**的 SKU 补一条 0 库存。返回新建条数。
 
-    ★ 为什么需要它：库存页是按 SKU 驱动的，而 ``adjust`` 要求库存记录已存在。
-    没有这一步，商家发布商品后在库存页看不到它，也就永远无法设置库存 ——
-    这是一个真实的可用性缺口，不是可有可无的便利。
+    ★ 两个调用点：**建仓时**（顺手铺好，商家只需去库存页填数量）、
+      **库存页**（`list_stock_out` 的 `sync_missing`，商家选哪个仓就补哪个仓）。
 
-    幂等：已经有记录（含 available=0 的）不会被覆盖，所以可以每次列表都调。
+    ★ **刻意不放在下单路径上。** 曾经想在"下单前给路由到的仓补这次要买的 SKU"，
+      但那跑在订单事务里：行不存在 → 预占必然失败 → 整个事务回滚 → 补出来的行也
+      一起没了。也就是说它**恰好在唯一需要它的场合不生效**，是死重。
+      真正的兜底是库存页那条（商家选仓时补齐）加上可操作的报错（见 trade 那边）。
+
+    幂等：已经有记录（含 available=0 的）不会被覆盖，所以可以反复调。
     """
     sku_ids = await product_service.list_shop_sku_ids(session, shop_id)
     if not sku_ids:
@@ -925,10 +1207,3 @@ async def batch_available(session: AsyncSession, sku_ids: Sequence[int]) -> dict
     不要把这个函数的返回值直接甩给前端 —— 那会把真实库存喂给爬虫。
     """
     return await repo.sum_available_by_skus(session, list(sku_ids))
-
-
-async def batch_sku_warehouses(
-    session: AsyncSession, sku_ids: Sequence[int]
-) -> dict[int, int]:
-    """批量取每个 SKU 的**发货仓**。运费按仓分组计算要用（docs/06 §5）。"""
-    return await repo.sku_warehouses(session, list(sku_ids))

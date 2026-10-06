@@ -1,22 +1,27 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
 import PromoStrip from '@/components/PromoStrip.vue'
 import ProfileEditDialog from '@/components/ProfileEditDialog.vue'
+import { accountBlockOf } from '@/api/errors'
 import { setUnauthorizedHandler } from '@/api/http'
+import { fetchSiteTheme } from '@/api/site'
+import { usePoll } from '@/composables/usePoll'
 import { useTheme } from '@/composables/useTheme'
 import { useAuthStore } from '@/stores/auth'
 import { useCartStore } from '@/stores/cart'
+import { useNotifyStore } from '@/stores/notify'
 import { ADMIN_APP_URL } from '@/utils/siblingApp'
 import { onImageError } from '@/utils/placeholder'
 
 const auth = useAuthStore()
 const cart = useCartStore()
+const notify = useNotifyStore()
 const router = useRouter()
 const route = useRoute()
-const { theme, themes, setTheme } = useTheme()
+const { applyServerSkin } = useTheme()
 const profileVisible = ref(false)
 
 /**
@@ -32,19 +37,62 @@ const backendEntry = computed(() => {
   return user.shopId ? { label: '去后台', url: ADMIN_APP_URL } : null
 })
 
-// 令牌失效时由 http 层回调：清状态并跳登录
-setUnauthorizedHandler(() => {
+/**
+ * 令牌失效时由 http 层回调：清状态并跳登录。
+ *
+ * ★ 传进来的 `blocked` 只在**账号被冻结 / 已注销**时才有值。这两种情况不能提示
+ *   「登录已过期，请重新登录」—— 重新登录不会成功，那是个死循环的指引。
+ *   把详情交给登录页的持久面板说清楚（见 `LoginView`）。
+ */
+setUnauthorizedHandler((blocked) => {
   auth.clearLocal()
   cart.reset()
-  ElMessage.warning('登录已过期，请重新登录')
+  notify.reset()
+  if (blocked) {
+    auth.setBlocked(accountBlockOf(blocked))
+  } else {
+    ElMessage.warning('登录已过期，请重新登录')
+  }
   void router.push({ name: 'login', query: { redirect: route.fullPath } })
 })
 
+/**
+ * 拉一次站点皮肤并应用。
+ *
+ * ★ 皮肤由**运营**在后台启用（后端一行配置），买家端没有切换器 ——
+ *   本地缓存只负责首屏不闪，真正的值以这里拉到的为准。
+ * ★ 失败就沿用缓存：这是纯视觉的事，拉不到不该影响任何功能，也不值得打扰用户。
+ */
+async function loadSiteSkin(): Promise<void> {
+  try {
+    applyServerSkin((await fetchSiteTheme()).skin)
+  } catch {
+    // 静默：沿用缓存里的皮肤
+  }
+}
+
 onMounted(async () => {
+  // 与 auth 并行、不等它 —— 主题早到晚到都不影响功能，排在 restore 前面
+  // 只会白白推迟登录态的恢复
+  void loadSiteSkin()
   await auth.restore()
   // 角标要在登录态恢复之后再拉，否则未登录时白跑一次
   await cart.refresh()
+  await notify.refresh()
 })
+
+/**
+ * 站内信角标：30 秒一轮（切到后台会停），另外**每次路由切换补一次** ——
+ * 用户刚在消息页点完「全部已读」回到商品页时，角标必须已经是新的。
+ *
+ * `immediate: false`：初次拉取交给上面 onMounted 里那次，它排在 `auth.restore()`
+ * 之后；轮询件如果自己在挂载时跑，会赶在恢复登录态之前拿着空令牌白跑一遍。
+ */
+usePoll(() => notify.refresh(), 30_000, { immediate: false })
+watch(
+  () => route.fullPath,
+  () => void notify.refresh(),
+)
 
 /** 昵称下拉：个人资料 / 退出登录 —— 和后台是同一套（菜单直接开弹窗，不跳页） */
 function onUserCommand(command: 'profile' | 'logout'): void {
@@ -58,6 +106,7 @@ function onUserCommand(command: 'profile' | 'logout'): void {
 async function onLogout(): Promise<void> {
   await auth.logout()
   cart.reset()
+  notify.reset()
   ElMessage.success('已退出登录')
   void router.push({ name: 'home' })
 }
@@ -82,27 +131,17 @@ async function onLogout(): Promise<void> {
           <RouterLink v-if="auth.isLoggedIn" to="/orders" class="nav-link">我的订单</RouterLink>
           <RouterLink v-if="auth.isLoggedIn" to="/reviews" class="nav-link">评价</RouterLink>
           <RouterLink v-if="auth.isLoggedIn" to="/refunds" class="nav-link">退款/售后</RouterLink>
+          <RouterLink v-if="auth.isLoggedIn" to="/support" class="nav-link">客服</RouterLink>
+          <RouterLink v-if="auth.isLoggedIn" to="/notifications" class="nav-link">
+            消息
+            <span v-if="notify.unread > 0" class="badge tnum">
+              {{ notify.unread > 99 ? '99+' : notify.unread }}
+            </span>
+          </RouterLink>
           <RouterLink v-if="auth.isLoggedIn" to="/account" class="nav-link">我的</RouterLink>
         </nav>
 
         <div class="spacer" />
-
-        <!-- 皮肤切换：只改 <html data-theme>，货架结构一点不动 -->
-        <div class="themes" role="group" aria-label="切换皮肤">
-          <button
-            v-for="t in themes"
-            :key="t.id"
-            type="button"
-            class="theme-btn"
-            :class="{ active: t.id === theme }"
-            :title="`切换到「${t.label}」皮肤`"
-            :aria-pressed="t.id === theme"
-            @click="setTheme(t.id)"
-          >
-            <span class="theme-dot" :style="{ background: t.swatch }" />
-            <span class="theme-label">{{ t.label }}</span>
-          </button>
-        </div>
 
         <div class="user">
           <template v-if="auth.isLoggedIn">
@@ -258,60 +297,6 @@ async function onLogout(): Promise<void> {
 
 .spacer {
   flex: 1;
-}
-
-/* ---------- 皮肤切换 ---------- */
-
-.themes {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-pill);
-  background: var(--color-bg-subtle);
-  flex: 0 0 auto;
-}
-
-.theme-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-1) var(--space-3);
-  border: none;
-  border-radius: var(--radius-pill);
-  background: transparent;
-  color: var(--color-text-secondary);
-  font-size: var(--text-xs);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-fast) var(--ease-out),
-    color var(--dur-fast) var(--ease-out);
-}
-
-.theme-btn:hover {
-  color: var(--color-text);
-}
-
-.theme-btn.active {
-  background: var(--color-bg-surface);
-  color: var(--color-text);
-  font-weight: var(--weight-medium);
-  box-shadow: var(--shadow-xs);
-}
-
-.theme-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: var(--radius-pill);
-  flex: 0 0 auto;
-}
-
-/* 窄屏只留色点，标签藏起来 */
-@media (max-width: 900px) {
-  .theme-label {
-    display: none;
-  }
 }
 
 /* ---------- 用户区 ---------- */

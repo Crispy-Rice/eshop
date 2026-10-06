@@ -31,6 +31,7 @@ from app.modules.inventory.models import Warehouse
 from app.modules.promotion import service as promotion_service
 from app.modules.promotion.models import (
     CALC_DIRECT,
+    COUPON_TYPE_FREIGHT,
     DISCOUNT_ITEM_PROMO,
     LEVEL_ITEM,
     SCOPE_ALL,
@@ -183,15 +184,17 @@ async def _make_address(client: AsyncClient, headers: dict) -> str:
     return resp.json()["data"]["id"]
 
 
-async def _make_coupon(*, threshold: int = 100, value: int = 2000) -> int:
-    """建一个平台券模板（长期有效、进行中）。"""
+async def _make_coupon(
+    *, threshold: int = 100, value: int = 2000, coupon_type: int = 1
+) -> int:
+    """建一个平台券模板（长期有效、进行中）。``coupon_type=5`` 是运费券。"""
     now = datetime.now(UTC)
     async with get_session_factory()() as s, s.begin():
         tpl = CouponTemplate(
             id=next_id(),
             shop_id=0,
             name="满1元减20",
-            type=1,
+            type=coupon_type,
             get_type=1,
             discount_value=value,
             threshold=threshold,
@@ -1361,6 +1364,17 @@ async def _sub_amounts(order_main_no: str) -> list[tuple]:
         return [tuple(r) for r in rows]
 
 
+async def _main_freight(order_main_no: str) -> int:
+    """母单运费。子单运费之和必须等于它（``_assert_conservation`` 的其中一条）。"""
+    async with get_session_factory()() as s:
+        return int(
+            await s.scalar(
+                text("SELECT freight_amount FROM trade.order_main WHERE order_main_no = :n"),
+                {"n": order_main_no},
+            )
+        )
+
+
 async def test_sub_amounts_aggregate_item_allocations(client: AsyncClient, session) -> None:
     """★ 子单应付 == 该子单**各行实付之和 + 子单运费**（每个子单都要成立）。
 
@@ -1388,6 +1402,49 @@ async def test_sub_amounts_aggregate_item_allocations(client: AsyncClient, sessi
             {"n": order["orderMainNo"]},
         )
     assert sum(r[2] for r in subs) == main_payable
+
+
+async def test_two_shop_freight_goes_to_each_shop(client: AsyncClient, session) -> None:
+    """★ 每个子单的运费 == **它自己那个包裹**的运费，不是按商品金额摊出来的。
+
+    两店各发各的包裹、各收一次首重（docs/06 §6）：甲店 2×199g 与乙店 1×199g 都落在
+    首重 1000g 内 → 两包**各 10 元**。按商品金额（2:1）摊会得到 13.64 / 6.36 —— 而退款
+    退的正是子单这个数（docs/06 §8），于是"实收 10 元"的店只退 6.36 元；母单总额却还是
+    平的，守恒断言（只校验 Σ 子单 == 母单）拦不住。
+    """
+    ctx = await _prepare_two_shops(client, session)
+    order = await _create_multi_order(client, ctx, idem="two-shop-freight")
+
+    subs = await _sub_amounts(order["orderMainNo"])
+    assert len(subs) == 2
+    freights = [row[1] for row in subs]
+    assert freights == [FREIGHT_FIRST, FREIGHT_FIRST], (
+        f"两个子单应各收自己包裹的首重 {FREIGHT_FIRST} 分，实际 {freights}"
+    )
+    assert sum(freights) == await _main_freight(order["orderMainNo"])
+
+
+async def test_freight_coupon_is_shared_by_shops_in_proportion(
+    client: AsyncClient, session
+) -> None:
+    """运费券在跨店单里按**各店自己的运费**比例分掉，总额仍严格守恒。
+
+    两包各 10 元、券减 5 元 → 1500 分按 1000:1000 分给两店 → 各 750 分。
+    """
+    ctx = await _prepare_two_shops(client, session)
+    tpl_id = await _make_coupon(threshold=0, value=500, coupon_type=COUPON_TYPE_FREIGHT)
+    coupon_id = await _receive_coupon(tpl_id, ctx["buyer_id"], "two-shop-freight-coupon")
+
+    order = await _create_multi_order(
+        client, ctx, coupon_ids=[coupon_id], idem="two-shop-freight-coupon"
+    )
+
+    subs = await _sub_amounts(order["orderMainNo"])
+    freights = [row[1] for row in subs]
+    main_freight = await _main_freight(order["orderMainNo"])
+    assert main_freight == 2 * FREIGHT_FIRST - 500
+    assert freights == [750, 750], freights
+    assert sum(freights) == main_freight
 
 
 # ============================================================

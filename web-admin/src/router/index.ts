@@ -37,6 +37,13 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
+    // 仓库管理：地址、覆盖区域、默认仓。发货仓路由按这里的配置走
+    path: '/warehouses',
+    name: 'warehouses',
+    component: () => import('@/views/WarehouseView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/orders',
     name: 'orders',
     component: () => import('@/views/OrderListView.vue'),
@@ -46,6 +53,13 @@ const routes: RouteRecordRaw[] = [
     path: '/aftersales',
     name: 'aftersales',
     component: () => import('@/views/AfterSaleView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    // 客服会话。商家看本店队列、平台运营看全部 —— 同一页按身份换端点
+    path: '/support',
+    name: 'support',
+    component: () => import('@/views/SupportView.vue'),
     meta: { requiresAuth: true },
   },
   {
@@ -73,6 +87,14 @@ const routes: RouteRecordRaw[] = [
     path: '/categories',
     name: 'categories',
     component: () => import('@/views/CategoryView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    // 运营专属：后端的 /api/admin/users 只放给 admin（不含 finance）——
+    // 财务能看营销数据，但不该能封人或重置密码
+    path: '/users',
+    name: 'users',
+    component: () => import('@/views/UserListView.vue'),
     meta: { requiresAuth: true },
   },
   {

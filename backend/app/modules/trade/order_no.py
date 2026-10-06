@@ -123,3 +123,10 @@ def build_refund_no(snowflake_id: int, *, now: datetime | None = None) -> str:
     now = now or datetime.now()
     body = f"{now:%Y%m%d}{snowflake_id % 10_000_000_000:010d}"
     return f"R{body}{luhn_check_digit(body)}"
+
+
+def build_ticket_no(snowflake_id: int, *, now: datetime | None = None) -> str:
+    """客服会话号。``T`` 前缀，同样与订单号同构。"""
+    now = now or datetime.now()
+    body = f"{now:%Y%m%d}{snowflake_id % 10_000_000_000:010d}"
+    return f"T{body}{luhn_check_digit(body)}"

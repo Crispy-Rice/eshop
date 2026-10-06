@@ -11,8 +11,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.snowflake import next_id
@@ -21,7 +22,9 @@ from app.modules.inventory.models import (
     SkuStock,
     StockFlow,
     Warehouse,
+    WarehouseRegionRule,
 )
+from app.modules.inventory.routing import region_level_of
 
 
 # ============================================================
@@ -52,36 +55,106 @@ async def get_default_warehouse(session: AsyncSession, shop_id: int) -> Warehous
 
 
 async def create_warehouse(
-    session: AsyncSession, shop_id: int, name: str, region_code: str
+    session: AsyncSession, shop_id: int, *, values: dict[str, Any]
 ) -> Warehouse:
     """建仓。**该店铺还没有仓库时自动设为默认仓**。
 
-    默认仓的意义：下单时不指定仓库就走它。第一期不实现多仓路由，
-    所以每个店铺必须有且只有一个默认仓。
+    "每店必有且仅有一个默认仓"是一条不变量（路由的兜底靠它），起点就在这一句：
+    第一个建出来的仓即默认仓；之后换默认要显式调 :func:`set_default_warehouse`
+    （默认仓不允许停用，见 service）。
     """
     has_any = await session.scalar(select(Warehouse.id).where(Warehouse.shop_id == shop_id))
     warehouse = Warehouse(
         id=next_id(),
         shop_id=shop_id,
-        name=name,
-        region_code=region_code,
         is_default=has_any is None,
         status=WAREHOUSE_ENABLED,
+        **values,
     )
     session.add(warehouse)
     await session.flush()
     return warehouse
 
 
-async def ensure_default_warehouse(session: AsyncSession, shop_id: int) -> Warehouse:
-    """取默认仓，没有就建一个。
+async def update_warehouse_fields(
+    session: AsyncSession, warehouse_id: int, values: dict[str, Any]
+) -> None:
+    if not values:
+        return
+    values["updated_at"] = func.now()
+    await session.execute(update(Warehouse).where(Warehouse.id == warehouse_id).values(**values))
 
-    库存页、调整接口都先调它 —— 商家不该为了调一次库存先去建仓库。
+
+async def set_default_warehouse(session: AsyncSession, shop_id: int, warehouse_id: int) -> None:
+    """换默认仓。**必须先摘掉旧的** —— ``uk_warehouse_default`` 是唯一索引，
+    同一店铺同时有两个 ``is_default`` 会直接撞约束（这也是它在结构上被保证的原因）。
     """
-    existing = await get_default_warehouse(session, shop_id)
-    if existing is not None:
-        return existing
-    return await create_warehouse(session, shop_id, "默认仓库", "")
+    await session.execute(
+        update(Warehouse)
+        .where(Warehouse.shop_id == shop_id, Warehouse.is_default.is_(True))
+        .values(is_default=False, updated_at=func.now())
+    )
+    await session.execute(
+        update(Warehouse)
+        .where(Warehouse.id == warehouse_id, Warehouse.shop_id == shop_id)
+        .values(is_default=True, updated_at=func.now())
+    )
+
+
+# ============================================================
+# 仓 → 覆盖区划
+# ============================================================
+async def list_region_rules(session: AsyncSession, shop_id: int) -> list[WarehouseRegionRule]:
+    """该店铺的全部区域规则。路由按店**批量**取，所以走 shop_id（有索引）。"""
+    result = await session.scalars(
+        select(WarehouseRegionRule)
+        .where(WarehouseRegionRule.shop_id == shop_id)
+        .order_by(WarehouseRegionRule.region_code)
+    )
+    return list(result)
+
+
+async def delete_region_rules_of_warehouse(session: AsyncSession, warehouse_id: int) -> None:
+    await session.execute(
+        delete(WarehouseRegionRule).where(WarehouseRegionRule.warehouse_id == warehouse_id)
+    )
+
+
+async def insert_region_rules(
+    session: AsyncSession, *, shop_id: int, warehouse_id: int, codes: Sequence[str]
+) -> None:
+    for code in codes:
+        session.add(
+            WarehouseRegionRule(
+                id=next_id(),
+                shop_id=shop_id,
+                warehouse_id=warehouse_id,
+                region_code=code,
+                region_level=region_level_of(code),
+            )
+        )
+    await session.flush()
+
+
+async def region_rule_owners(
+    session: AsyncSession, *, shop_id: int, codes: Sequence[str], exclude_warehouse_id: int
+) -> dict[str, int]:
+    """这些区划码**被别的仓**认领了哪些。用于整体替换前的冲突检查。
+
+    唯一键是 ``(shop_id, region_code)`` —— 一个地方只能由一个仓发货，
+    所以商家把某个区划配给第二个仓时必须先提示他"那儿已经归别人了"，
+    而不是丢一个数据库唯一约束错误给他。
+    """
+    if not codes:
+        return {}
+    rows = await session.execute(
+        select(WarehouseRegionRule.region_code, WarehouseRegionRule.warehouse_id).where(
+            WarehouseRegionRule.shop_id == shop_id,
+            WarehouseRegionRule.region_code.in_(list(codes)),
+            WarehouseRegionRule.warehouse_id != exclude_warehouse_id,
+        )
+    )
+    return {str(code): int(wh_id) for code, wh_id in rows}
 
 
 # ============================================================
@@ -151,24 +224,25 @@ async def sum_available_by_skus(
     return {int(sku_id): int(total) for sku_id, total in rows}
 
 
-async def sku_warehouses(session: AsyncSession, sku_ids: Sequence[int]) -> dict[int, int]:
-    """批量取每个 SKU 的**发货仓**。
+async def available_of(
+    session: AsyncSession, *, warehouse_ids: Sequence[int], sku_ids: Sequence[int]
+) -> dict[tuple[int, int], int]:
+    """批量取 ``(sku_id, warehouse_id) → available`` —— **按仓择仓**用（见 routing）。
 
-    运费按仓库分组计算，所以要先知道每个 SKU 从哪发（docs/06 §5）。
-    第一期每个 SKU 只在一个仓有库存记录，所以取第一条即可；
-    将来多仓铺货后，这里要改成"按库存量最大的仓"或引入仓路由策略。
+    ★ 与 `sum_available_by_skus` 的区别就是**不跨仓求和**：缺货兜底要问的是
+      "这个仓自己够不够"，而跨仓求和恰恰是这一轮要修掉的那个口径。
+    ★ **没有库存记录的组合不出现在结果里**，调用方用 ``.get((sku, wh), 0)`` ——
+      "没有那一行"的语义就是"这个仓没这个货"（`ensure_stock_rows` 只给商家打开过的
+      仓补行，所以新仓、没铺过货的仓天然是 0）。
     """
-    if not sku_ids:
+    if not sku_ids or not warehouse_ids:
         return {}
     rows = await session.execute(
-        select(SkuStock.sku_id, SkuStock.warehouse_id)
-        .where(SkuStock.sku_id.in_(sku_ids))
-        .order_by(SkuStock.sku_id, SkuStock.warehouse_id)
+        select(SkuStock.sku_id, SkuStock.warehouse_id, SkuStock.available).where(
+            SkuStock.sku_id.in_(sku_ids), SkuStock.warehouse_id.in_(warehouse_ids)
+        )
     )
-    result: dict[int, int] = {}
-    for sku_id, wh_id in rows:
-        result.setdefault(int(sku_id), int(wh_id))
-    return result
+    return {(int(sku_id), int(wh_id)): int(available) for sku_id, wh_id, available in rows}
 
 
 # ============================================================

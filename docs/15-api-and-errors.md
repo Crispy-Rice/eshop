@@ -109,10 +109,15 @@ class OrderOut(CamelModel):
 |---|---|---|---|
 | POST | `/api/auth/register` | 注册（手机号 + 密码，第一期不验证手机号真实性） | 公开 |
 | POST | `/api/auth/login` | 登录，返回 access/refresh token | 公开 |
-| POST | `/api/auth/refresh` | 刷新 access token | refresh token |
+| POST | `/api/auth/refresh` | 刷新 access token。★ 账号被冻结时回 **`ACCOUNT_BANNED`（403）而不是 401** —— 状态判断排在"令牌是否已吊销"之前，否则被封的人只会看到"登录已过期"（[18 §3](18-account.md)） | refresh token |
 | POST | `/api/auth/logout` | 吊销 refresh token | 登录 |
 | GET | `/api/me` | 当前用户信息、积分余额 | 登录 |
 | GET/POST/PUT/DELETE | `/api/me/addresses[/{id}]` | 收货地址 | 登录 |
+| PUT | `/api/me/password` | 改密码。**成功后吊销该账号全部 refresh token**（其它设备被登出），并给当前会话补发一对新 token —— 所以调用方要把返回的令牌写回本地 | 登录 |
+| POST | `/api/me/deactivate` | **注销账号**（不可恢复）。要带当前密码（没有短信验证码，这是唯一能证明"是本人"的手段）。先过三条守卫再匿名化，详见 [18](18-account.md) | 登录 |
+| GET | `/api/me/deactivation` | **注销前置检查**：`{canDeactivate, hasShop, orderCount, refundCount}`。★ 只报**事实**不拼文案 —— 前端要按被挡的那几项各给一个跳转按钮。它的存在是为了**别让用户白输一次密码**（[18 §5.1](18-account.md)） | 登录 |
+
+> 注销用 `POST /api/me/deactivate` 而不是 `DELETE /api/me`：注销是**状态变更**（账号行还在，只是被匿名化）不是删资源，而且它要带 body —— **DELETE 带 body 的语义在 RFC 里没有定义**，httpx 的 `client.delete()` 干脆不收 `json=`，中间层也可能把 body 丢掉（那会变成"空密码"的请求）。
 
 ### 2.1 商品
 
@@ -121,7 +126,7 @@ class OrderOut(CamelModel):
 | GET | `/api/spus/{spuId}` | SPU 详情（含 SKU 列表、规格） | - |
 | POST | `/api/skus/batch` | 批量查询 SKU（购物车/结算页用） | - |
 | GET | `/api/skus/{skuId}/stock` | 库存查询（展示用，档位化） | - |
-| GET | `/api/search?kw=&categoryId=&priceFrom=&priceTo=&sort=&cursor=` | 商品搜索（[02 §7](02-domain-model.md)） | - |
+| GET | `/api/search?kw=&categoryId=&shopId=&priceFrom=&priceTo=&sort=&cursor=` | 商品搜索。`shopId` 是**店铺页**的过滤：走与搜索完全相同的条件（含 `deleted` / 已上架），不另写查询；**不校验店铺是否存在**，查不到就是空列表（实体校验是店铺页自己的事） | - |
 | GET | `/api/categories` | 类目树 | - |
 | POST | `/api/files/images?biz=reviews\|aftersale\|products` | 上传图片，返回相对路径与可直用的 url | 登录，单张 ≤ 5MB |
 
@@ -150,7 +155,7 @@ class OrderOut(CamelModel):
 
 | 方法 | 路径 | 说明 | 幂等 |
 |---|---|---|---|
-| POST | `/api/checkout/calc` | ★ 算价（返回明细 + priceToken） | - |
+| POST | `/api/checkout/calc` | ★ 算价（明细 + 逐级优惠 + **`canSubmit`**）。★ 缺货**不会**让算价失败（用户可能只是想看看多少钱）——只把 `canSubmit` 置 `false` 并给一句能照着做的提示，前端据此禁用提交按钮 | - |
 | POST | `/api/checkout/coupons` | 可用券列表（含不可用原因） | - |
 | POST | `/api/orders` | ★ 提交订单 | ✅ `Idempotency-Key` + `uk_order_main_request` |
 | GET | `/api/orders/{orderMainNo}` | 订单详情（母单 + 子单） | - |
@@ -160,6 +165,18 @@ class OrderOut(CamelModel):
 | PUT | `/api/order-subs/{orderSubNo}/address` | 修改地址（未发货） | ✅ `Idempotency-Key` |
 
 #### POST /api/checkout/calc
+
+> ★ **下面这个示例是"当初的设计形状"，与当前实现不一致**：实现返回的是**扁平**的
+> `CalcPriceOut`（`items` / `discounts` / `totalAmount` / … / `freight` / `freightByShop`
+> / `notices` / `canSubmit`），
+> **没有** `shops` / `summary` 分组，请求里**也没有** `usePoints`（积分体系未实现）。
+> 更要注意：**没有 `priceToken`** —— 那套价格一致性校验尚未实现（[11](11-price-consistency.md)
+> 描述的是目标），所以 `PRICE_TOKEN_EXPIRED` / `INVALID_PRICE_TOKEN` 这两个码目前
+> **不会被抛出**。以 `app/modules/promotion/schemas.py` 为准。
+
+> `freightByShop` 是 `{shopId: 运费}`，`Σ == freight`（未选地址时为空对象）。
+> 它是**子单运费**的依据：跨店单里每个子单按它记账（退款退的就是这个数，
+> 见 [06 §6](06-freight.md)）。前端目前只展示合计，这个字段留给"分店显示运费"。
 
 **请求**：
 
@@ -446,6 +463,12 @@ Idempotency-Key: 9a8b7c6d-...
 | POST | `/api/merchant/freight/bind` | 把 SKU 绑到运费模板 |
 | GET | `/api/merchant/freight/templates/{id}/binds` | ★ 该模板绑了哪些 SKU。带商品标题/规格/仓库名（后端拼好）。**只有读，没有解绑** |
 | PUT | `/api/merchant/freight/templates/{id}/default` | 设为店铺默认模板（一店一条，设新的顶掉旧的）。未绑定模板的规格算运费时回落到它。**开店时系统已自动建了一条**，商家可改可换 |
+| GET/POST | `/api/merchant/warehouses` | 仓库列表（含每个仓覆盖的区划）/ 建仓（首个自动设为默认仓，并**给该店全部 SKU 在这个仓补 0 库存行**） |
+| PUT | `/api/merchant/warehouses/{id}` | 改仓：名称 / 地址 / 联系人（部分更新，地址传空串即清空该项） |
+| POST | `/api/merchant/warehouses/{id}/default` | 设为默认仓（路由的兜底：地址没命中任何区域规则时发它） |
+| POST | `/api/merchant/warehouses/{id}/status` | 启用 / 停用。**默认仓不允许停用**（停了就没兜底仓）；停用只影响新订单的路由 |
+| PUT | `/api/merchant/warehouses/{id}/regions` | 设置这个仓覆盖的发货区划（**整体替换**）。★ 一个区划只能由一个仓发货 —— 抢别人已占用的会拿到一条点名"哪个地区、归哪个仓"的 400 |
+| GET | `/api/merchant/inventory?warehouseId=&skuId=&cursor=` | 库存列表（按仓筛选）；会先为**还没有库存记录的 SKU 补 0 行** |
 | GET/POST | `/api/merchant/coupon-templates` | 店铺券（未实现） |
 | GET | `/api/merchant/orders?status=&cursor=` | 商家订单列表（`idx_order_sub_shop` 索引） |
 | POST | `/api/merchant/order-subs/{subNo}/ship` | 发货（填写快递公司与单号） |
@@ -476,6 +499,13 @@ Idempotency-Key: 9a8b7c6d-...
 | POST | `/api/admin/aftersales/{refundNo}/judge` | 平台裁决（未实现） |
 | GET | `/api/admin/reviews/audit-queue` | 评价审核队列（**两个互不相交的视图**）：默认 = 待审核（机审命中高风险词，先审后发）；`secondAuditOnly=true` = 待抽检（机审放行、先发后审，即 `status=已发布 ∧ need_second_audit`）。**这个参数必须写 alias**，否则前端传 camelCase 会被静默忽略 |
 | POST | `/api/admin/reviews/{reviewId}/audit` | 处置评价：APPROVE / REJECT / BLOCK / UNBLOCK。**会同步更新商品评分** |
+| GET | `/api/admin/users` | 用户列表（`status` 过滤 + `keyword` + 游标分页）。`keyword` 两种走法：11 位手机号走 `phone_hash` **精确匹配**（库里存的是 HMAC，没法 LIKE），否则按昵称模糊搜。手机号**只回掩码** |
+| GET | `/api/admin/users/{userId}` | 用户详情。★ 路径写成 `{user_id:int}` 是**必须的**：不然它会抢走 `/api/admin/users/lookup`（路径参数匹配任意单段，"lookup" 被当成 id 解析成整数 → 400） |
+| POST | `/api/admin/users/{userId}/ban` | 封禁（第一版**只禁登录**）。`reason` 必填且**会展示给被封的人**。登录与刷新立刻被拒、同时吊销其全部 refresh token；但**已签发的 access token 最长还能用 30 分钟** |
+| POST | `/api/admin/users/{userId}/unban` | 解封。**不恢复令牌**（重新登录即可）；已注销的账号解不了（终态） |
+| POST | `/api/admin/users/{userId}/reset-password` | 重置为随机临时口令，**只返回这一次**（库里只有哈希）；同时吊销该用户全部 refresh token |
+| PUT | `/api/admin/site-theme` | **设置全站皮肤**（`neutral` / `promo-618` / `promo-double11` / `promo-spring`）。保存后**立刻对所有人**生效；白名单外的值 → 400，不进库 |
+| PUT | `/api/admin/site-contact` | **设置平台客服联系方式**（邮箱 / 电话 / 服务时间）。**整行覆盖**：传空串或留空 = 取消配置那一项。空串 / 纯空格归一成 `null`；邮箱做粗校验（漏域名之类 → 400） |
 | GET | `/api/admin/reconcile/diffs` | 对账差异（finance，未实现） |
 | GET | `/api/admin/alerts` | 告警列表（对账异常、死信等，未实现） |
 | PUT | `/api/admin/switches/{name}` | 降级开关（未实现） |
@@ -501,6 +531,57 @@ async def owned_sub_order(order_sub_no: str, merchant: CurrentMerchant, session:
 @router.post("/api/merchant/order-subs/{order_sub_no}/ship")
 async def ship(body: ShipRequest, sub: Annotated[OrderSub, Depends(owned_sub_order)], ...): ...
 ```
+
+### 2.10 平台展示内容（公开）
+
+运营在后台配、买家端直接展示的东西。这几个读接口都**不需要登录** ——
+未登录用户浏览时也要看得到（与评价列表同理，见 §4）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/banners` | 首页轮播图。只返回启用中的，按 `sort`、`id` 升序 |
+| GET | `/api/site-theme` | 当前**站点皮肤** + 可选清单 `options`。皮肤由**运营**启用、全站生效（[17 §3](17-frontend-design-system.md)）；`options` 供后台的选择器用 —— 皮肤清单只存在后端一处 |
+| GET | `/api/site-contact` | **平台客服联系方式**（客服邮箱 / 电话 / 服务时间）。三项都可能是 `null` = 未配置。★ 它必须是公开的：展示位置是**登录页**与**账号被冻结的提示**，而需要联系平台的人恰恰**还没登录**（[18 §7](18-account.md)） |
+| GET | `/api/promotions/active` | **进行中的平台级活动**，最快结束的排最前。返回 `{items, total}` —— `items` 最多 `ACTIVE_ACTIVITY_LIMIT`(5) 条，**`total` 是真实条数**（"还有 N 个活动进行中"必须拿它算，不能用 `items.length`）。买家端顶部公告读它；★ **只播平台级** —— 店铺级/单品级活动的名字是**商家**起的，播到全站公告上等于平台替商家打广告。一条都没有就返回 `{items: [], total: 0}`（前端整条不渲染） |
+
+> `GET /api/promotions/active` 同时按 `status = 2` 与时间窗过滤。代价是**刚开场的
+> 活动最多晚一分钟**出现在公告上（`status` 由每分钟一次的 cron 推进）。
+> 买家端还会把 `items` 里的活动名与结束日拼成整条公告带的**悬停提示** ——
+> 公告带只放得下一条标题，其余的活动原本只是一个数字，用户看不到是什么。
+
+### 2.11 客服与站内信
+
+界面与取舍见 [19-support.md](19-support.md)。三组端点分别对应买家 / 商家 / 平台，
+**守卫与其它模块一致**：买家 `CurrentUserDep`、商家 `CurrentShopIdDep`（按**店铺归属**，
+不看 role）、平台 `require_role("admin")`。
+
+| 方法 | 路径 | 身份 | 说明 |
+|---|---|---|---|
+| POST | `/api/support/tickets` | 买家 | 开会话。**已有进行中的会话就把那一条还给你**（不是报错）；不带 `shopId` = 平台级。**首条消息另发** |
+| GET | `/api/support/tickets` | 买家 | 我的会话（keyset 游标 `cursor` / `limit`） |
+| GET | `/api/support/tickets/{no}` | 买家 | 详情 + 最近一页消息（最多 50 条）。`?before=<消息id>` 往前翻 |
+| POST | `/api/support/tickets/{no}/messages` | 买家 | 发消息。会话已关闭时**重开同一条** |
+| POST | `/api/support/tickets/{no}/close` | 买家 | 结束会话（重复调用**不报错**） |
+| GET | `/api/merchant/support/tickets` | 商家 | 本店队列。`pendingOnly=true` 只看「待回复」 |
+| GET | `/api/merchant/support/pending-count` | 商家 | 待回复条数（后台导航角标） |
+| GET | `/api/merchant/support/tickets/{no}` | 商家 | 详情 |
+| POST | `/api/merchant/support/tickets/{no}/messages` | 商家 | 回复。**同事务**给买家写一条站内信 |
+| POST | `/api/merchant/support/tickets/{no}/close` | 商家 | 结束会话 |
+| GET | `/api/admin/support/tickets` | 平台 | 全部会话，可加 `shopId`（`0` = 平台级）/ `status` / `pendingOnly` |
+| GET | `/api/admin/support/pending-count` | 平台 | 待回复条数（含全部店铺与平台级） |
+| GET | `/api/admin/support/tickets/{no}` | 平台 | 详情 |
+| POST | `/api/admin/support/tickets/{no}/messages` | 平台 | 介入发言 |
+| POST | `/api/admin/support/tickets/{no}/close` | 平台 | 结束会话 |
+| GET | `/api/notifications` | 买家 | 我的站内信（`unreadOnly` / `cursor` / `limit`） |
+| GET | `/api/notifications/unread-count` | 买家 | 未读数（商城导航角标） |
+| POST | `/api/notifications/{id}/read` · `/read-all` | 买家 | 标记已读 |
+
+**几条刻意的约定**（理由见 [19 §5](19-support.md)）：
+
+- **归属不对一律 404，不是 403** —— 不区分"不存在"与"不是你的"，否则可被用来遍历探测会话号。
+- **没有 `/read` 端点**：读游标由「打开详情」与「发消息」推进。
+- **发消息不要求 `Idempotency-Key`**：聊天消息天然可重复，没有资金动作要护住。
+- 客服台显示的是买家**打码手机号**（`phone_decrypt` 至今无生产调用点）。
 
 ## 3. 错误码
 
@@ -553,6 +634,12 @@ class ErrorCode(StrEnum):
 | `RATE_LIMITED` | 429 | 请求过于频繁 | 提示稍后再试 |
 | `INTERNAL_ERROR` | 500 | 系统错误 | 提示"系统繁忙"，展示 `requestId`，**不展示技术细节** |
 | `SYSTEM_BUSY` | 503 | 服务降级中 | 提示"活动火爆，请稍后" |
+| **账号状态** | | | |
+| `ACCOUNT_BANNED` | 403 | 账号被冻结（**买家文案用「冻结」，运营后台仍旧叫「封禁」**）。`message` 是一句完整的话（理由放在括号里），理由另走 `data.reason` 结构化下发 | 前端渲染成**持久面板**（标题 / 原因 / 联系方式），**不是 toast**；联系方式来自 `GET /api/site-contact`（[18 §7](18-account.md)）。★ 令牌续期被拒时也是这个码，不能提示"登录已过期" |
+| `ACCOUNT_CLOSED` | 403 | 账号已注销 | 自助操作（改密/注销）时提示；**登录时不回这个码**（见下） |
+| `PHONE_IN_COOLDOWN` | 409 | 手机号注销未满 30 天 | 提示可以重新注册的日期 |
+| `ACCOUNT_HAS_UNFINISHED` | 409 | 还有未完成的订单 / 售后，不能注销 | 提示数量，引导去处理 |
+| `SHOP_OWNER_CANNOT_DEACTIVATE` | 409 | 名下有店铺，不能自助注销 | 提示先处理店铺 |
 | **幂等** | | | |
 | `REQUEST_PROCESSING` | 409 | 请求处理中 | 等待 2s 后用同一个 key 重试 |
 | **价格一致性** | | | |
@@ -609,6 +696,8 @@ class ErrorCode(StrEnum):
 | **文件上传** | | | |
 | `INVALID_IMAGE` | 422 | 图片格式不支持或已损坏 | 提示重新选择 |
 | `IMAGE_TOO_LARGE` | 413 | 图片体积超过限制 | 提示压缩后再传 |
+| **客服** | | | |
+| `SUPPORT_RATE_LIMITED` | 429 | 发送太频繁，请稍后再试 | 提示稍后再发（60 秒内最多 20 条） |
 
 ### 3.3 错误响应的安全原则
 

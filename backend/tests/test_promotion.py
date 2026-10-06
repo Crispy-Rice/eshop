@@ -45,6 +45,7 @@ from app.modules.promotion.models import (
     CouponTemplate,
     PromoActivity,
 )
+from app.modules.promotion.router import ACTIVE_ACTIVITY_LIMIT
 from app.modules.promotion.tasks import refresh_promo_status
 from tests.conftest import auth_header, make_admin, open_shop, register
 
@@ -1668,3 +1669,270 @@ async def test_void_coupon_template_stops_claiming_but_keeps_issued(
     twice = await _void(client, h, f"/api/admin/coupons/templates/{tpl_id}/void")
     assert twice.status_code == 400, twice.text
     assert "已经作废" in twice.json()["message"]
+
+
+# ============================================================
+# 站点主题（运营启用、全站生效）
+# ============================================================
+async def test_site_theme_defaults_to_neutral_with_options(client: AsyncClient, session) -> None:
+    """公开接口：默认中性皮肤，并**一并下发可选清单**（后台选择器用它，省一份清单）。"""
+    resp = await client.get("/api/site-theme")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["skin"] == "neutral"
+    assert [o["value"] for o in data["options"]] == [
+        "neutral",
+        "promo-618",
+        "promo-double11",
+        "promo-spring",
+    ]
+    assert all(o["label"] for o in data["options"]), "每个选项都要有人看的名字"
+
+
+async def test_site_theme_update_is_immediately_public(client: AsyncClient, session) -> None:
+    """运营改完，公开接口立刻跟着变 —— 买家端下次加载就读到新皮肤。"""
+    admin = await make_admin(client, session)
+    h = auth_header(admin["accessToken"])
+
+    resp = await client.put("/api/admin/site-theme", json={"skin": "promo-618"}, headers=h)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["skin"] == "promo-618"
+
+    assert (await client.get("/api/site-theme")).json()["data"]["skin"] == "promo-618"
+    async with get_session_factory()() as s:
+        assert await s.scalar(text("SELECT skin FROM promotion.site_theme")) == "promo-618"
+
+
+@pytest.mark.parametrize("skin", ["promo-nope", "", "NEUTRAL", "618"])
+async def test_site_theme_rejects_unknown_skin(
+    client: AsyncClient, session, skin: str
+) -> None:
+    """白名单外的值在 Pydantic 那层被挡下（400），一个字都不会进库。"""
+    admin = await make_admin(client, session)
+    resp = await client.put(
+        "/api/admin/site-theme", json={"skin": skin}, headers=auth_header(admin["accessToken"])
+    )
+    assert resp.status_code == 400, f"{skin!r} 该被拒：{resp.text}"
+    assert (await client.get("/api/site-theme")).json()["data"]["skin"] == "neutral"
+
+
+async def test_site_theme_write_requires_admin(client: AsyncClient, session) -> None:
+    """买家改不了全站皮肤（公开读、运营写）。"""
+    buyer = await register(client, phone=BUYER_PHONE)
+    resp = await client.put(
+        "/api/admin/site-theme",
+        json={"skin": "promo-618"},
+        headers=auth_header(buyer["accessToken"]),
+    )
+    assert resp.status_code == 403
+
+
+# ============================================================
+# 客服联系方式（运营填、公开可读）
+# ============================================================
+async def test_site_contact_defaults_to_unconfigured(client: AsyncClient) -> None:
+    """默认**三项全空**。
+
+    ★ 是 ``null`` 而不是空字符串：未配置要是一个**可判断的状态** —— 买家端据此
+      只展示真正填了的项，一项都没有就不承诺一个不存在的渠道。
+    """
+    resp = await client.get("/api/site-contact")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == {
+        "serviceEmail": None,
+        "servicePhone": None,
+        "serviceHours": None,
+    }
+
+
+async def test_site_contact_update_is_immediately_public(client: AsyncClient, session) -> None:
+    """运营存完，公开接口立刻读得到 —— 买家端不必等任何缓存过期。
+
+    ★ 这条同时是"更新真的落库了"的回归测试：单行配置如果被误加进测试清理的
+      TRUNCATE 列表，UPDATE 会命中 0 行、接口却照样回 200（见 conftest 的说明）。
+      断言直查数据库，就是为了让那种静默失效当场暴露。
+    """
+    admin = await make_admin(client, session)
+    h = auth_header(admin["accessToken"])
+
+    resp = await client.put(
+        "/api/admin/site-contact",
+        json={
+            "serviceEmail": "kf@eshop.test",
+            "servicePhone": "400-000-1234",
+            "serviceHours": "工作日 9:00-18:00",
+        },
+        headers=h,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["serviceEmail"] == "kf@eshop.test"
+
+    public = (await client.get("/api/site-contact")).json()["data"]
+    assert public["servicePhone"] == "400-000-1234"
+    assert public["serviceHours"] == "工作日 9:00-18:00"
+
+    async with get_session_factory()() as s:
+        stored = await s.scalar(text("SELECT service_email FROM promotion.site_contact WHERE id = 1"))
+    assert stored == "kf@eshop.test"
+
+
+async def test_site_contact_blank_clears_and_overwrites(client: AsyncClient, session) -> None:
+    """传空串 = **取消配置那一项**；且整行覆盖（没传的项也一并清掉）。
+
+    这正是接口不做"部分更新"的原因：运营得删得掉一条填错的值。
+    另外顺便验证**纯空格**也算空 —— 否则运营敲个空格还以为清掉了。
+    """
+    admin = await make_admin(client, session)
+    h = auth_header(admin["accessToken"])
+    await client.put(
+        "/api/admin/site-contact",
+        json={"serviceEmail": "kf@eshop.test", "servicePhone": "400-000-1234"},
+        headers=h,
+    )
+
+    resp = await client.put("/api/admin/site-contact", json={"serviceEmail": "   "}, headers=h)
+    assert resp.json()["data"] == {
+        "serviceEmail": None,
+        "servicePhone": None,
+        "serviceHours": None,
+    }
+    async with get_session_factory()() as s:
+        row = (
+            await s.execute(
+                text(
+                    "SELECT service_email, service_phone FROM promotion.site_contact WHERE id = 1"
+                )
+            )
+        ).one()
+    assert row == (None, None)
+
+
+@pytest.mark.parametrize("bad", ["kf@eshop", "kf eshop@x.com", "@eshop.test", "kf@"])
+async def test_site_contact_rejects_bad_email(
+    client: AsyncClient, session, bad: str
+) -> None:
+    """邮箱只做**粗校验**：漏域名、把 @ 打成空格这类手误要挡在库外。
+
+    ★ 不求完备 —— 一个邮箱到底能不能收到信只有发一封才知道。但"没配"和"配了一个
+      收不到的信箱"对用户来说后果一样，所以明显的手误必须先拦下来。
+    """
+    admin = await make_admin(client, session)
+    resp = await client.put(
+        "/api/admin/site-contact",
+        json={"serviceEmail": bad},
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert resp.status_code == 400, f"{bad!r} 该被拒：{resp.text}"
+
+
+async def test_site_contact_write_requires_admin(client: AsyncClient, session) -> None:
+    """买家改不了平台联系方式（公开读、运营写）。"""
+    buyer = await register(client, phone=BUYER_PHONE)
+    resp = await client.put(
+        "/api/admin/site-contact",
+        json={"serviceEmail": "hacker@evil.test"},
+        headers=auth_header(buyer["accessToken"]),
+    )
+    assert resp.status_code == 403
+
+
+# ============================================================
+# 进行中的活动（买家端顶部公告）
+# ============================================================
+async def test_active_promotions_only_platform_and_ongoing(
+    client: AsyncClient, session
+) -> None:
+    """★ 公告**只播平台级、只播正在进行**的活动。
+
+    店铺级活动的名字是**商家**起的，播到全站公告上等于平台替商家打广告 ——
+    所以它必须被过滤掉，哪怕它正在进行。
+    """
+    admin = await make_admin(client, session)
+    h = auth_header(admin["accessToken"])
+
+    async def post(level: int, atype: str, name: str, starts_in: timedelta, ends_in: timedelta):
+        resp = await _post_activity(
+            client,
+            h,
+            level=level,
+            atype=atype,
+            calc_type=CALC_DIRECT,
+            name=name,
+            starts_in=starts_in,
+            ends_in=ends_in,
+        )
+        assert resp.status_code == 200, resp.text
+
+    await post(LEVEL_PLATFORM, DISCOUNT_PLATFORM_PROMO, "全平台直降", -timedelta(hours=1), timedelta(days=3))
+    await post(LEVEL_PLATFORM, DISCOUNT_PLATFORM_PROMO, "还没开始", timedelta(days=1), timedelta(days=3))
+    await post(LEVEL_PLATFORM, DISCOUNT_PLATFORM_PROMO, "已经结束", -timedelta(days=3), -timedelta(days=1))
+    await post(LEVEL_SHOP, DISCOUNT_SHOP_PROMO, "本店满减", -timedelta(hours=1), timedelta(days=3))
+
+    resp = await client.get("/api/promotions/active")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    rows = data["items"]
+    assert [r["name"] for r in rows] == ["全平台直降"]
+    assert rows[0]["level"] == LEVEL_PLATFORM
+    assert rows[0]["endAt"]
+    assert data["total"] == 1
+
+
+async def test_active_promotions_sorted_by_end_at(client: AsyncClient, session) -> None:
+    """最快结束的排最前 —— 公告要先说最紧急的那件。"""
+    admin = await make_admin(client, session)
+    h = auth_header(admin["accessToken"])
+    for name, ends_in in (("慢的", timedelta(days=5)), ("快的", timedelta(days=1))):
+        resp = await _post_activity(
+            client,
+            h,
+            level=LEVEL_PLATFORM,
+            atype=DISCOUNT_PLATFORM_PROMO,
+            calc_type=CALC_DIRECT,
+            name=name,
+            starts_in=-timedelta(hours=1),
+            ends_in=ends_in,
+        )
+        assert resp.status_code == 200, resp.text
+
+    data = (await client.get("/api/promotions/active")).json()["data"]
+    assert [r["name"] for r in data["items"]] == ["快的", "慢的"]
+
+
+async def test_active_promotions_total_counts_beyond_the_cap(
+    client: AsyncClient, session
+) -> None:
+    """活动数超过上限时，``total`` 仍是**真实条数**，不能等于 ``len(items)``。
+
+    ★ 这条盯的是一个具体的错误算法：公告带写的是"还有 N 个活动进行中"，
+      如果 N 用**截断后**的列表长度去算，超出的活动就既看不到、也不计数 ——
+      7 个进行中会显示成"还有 4 个"，凭空少了两个。
+    """
+    admin = await make_admin(client, session)
+    h = auth_header(admin["accessToken"])
+    overflow = 2
+    for i in range(ACTIVE_ACTIVITY_LIMIT + overflow):
+        resp = await _post_activity(
+            client,
+            h,
+            level=LEVEL_PLATFORM,
+            atype=DISCOUNT_PLATFORM_PROMO,
+            calc_type=CALC_DIRECT,
+            name=f"活动{i}",
+            starts_in=-timedelta(hours=1),
+            ends_in=timedelta(days=i + 1),
+        )
+        assert resp.status_code == 200, resp.text
+
+    data = (await client.get("/api/promotions/active")).json()["data"]
+    assert len(data["items"]) == ACTIVE_ACTIVITY_LIMIT
+    assert data["total"] == ACTIVE_ACTIVITY_LIMIT + overflow
+
+
+async def test_active_promotions_empty_when_nothing_running(
+    client: AsyncClient, session
+) -> None:
+    """没有进行中的活动 → **空列表 + total 0**（买家端据此整条不渲染，而不是显示一句空话）。"""
+    resp = await client.get("/api/promotions/active")
+    assert resp.status_code == 200
+    assert resp.json()["data"] == {"items": [], "total": 0}

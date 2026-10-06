@@ -254,6 +254,10 @@ CREATE TABLE trade.order_sub (
   -- 履约
   delivery_status   SMALLINT     NOT NULL DEFAULT 0, -- 0未发货 1部分发货 2全部发货 3已签收
   delivery_count    INT          NOT NULL DEFAULT 0,
+  -- ★ 下单时按收货区划**路由**到的发货仓（见 03 §12）。可空：迁移前的历史行为 NULL，
+  --   代码回退到该店默认仓。**发货、支付确认、关单回补、售后退款回补都读它** ——
+  --   不再重新路由，否则商家改了区域规则就会"从 A 仓预占、往 B 仓回补"。
+  warehouse_id      BIGINT,
   -- 售后
   has_aftersale     BOOLEAN      NOT NULL DEFAULT false, -- 是否有进行中的售后
   can_aftersale     BOOLEAN      NOT NULL DEFAULT true,  -- 是否可申请售后

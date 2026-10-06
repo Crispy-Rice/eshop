@@ -55,6 +55,17 @@ async def insert_order(session: AsyncSession, order: RefundOrder) -> RefundOrder
     return order
 
 
+async def count_user_open_refunds(session: AsyncSession, user_id: int) -> int:
+    """该用户还有多少笔进行中的售后。账号注销的前置守卫用（见 service）。"""
+    return (
+        await session.scalar(
+            select(func.count())
+            .select_from(RefundOrder)
+            .where(RefundOrder.user_id == user_id, RefundOrder.status.in_(ACTIVE_STATUSES))
+        )
+    ) or 0
+
+
 async def insert_items(session: AsyncSession, items: list[RefundItem]) -> None:
     session.add_all(items)
     await session.flush()

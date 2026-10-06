@@ -45,6 +45,11 @@ from app.main import app  # noqa: E402
 # 每个用例前清空的表（TRUNCATE ... CASCADE 会自动处理外键顺序）
 _TRUNCATE = (
     "ops.alert",
+    # 客服会话与站内信（support 的表引用自己的 ticket_no，CASCADE 会处理顺序）
+    "support.ticket_state_flow",
+    "support.ticket_message",
+    "support.ticket",
+    "notify.site_message",
     "review.review_reply",
     "review.review",
     "aftersale.refund_item",
@@ -82,6 +87,7 @@ _TRUNCATE = (
     "product.sku",
     "product.spu",
     "product.category",
+    "account.user_state_flow",
     "account.user_address",
     "account.shop_member",
     "account.shop",
@@ -117,6 +123,17 @@ async def clean_tables(app_runtime: None) -> AsyncIterator[None]:
     """每个用例前清空数据，保证用例之间互不影响。"""
     async with get_session_factory()() as session, session.begin():
         await session.execute(text(f"TRUNCATE {', '.join(_TRUNCATE)} CASCADE"))
+        # ★ 两张**单行配置**（promotion.site_theme / promotion.site_contact）刻意都不进
+        #   _TRUNCATE —— 那两行是迁移插进去的，删掉之后 UPDATE 就会影响 0 行，
+        #   "改皮肤"和"存联系方式"都会**静默失效**（接口回 200，库里没变）。
+        #   用例之间要的是**复位**，不是清空。
+        await session.execute(text("UPDATE promotion.site_theme SET skin = 'neutral'"))
+        await session.execute(
+            text(
+                "UPDATE promotion.site_contact"
+                " SET service_email = NULL, service_phone = NULL, service_hours = NULL"
+            )
+        )
     yield
 
 

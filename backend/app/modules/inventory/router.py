@@ -18,13 +18,18 @@ from app.core.response import ApiResponse
 from app.modules.account.deps import CurrentShopIdDep
 from app.modules.inventory import service
 from app.modules.inventory.schemas import (
+    RegionRuleOut,
+    RegionRulesReplaceRequest,
     SkuStockDisplayOut,
     StockAdjustOut,
     StockAdjustRequest,
     StockFlowListOut,
     StockListOut,
+    WarehouseCreatedOut,
     WarehouseCreateRequest,
     WarehouseOut,
+    WarehouseStatusRequest,
+    WarehouseUpdateRequest,
 )
 
 router = APIRouter()
@@ -51,7 +56,7 @@ async def sku_stock(session: DbSession, sku_id: int) -> ApiResponse[SkuStockDisp
 @router.get(
     "/api/merchant/warehouses",
     response_model=ApiResponse[list[WarehouseOut]],
-    summary="仓库列表",
+    summary="仓库列表（含每个仓覆盖的区划）",
 )
 async def list_warehouses(
     session: DbSession, shop_id: CurrentShopIdDep
@@ -61,15 +66,91 @@ async def list_warehouses(
 
 @router.post(
     "/api/merchant/warehouses",
-    response_model=ApiResponse[WarehouseOut],
+    response_model=ApiResponse[WarehouseCreatedOut],
     summary="新建仓库（首个自动设为默认仓）",
 )
 async def create_warehouse(
     session: DbSession,
     body: WarehouseCreateRequest,
     shop_id: CurrentShopIdDep,
-) -> ApiResponse[WarehouseOut]:
+) -> ApiResponse[WarehouseCreatedOut]:
+    """建仓。★ 会**顺手给该店全部 SKU 在这个仓补 0 库存行**，返回值里的
+    ``stockedSkus`` 就是补了多少条 —— 下一步该去库存页填数量。
+    """
     return ApiResponse.ok(await service.create_warehouse(session, shop_id, body))
+
+
+@router.put(
+    "/api/merchant/warehouses/{warehouse_id}",
+    response_model=ApiResponse[WarehouseOut],
+    summary="改仓库（名称 / 地址 / 联系人）",
+)
+async def update_warehouse(
+    session: DbSession,
+    body: WarehouseUpdateRequest,
+    warehouse_id: int,
+    shop_id: CurrentShopIdDep,
+) -> ApiResponse[WarehouseOut]:
+    """部分更新：只写传了的字段。地址字段传空串表示**清空**那一项。"""
+    return ApiResponse.ok(await service.update_warehouse(session, shop_id, warehouse_id, body))
+
+
+@router.post(
+    "/api/merchant/warehouses/{warehouse_id}/default",
+    response_model=ApiResponse[WarehouseOut],
+    summary="设为默认仓",
+)
+async def set_warehouse_default(
+    session: DbSession, warehouse_id: int, shop_id: CurrentShopIdDep
+) -> ApiResponse[WarehouseOut]:
+    """默认仓是路由的**兜底**：收货地址没命中任何区域规则时发它。
+
+    ★ 换默认仓会**先摘掉旧的**，因为 ``uk_warehouse_default`` 是唯一索引 ——
+      同一店铺同时有两个默认仓会直接撞约束。
+    """
+    return ApiResponse.ok(await service.set_warehouse_default(session, shop_id, warehouse_id))
+
+
+@router.post(
+    "/api/merchant/warehouses/{warehouse_id}/status",
+    response_model=ApiResponse[WarehouseOut],
+    summary="启用 / 停用仓库",
+)
+async def set_warehouse_status(
+    session: DbSession,
+    body: WarehouseStatusRequest,
+    warehouse_id: int,
+    shop_id: CurrentShopIdDep,
+) -> ApiResponse[WarehouseOut]:
+    """停用只影响**新订单**的路由；历史订单落在这个仓的照常发货、售后照常回补。
+
+    ★ **默认仓不允许停用** —— 停了它这个店就没有兜底仓了。
+    """
+    return ApiResponse.ok(
+        await service.set_warehouse_status(session, shop_id, warehouse_id, body.status)
+    )
+
+
+@router.put(
+    "/api/merchant/warehouses/{warehouse_id}/regions",
+    response_model=ApiResponse[list[RegionRuleOut]],
+    summary="设置仓库覆盖的发货区划（整体替换）",
+)
+async def replace_warehouse_regions(
+    session: DbSession,
+    body: RegionRulesReplaceRequest,
+    warehouse_id: int,
+    shop_id: CurrentShopIdDep,
+) -> ApiResponse[list[RegionRuleOut]]:
+    """整体替换：提交什么就是什么。
+
+    ★ 唯一键是 ``(shop_id, region_code)`` —— 一个地方只能由一个仓发货。提交了已被
+      别的仓占用的区划会拿到一条说明**是哪个地区、现在归哪个仓**的 400，而不是
+      数据库唯一约束错误。
+    """
+    return ApiResponse.ok(
+        await service.replace_region_rules(session, shop_id, warehouse_id, body.rules)
+    )
 
 
 # ============================================================

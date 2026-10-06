@@ -123,6 +123,19 @@ class UserRole(StrEnum):
     FINANCE = "finance"
 
 
+class UserStatus(IntEnum):
+    """账号状态（``account/models.py`` 的 ``User.status``）。
+
+    ★ 2 与 3 的**唯一写入口**是 ``account/service`` 的 ``ban_user`` /
+      ``unban_user`` / ``close_account`` —— 它们同时负责吊销令牌与写审计流水。
+      别在别处直接改 status，否则登录拦截与审计会对不上。
+    """
+
+    NORMAL = 1
+    BANNED = 2
+    CLOSED = 3
+
+
 class OperatorType(IntEnum):
     """状态流水的操作者类型（docs/07 §4.5）。"""
 
@@ -130,3 +143,37 @@ class OperatorType(IntEnum):
     MERCHANT = 2
     SYSTEM = 3
     PLATFORM = 4
+
+
+class TicketStatus(IntEnum):
+    """客服会话状态（docs/19 §2）。
+
+    ★ **只有两个状态**。"欠谁一个回复"由 ``ticket.last_sender_type`` 推出来，
+      不另存一列 —— 少一列状态 = 少一处能不一致的地方。
+      （``RefundStatus`` 存 ``source_status`` 是因为拒绝时要回到**原状态**，
+      客服没有这个需求，所以不学它。）
+    """
+
+    OPEN = 10
+    CLOSED = 30
+
+
+class SiteMsgType(StrEnum):
+    """站内信类型（``notify.site_message.msg_type``）。
+
+    前三个由 outbox 的投递循环落库，``SUPPORT_REPLY`` 由客服回复时同事务直写。
+    """
+
+    ORDER_CLOSED = "ORDER_CLOSED"
+    ORDER_PAID = "ORDER_PAID"
+    REFUND_SUCCEEDED = "REFUND_SUCCEEDED"
+    SUPPORT_REPLY = "SUPPORT_REPLY"
+
+
+class MsgLinkType(StrEnum):
+    """站内信点进去跳哪。``NONE`` = 纯文本，前端不渲染跳转。"""
+
+    NONE = "NONE"
+    ORDER = "ORDER"
+    REFUND = "REFUND"
+    TICKET = "TICKET"

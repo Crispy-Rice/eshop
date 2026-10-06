@@ -50,6 +50,11 @@ ORDER_CLOSED = 50
 ORDER_REFUNDING = 60
 ORDER_REFUNDED = 70
 
+# "还没走完"的母单状态：待付款 / 待发货 / 待收货 / 退款中。
+# 给账号注销做前置守卫用 —— 有这些单子在途时不允许注销（见 account/router.py）。
+# 40 已完成、50 已关闭、70 已退款都不算，它们是终态。
+BLOCKING_ORDER_STATUSES = (ORDER_WAIT_PAY, ORDER_WAIT_DELIVER, ORDER_WAIT_RECEIVE, ORDER_REFUNDING)
+
 STATUS_TEXT: dict[int, str] = {
     ORDER_WAIT_PAY: "待付款",
     ORDER_WAIT_DELIVER: "待发货",
@@ -238,6 +243,12 @@ class OrderSub(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="冗余，便于按用户查")
     shop_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     shop_name_snap: Mapped[str] = mapped_column(String(64), nullable=False, comment="店铺名快照")
+    # ★ 下单时**路由**到的发货仓。**发货与售后都读它**，不再重新路由 ——
+    #   商家事后改了区域规则，不能让在途订单的退货入错仓（见 inventory/routing.py）。
+    #   历史行由迁移回填成该店默认仓；仍未空的由代码回退默认仓。
+    warehouse_id: Mapped[int | None] = mapped_column(
+        BigInteger, comment="下单时路由到的发货仓；发货与售后读它"
+    )
 
     total_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
     item_discount: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))

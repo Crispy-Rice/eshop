@@ -179,6 +179,19 @@ async def list_timeout_mains(session: AsyncSession, *, limit: int = 500) -> list
     )
 
 
+async def count_user_mains_in_statuses(
+    session: AsyncSession, user_id: int, statuses: tuple[int, ...]
+) -> int:
+    """该用户在这些状态下的母单数。账号注销的前置守卫用（见 trade.service）。"""
+    return (
+        await session.scalar(
+            select(func.count())
+            .select_from(OrderMain)
+            .where(OrderMain.user_id == user_id, OrderMain.status.in_(statuses))
+        )
+    ) or 0
+
+
 # ============================================================
 # 子单
 # ============================================================
@@ -203,6 +216,19 @@ async def list_subs(session: AsyncSession, order_main_no: str) -> list[OrderSub]
             .where(OrderSub.order_main_no == order_main_no)
             .order_by(OrderSub.order_sub_no)
         )
+    )
+
+
+async def list_subs_by_nos(session: AsyncSession, sub_nos: Sequence[str]) -> list[OrderSub]:
+    """按子单号批量取。
+
+    给"从订单项反查它属于哪个子单、进而拿到发货仓"用（见 ``service._to_stock_items``）：
+    一个母单可能跨店、各子单的仓不同，所以必须逐条对应，不能只查一次母单。
+    """
+    if not sub_nos:
+        return []
+    return list(
+        await session.scalars(select(OrderSub).where(OrderSub.order_sub_no.in_(list(sub_nos))))
     )
 
 

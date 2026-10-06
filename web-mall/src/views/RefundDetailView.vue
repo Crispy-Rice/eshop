@@ -17,6 +17,7 @@ import {
   type Refund,
 } from '@/api/aftersale'
 import { isBizError } from '@/api/errors'
+import { TICKET_SOURCE } from '@/api/support'
 import { formatDateTime, formatYuan } from '@/utils/money'
 import { onImageError } from '@/utils/placeholder'
 
@@ -50,6 +51,24 @@ const returnRules: FormRules = {
 }
 
 const refundNo = computed(() => String(route.params.refundNo ?? ''))
+
+/**
+ * 联系这家店的客服，带上这笔售后与订单号 —— 买家点「联系客服」十有八九
+ * 就是在问这笔退款。会话详情里会给一个跳回售后的链接。
+ */
+function goSupport(): void {
+  const r = refund.value
+  if (!r) return
+  void router.push({
+    name: 'support',
+    query: {
+      shopId: r.shopId,
+      refundNo: r.refundNo,
+      orderMainNo: r.orderMainNo ?? undefined,
+      source: TICKET_SOURCE.AFTERSALE,
+    },
+  })
+}
 
 /** 走到哪一步了。四个环节的进度条让用户知道"还要等多久、等谁" */
 const STEPS = computed(() => {
@@ -267,6 +286,7 @@ onMounted(load)
           查看订单
         </el-button>
         <el-button v-if="refund.canRevoke" :loading="acting" @click="onRevoke">撤销申请</el-button>
+        <el-button @click="goSupport">联系客服</el-button>
       </footer>
     </template>
 

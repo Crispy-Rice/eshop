@@ -36,6 +36,7 @@
 | **aftersale** | 退款单、退货单、逆向状态机 | PG | 部分退、券与积分回退 |
 | **user** | 账号、地址、积分账户、角色权限 | PG | 积分流水 |
 | **review** | 评价、追评、图片、审核 | PG | 购后限制、唯一性 |
+| **support** | 客服会话（买家 ↔ 商家 / 平台的异步工单） | PG + Redis | 一会话一仓、未读游标 |
 | **settlement** | 商家账单、平台佣金 | PG | 对账准确性 |
 | **notify** | 站内信（第一期不接短信） | PG | 幂等、去重 |
 
@@ -53,7 +54,17 @@ aftersale ─┬─> trade
            ├─> inventory
            ├─> promotion
            └─> user(积分)
+
+support ─┬─> account（店铺名、买家标签）
+         └─> notify（写站内信）
+
+notify ──> （无下游；由 worker 的 outbox 投递循环与 support 调用）
 ```
+
+★ **`trade` / `payment` / `aftersale` 与 `notify` 之间没有边**：它们把通知意图写进
+`core.local_message`（outbox，见 §2.2 与 docs/19 §4），由 worker 就地分派。这是
+"不让下游模块反向依赖通知实现"的解耦缝 —— 站内信要换成短信时，改的是 worker 侧的
+handler，不是那三个模块。
 
 反向通知（如 payment 成功后 trade 改状态以外的副作用、inventory 回补后通知 product 刷新缓存）一律走领域事件。
 

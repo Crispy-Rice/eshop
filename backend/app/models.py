@@ -29,6 +29,7 @@ from app.modules.inventory.models import (  # noqa: F401
     StockFlow,
     Warehouse,
 )
+from app.modules.notify.models import SiteMessage  # noqa: F401
 from app.modules.payment.models import MockChannelTrade, Payment, PaymentRefund  # noqa: F401
 from app.modules.product.models import (  # noqa: F401
     Category,
@@ -48,6 +49,11 @@ from app.modules.promotion.models import (  # noqa: F401
     PromoStackRule,
 )
 from app.modules.review.models import Review, ReviewReply  # noqa: F401
+from app.modules.support.models import (  # noqa: F401
+    Ticket,
+    TicketMessage,
+    TicketStateFlow,
+)
 from app.modules.trade.models import (  # noqa: F401
     DeliveryItem,
     DeliveryOrder,

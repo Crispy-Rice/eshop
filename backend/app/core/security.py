@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import string
 import time
 from typing import Any
 
@@ -77,6 +78,29 @@ def validate_password_strength(raw: str) -> str:
     if raw.lower() in {"12345678", "password", "qwertyui", "11111111"}:
         raise ValueError("密码过于简单")
     return raw
+
+
+def generate_temp_password(length: int = 16) -> str:
+    """生成一个**必然**满足 ``validate_password_strength`` 的随机临时口令。
+
+    用途只有一个：运营在后台给"忘了密码"的用户重置（docs/18-account.md）。
+    没有短信通道时这是唯一的兜底手段，所以它必须一定能过自己的强度校验。
+
+    ★ 四类字符**各先取一个**，再补足长度、最后打乱 —— 而不是"随机生成再校验、
+      不合格就重试"：后者的重试次数取决于规则，规则一收紧可能长时间不收敛。
+      末尾仍自校验一次，这样将来改了规则会在这里立刻炸出来，
+      而不是把一条不合规的口令发给用户。
+    """
+    pools = (string.ascii_lowercase, string.ascii_uppercase, string.digits, "!@#$%^&*-_")
+    size = max(length, get_settings().password_min_length, len(pools))
+    chars = [secrets.choice(pool) for pool in pools]
+    alphabet = "".join(pools)
+    chars += [secrets.choice(alphabet) for _ in range(size - len(chars))]
+    secrets.SystemRandom().shuffle(chars)
+
+    candidate = "".join(chars)
+    validate_password_strength(candidate)
+    return candidate
 
 
 # ------------------------------------------------------------

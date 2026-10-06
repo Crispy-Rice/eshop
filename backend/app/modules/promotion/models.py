@@ -557,3 +557,91 @@ class Banner(Base):
     )
     created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
+
+
+# ============================================================
+# 站点主题（全站单行配置）
+# ============================================================
+# 皮肤白名单：**后端这一份是唯一定义处**。
+#   - 买家端 `theme/themes.ts` 里也有这几个 id（它负责配色），加皮肤要同时动两处；
+#   - 后台的选择器不自己维护清单，直接读 `GET /api/site-theme` 下发的 options。
+# 校验正则由白名单生成，避免"列表改了、正则忘了改"。
+SITE_SKINS: tuple[tuple[str, str], ...] = (
+    ("neutral", "默认·中性"),
+    ("promo-618", "618 大促"),
+    ("promo-double11", "双 11"),
+    ("promo-spring", "年货节"),
+)
+SITE_SKIN_PATTERN = "^(" + "|".join(value for value, _ in SITE_SKINS) + ")$"
+
+# 单行表的固定主键；以及"没有大促时"的常态皮肤
+SITE_THEME_ID = 1
+DEFAULT_SITE_SKIN = "neutral"
+
+
+class SiteTheme(Base):
+    """站点主题 —— **全站唯一一行**的配置。
+
+    ★ 皮肤的启用权在**运营**，不在用户：买家端没有切换器，启动时读这个值并覆盖
+      本地缓存（docs/17 §3）。所以这一行就是"当前全站是什么皮肤"的唯一事实来源。
+      之所以要落地到库而不是配置项，是因为它要能被运营随时改、且立刻全站生效。
+
+    ★ 单行用 ``CHECK (id = 1)`` 表达，而不是靠"约定只插一行"。迁移里已经插好了那
+      一行，公开接口因此永远读得到，不必到处处理"表是空的"。
+
+    放在 promotion schema 下的理由与 ``Banner`` 相同：它是**运营投放的东西**，
+    归属与角色（admin / finance）跟营销一致，没必要为一行配置新建模块。
+    """
+
+    __tablename__ = "site_theme"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="single_row"),
+        {"schema": "promotion", "comment": "站点主题（单行配置）"},
+    )
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, comment="恒为 1")
+    skin: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'neutral'"),
+        comment="启用的皮肤 id，与 web-mall 的 theme/themes.ts 对齐",
+    )
+    updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
+
+
+# 单行表的固定主键（与 SiteTheme 同值，但分开命名：它们是两张独立的表）
+SITE_CONTACT_ID = 1
+
+
+class SiteContact(Base):
+    """平台客服联系方式 —— **全站唯一一行**的配置。
+
+    ★ 它存在的理由是**买家端原本一个联系入口都没有**。封禁提示写着「请联系客服」，
+      而后端所有「客服」都是运营侧概念（补发券、券码核销、客服查看手机号），
+      买家够不着 —— 那句话是个死胡同。这一行让"联系客服"变成真的。
+
+    ★ 展示位置只有**登录页**与**封禁提示**：需要联系平台的典型场景（被封、登不进来）
+      恰恰是人还没登录的时候，所以联系方式不能藏在「我的」里。
+
+    ★ 三列**可空 = 未配置**。空串在写侧归一成 NULL（与 ``product.sku.sku_code``
+      同一个取舍）。这样买家端能判断"到底配没配"：一项都没填就只陈述事实、
+      不承诺一个不存在的渠道。
+    """
+
+    __tablename__ = "site_contact"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="single_row"),
+        {"schema": "promotion", "comment": "平台客服联系方式（单行配置）"},
+    )
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, comment="恒为 1")
+    service_email: Mapped[str | None] = mapped_column(
+        String(128), comment="客服邮箱。NULL = 未配置"
+    )
+    service_phone: Mapped[str | None] = mapped_column(
+        String(32), comment="客服电话。NULL = 未配置（自由文本，400 号/固话/分机都行）"
+    )
+    service_hours: Mapped[str | None] = mapped_column(
+        String(64), comment="服务时间，如「工作日 9:00-18:00」。NULL = 未配置"
+    )
+    updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())

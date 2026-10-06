@@ -468,6 +468,19 @@ async def lock_stock(items: list[LockItem], request_id: str) -> LockPath:
 
 ## 6. Redis Streams 事件约定
 
+> ★ **实现状态（[19 §4.2](19-support.md)）：本期**没有**引入这一层。**
+>
+> outbox 的投递循环（`worker/outbox_delivery.py`）在 **worker 进程内就地分派**
+> handler，不 `XADD`；因此 `core/redis_keys.py` 的 `stream()` / `stream_dead()`
+> **至今闲置**，本节描述的消费组、`XAUTOCLAIM`、死信 Stream 都还没有代码。
+>
+> 理由：那一层要等**第二个独立进程**也要消费同一批事件时才有意义（比如把单体拆成
+> 服务）。眼下唯一的消费者就是这个 worker，多一层只会多一份要各自对账的状态。
+> 真要拆服务时 `core.local_message` 仍是权威存储，可以重放 —— 届时本节直接可用。
+>
+> 保留的部分：`local_message` 的 `status 0/1/2/3`、`FOR UPDATE SKIP LOCKED` 取件、
+> 指数退避、重试上限后弃置并写 `ops.alert`。
+
 outbox 投递任务（[13 §4](13-schema.md)）把 `local_message` 写入 `stream:{topic}`，worker 中的消费者以**消费组**方式读取：
 
 ```python

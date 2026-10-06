@@ -48,29 +48,45 @@ Layer 3  Element Plus 桥接                --el-color-primary、--el-text-color
 
 换肤 = 切 `<html data-theme="...">`。**组件零改动、零重渲染**——只是 CSS 变量重新求值。
 
-| 皮肤 id | 名称 | 调用场景 |
+| 皮肤 id | 名称 | 谁在用 |
 |---|---|---|
-| `neutral` | 默认·中性 | 无大促 |
-| `promo-618` | 618 | 618 大促 |
-| `promo-double11` | 双 11 | 双 11 |
-| `promo-spring` | 年货节 | 年货节 |
+| `neutral` | 默认·中性 | 没有大促时的常态 |
+| `promo-618` | 618 大促 | 运营在后台启用 |
+| `promo-double11` | 双 11 | 同上 |
+| `promo-spring` | 年货节 | 同上 |
 
-### 3.1 加一套新皮肤
+### 3.1 皮肤由**运营**启用，不是用户偏好
 
-只需两步，**不需要碰任何组件**：
+启用权在**运营**：后台「营销中心 → 站点设置」选一套并保存，**全站立刻生效** ——
+所有访客下次加载都用它。买家端**没有切换器**（皮肤全归运营后，用户没有可选项）。
 
-1. 在 `tokens.css` 加一个 `[data-theme="promo-xxx"]` 块，覆盖 Layer 2 里的营销相关 token（强调色、交易色、营销带、页面底色）。
-2. 在 `src/theme/themes.ts` 的 `THEMES` 里加一条元数据（标签、色点、营销带文案、`themeColor`）。
+- 值存在 `promotion.site_theme`（**单行**配置，`CHECK (id = 1)`），
+  买家端启动时读 `GET /api/site-theme` 并覆盖本地缓存。
+- 皮肤的中文名与白名单只有**后端一份**（`promotion/models.py` 的 `SITE_SKINS`）：
+  后台的选择器直接用接口下发的 `options`，商城的 `theme/themes.ts` 只负责配色。
+- ★ **皮肤只管外观。** 它曾经还带着营销文案（「跨店每满 300 减 50」这类**优惠承诺**），
+  于是用户切一下皮肤就看到并不存在的活动。那些文案已从皮肤定义里删掉，
+  顶部那条活动公告现在读的是**真实进行中的平台级活动**（`GET /api/promotions/active`）。
 
-切换器（`App.vue` 里的 `.themes`）是 `v-for` 渲染 `THEME_LIST` 的，会自动多出一个按钮。
+### 3.2 加一套新皮肤
+
+三步，**不需要碰任何组件**：
+
+1. `tokens.css` 加一个 `[data-theme="promo-xxx"]` 块，覆盖 Layer 2 里的营销相关 token（强调色、交易色、营销带、页面底色）。
+2. `src/theme/themes.ts` 的 `THEMES` 加一条（只有 `id` 与 `themeColor`）。
+3. 后端 `promotion/models.py` 的 `SITE_SKINS` 登记一行（id + 中文名）—— 后台的选择器与接口的校验正则都读它。
 
 **只覆盖"气质"类 token**：灰阶、间距、圆角、字号**不要**在皮肤块里改——换肤换的是气质，不是结构。改了这些，货架排布会在不同皮肤下错位。
 
-### 3.2 首屏不闪（FOUC）
+### 3.3 首屏不闪（FOUC）
 
 `web-mall/index.html` 里有段内联脚本，在样式生效前把 `localStorage` 里的皮肤读回 `data-theme`。否则刷新时会先按默认主题渲染一帧再跳变，肉眼可见闪一下。
 
 > ★ 这段内联脚本用的 key `'eshop.theme'` 必须与 `src/composables/useTheme.ts` 的 `STORAGE_KEY` 一致，改一处要同步改另一处。
+>
+> ★ 它的角色已经变了：现在是**缓存**（"上次从后端读到的皮肤"），不再是用户偏好 —— 没有任何用户写入的入口。
+>
+> ★ 已知代价：**运营刚改完皮肤时，还没刷新过的人会看到一次闪动**（缓存里是旧值，拉到新值后切过去）。缓存命中时不闪，所以只有"改皮肤后的第一次访问"会遇到。
 
 ## 4. 前台规范：货架式
 
@@ -84,7 +100,12 @@ Layer 3  Element Plus 桥接                --el-color-primary、--el-text-color
 
 其余约定：
 
-- 商品卡用**自定义 `<article>`**，不用 `el-card`——需要控制 `overflow:hidden` + 图片缩放 + `margin-top:auto`，`el-card` 的 body 结构会挡路。
+- **货架是一个共享组件** `components/ProductGrid.vue`：搜索页与店铺页共用同一份网格与卡片。
+  卡片那几十行里全是"货架感"的讲究，复制第二份就等着腐烂。
+  页大小也由它算（列数 × 行数，列数只有它自己量得到），见 `composables/useShelf.ts`。
+- 商品卡用**自定义 `<a class="card">`**，不用 `el-card`——需要控制 `overflow:hidden` + 图片缩放 + `margin-top:auto`，`el-card` 的 body 结构会挡路。
+- ★ **卡片里不能放链接**。卡片整体已经是 `<a>`，再嵌一个（比如"店名 → 店铺页"）是无效 HTML，
+  浏览器会把它拆开、行为不可预测。店铺入口因此只在**商品详情页**（那块店铺信息现在可点）。
 - 价格加 `.tnum`（`font-variant-numeric: tabular-nums`），数字等宽，扫一排价格时位数不会左右跳。
 - 图片挂载 `@error="onImageError"`，失败回退到内联 SVG 占位。
 - hover 只做**轻抬升 + 边框加深 + 图放大 1.03**，不用重投影。
@@ -178,6 +199,8 @@ web-mall/
     ├── assets/base.css             # reset、排版、EP 组件质感
     ├── theme/themes.ts             # 皮肤注册表（元数据 + 营销带文案）
     ├── composables/useTheme.ts     # 主题状态 / 持久化 / 写 data-theme
+    ├── composables/useShelf.ts     # 货架页大小（列数 × 行数）与首屏触发
+    ├── components/ProductGrid.vue  # 货架：网格 + 卡片 + 加载更多（搜索页 / 店铺页共用）
     ├── components/PromoStrip.vue   # 可换肤营销带
     └── views/                      # 页面（只引用语义 token）
 
@@ -197,7 +220,7 @@ npm.cmd run type-check; npm.cmd run lint
 
 两个应用都要跑。然后在浏览器里实际看——**类型检查和 lint 验证不了观感**：
 
-- 前台：四套皮肤逐个切换，确认刷新后仍保持、营销带与品牌色同步变化
+- 前台：在后台逐个切换四种皮肤 → **商城任意页面**都跟着变；刷新后仍是运营选的那套（缓存生效）；没有进行中的平台活动时，顶部公告带**整条不出现**
 - 前台：货架排布是否整排对齐（不同标题长度、单价 vs 价格区间混排）
 - 后台：表格密度、状态标签、规格编辑器
 - 375px / 768px / 1440px 三档宽度

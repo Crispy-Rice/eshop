@@ -23,6 +23,14 @@ export const ErrorCode = {
   INTERNAL_ERROR: 'INTERNAL_ERROR',
   SYSTEM_BUSY: 'SYSTEM_BUSY',
 
+  // ---- 账号状态 ----
+  // 封禁可解封、注销是终态；冷静期/未完成订单/店主不能注销是三条注销守卫
+  ACCOUNT_BANNED: 'ACCOUNT_BANNED',
+  ACCOUNT_CLOSED: 'ACCOUNT_CLOSED',
+  PHONE_IN_COOLDOWN: 'PHONE_IN_COOLDOWN',
+  ACCOUNT_HAS_UNFINISHED: 'ACCOUNT_HAS_UNFINISHED',
+  SHOP_OWNER_CANNOT_DEACTIVATE: 'SHOP_OWNER_CANNOT_DEACTIVATE',
+
   // ---- 幂等 ----
   REQUEST_PROCESSING: 'REQUEST_PROCESSING',
 
@@ -89,6 +97,9 @@ export const ErrorCode = {
   INVALID_IMAGE: 'INVALID_IMAGE',
   IMAGE_TOO_LARGE: 'IMAGE_TOO_LARGE',
 
+  // ---- 客服 ----
+  SUPPORT_RATE_LIMITED: 'SUPPORT_RATE_LIMITED',
+
   // ---- 仅前端使用的本地错误码 ----
   NETWORK_ERROR: 'NETWORK_ERROR',
   TIMEOUT: 'TIMEOUT',
@@ -124,4 +135,22 @@ export class BizError extends Error {
 export function isBizError(e: unknown, code?: string): e is BizError {
   if (!(e instanceof BizError)) return false
   return code === undefined || e.code === code
+}
+
+/**
+ * 账号被冻结 / 已注销的补充信息。
+ *
+ * ★ 理由从业务的 `data` 里取，**不是**从 `message` 里切。后端把"发生了什么 / 为什么"
+ *   分开给（`account/service._ban_error`），界面才能分三行排版；靠切中文冒号来拆
+ *   只会再次拆错 —— 那正是它原来的毛病（「请联系客服：疑似刷单」把原因读成了联系方式）。
+ */
+export interface AccountBlock {
+  code: string
+  /** 运营填的封禁理由。可能没有。 */
+  reason: string | null
+}
+
+export function accountBlockOf(e: BizError): AccountBlock {
+  const data = e.data as { reason?: string | null } | null | undefined
+  return { code: e.code, reason: data?.reason ?? null }
 }

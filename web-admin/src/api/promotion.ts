@@ -1,4 +1,4 @@
-import { get, post } from './http'
+import { get, post, put } from './http'
 
 // ============================================================
 // 后端契约（取值必须与 backend/app/modules/promotion/models.py 对齐）
@@ -328,4 +328,63 @@ export function searchShops(keyword: string): Promise<ShopOption[]> {
  */
 export function fetchShopsByIds(ids: string[]): Promise<ShopOption[]> {
   return get<ShopOption[]>('/admin/shops', { params: { ids: ids.join(',') } })
+}
+
+// ============================================================
+// 站点设置（全站皮肤 + 客服联系方式，各一张单行配置）
+// ============================================================
+export interface SkinOption {
+  value: string
+  label: string
+}
+
+export interface SiteTheme {
+  skin: string
+  options: SkinOption[]
+}
+
+/**
+ * 当前站点皮肤 + **可选清单**。
+ *
+ * ★ 这个接口是**公开**的（买家端启动时也读它），后台只是复用它拿 `options` ——
+ *   皮肤清单因此只有**一份**（后端 `promotion/models.py` 的 `SITE_SKINS`），
+ *   后台不必再维护一个数组，也就不会出现"后台能选、买家端不认"的漂移。
+ */
+export function fetchSiteTheme(): Promise<SiteTheme> {
+  return get<SiteTheme>('/site-theme')
+}
+
+/** 切换全站皮肤。保存后立刻对所有人生效（买家端下次加载就读到）。 */
+export function updateSiteTheme(skin: string): Promise<SiteTheme> {
+  return put<SiteTheme>('/admin/site-theme', { skin })
+}
+
+// ============================================================
+// 客服联系方式（全站单行配置）
+// ============================================================
+/** 三项都可能为 `null` = **未配置**。 */
+export interface SiteContact {
+  serviceEmail: string | null
+  servicePhone: string | null
+  serviceHours: string | null
+}
+
+/**
+ * 平台客服联系方式。**公开接口**，后台只是复用它读现有值。
+ *
+ * ★ 它在买家端出现在**登录页**与**账号被冻结的提示**上 —— 这两处正是"人还没登进来"
+ *   的场景。所以这一项**不是可选装饰**：不填，被封的用户就真的没有联系入口。
+ */
+export function fetchSiteContact(): Promise<SiteContact> {
+  return get<SiteContact>('/site-contact')
+}
+
+/**
+ * 存客服联系方式。三项**一起提交**（整行覆盖）—— 传空串 = 取消配置那一项。
+ *
+ * ★ 返回的是**归一化之后**的值（空串 / 纯空格都变 `null`）。调用方拿它回填表单，
+ *   界面上显示的和服务端存的就是同一个东西，不会出现"表单里还留着空格、库里已经清了"。
+ */
+export function updateSiteContact(contact: SiteContact): Promise<SiteContact> {
+  return put<SiteContact>('/admin/site-contact', contact)
 }

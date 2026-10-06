@@ -1,7 +1,7 @@
 import { post } from './http'
 
 /** 允许上传的业务线。★ 与后端 `files/storage.py` 的 `ALLOWED_BIZ` 一一对应 */
-export type BizLine = 'reviews' | 'aftersale' | 'avatars' | 'banners'
+export type BizLine = 'reviews' | 'aftersale' | 'avatars' | 'banners' | 'support'
 
 /**
  * 上传单张图片（评价、售后凭证、头像共用）。

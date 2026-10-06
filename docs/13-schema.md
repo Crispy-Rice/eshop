@@ -86,12 +86,14 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;   -- 慢 SQL 分析（需 sha
 | | `user_address` | 收货地址 | 百万 | |
 | | `user_points` | 积分账户 | 百万 | |
 | | `points_biz_key` / `points_flow` | 积分幂等键 / 积分流水 | 千万 | 流水按月分区 |
+| | `user_state_flow` | 账号状态流水（封禁 / 解封 / 注销 / 重置密码） | 万 | 只追加；应用角色只授 INSERT/SELECT |
 | product | `category` | 类目 | 万 | |
 | | `spu` / `sku` | 商品 / 最小售卖单元 | 百万 | |
 | | `spec_group` / `spec_value` / `sku_spec` | 规格 | 千万 | |
 | | `spu_attr` | 商品参数 | 千万 | |
-| inventory | `warehouse` | 仓库 | 千 | |
+| inventory | `warehouse` | 仓库 | 千 | `is_default` 用 partial unique index 保证每店最多一个默认仓；带地址与联系人 |
 | | `sku_stock` | 分仓库存 | 百万 | `fillfactor = 80`（§9.2） |
+| | `warehouse_region_rule` | 仓的发货覆盖区划 | 万 | `UNIQUE (shop_id, region_code)` —— 一个区划只由一个仓发货，于是不需要优先级（[03 §12](03-inventory.md)） |
 | | `stock_biz_key` / `stock_flow` | 库存幂等键 / 库存流水 | 亿 | 流水按月分区；幂等键 90 天清理 |
 | cart | `cart_item` | 购物车项 | 千万 | |
 | promotion | `coupon_template` | 券模板 | 万 | |
@@ -99,6 +101,9 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;   -- 慢 SQL 分析（需 sha
 | | `coupon_user_quota` | 用户领取计数 | 千万 | |
 | | `coupon_receive_log` / `coupon_flow` | 领券流水 / 券状态流水 | 千万 | |
 | | `promo_activity` / `promo_stack_rule` | 促销活动 / 叠加规则 | 万 / 百 | |
+| | `banner` | 首页轮播图 | 百 | |
+| | `site_theme` | 站点主题（**全站单行**，运营启用的皮肤） | 1 | `CHECK (id = 1)`；迁移里插好默认行 `neutral` |
+| | `site_contact` | 平台客服联系方式（**全站单行**） | 1 | `CHECK (id = 1)`；迁移里插好空行，三列 **NULL = 未配置** |
 | freight | `freight_template` / `freight_region_rule` / `sku_freight_bind` / `freight_exclude_region` | 运费 | 百万 | |
 | trade | `order_main` / `order_sub` | 母单 / 子单 | 千万 | 3 年后归档（§7） |
 | | `order_item` | 订单项 | 亿 | 同上 |
@@ -112,6 +117,7 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;   -- 慢 SQL 分析（需 sha
 | | `mock_channel_trade` | 模拟渠道交易（仅 mock 模式） | — | |
 | aftersale | `refund_order` / `refund_item` / `refund_logistics` | 售后 | 百万 | |
 | review | `review` / `review_reply` / `stat_biz_key` | 评价 | 千万 | |
+| support | `ticket` / `ticket_message` / `ticket_state_flow` | 客服会话 / 消息 / 状态流水 | 百万 / 千万 / 千万 | 消息与流水**只追加**，客服也不能删自己的话（[19](19-support.md)） |
 | notify | `site_message` | 站内信 | 千万 | 1 年删除 |
 | core | `local_message` | 本地消息表（outbox） | 千万/周 | 7 天删除 |
 | ops | `alert` / `switch` | 告警 / 降级开关 | 万 / 十 | |
@@ -133,15 +139,20 @@ CREATE TABLE account."user" (
   member_expire  TIMESTAMPTZ(3),
   credit_score   INT          NOT NULL DEFAULT 700, -- 信用分（售后用）
   role           VARCHAR(16)  NOT NULL DEFAULT 'buyer', -- buyer/merchant/admin/finance
-  status         SMALLINT     NOT NULL DEFAULT 1, -- 1正常 2冻结 3注销
+  status         SMALLINT     NOT NULL DEFAULT 1, -- 1正常 2封禁 3注销（core.enums.UserStatus）
+  ban_reason     VARCHAR(255),            -- 封禁理由，**会原样展示给被封的用户**，解封时清空
+  closed_at      TIMESTAMPTZ(3),          -- 注销时间；手机号 30 天冷静期的基准
   failed_logins  SMALLINT     NOT NULL DEFAULT 0,
   locked_until   TIMESTAMPTZ(3),
   register_time  TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
   created_at     TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
-  updated_at     TIMESTAMPTZ(3) NOT NULL DEFAULT now(),
-  CONSTRAINT uk_user_phone_hash UNIQUE (phone_hash)
+  updated_at     TIMESTAMPTZ(3) NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_user_status_time ON account."user" (status, register_time);
+-- 手机号唯一性**只对未注销的行生效**（部分唯一索引）。
+-- 注销是终态：普通唯一约束会把那个号永久占死，用户想回来也回不来。
+-- 已注销的行不在索引里，所以冷静期过了之后同号可以重新注册 —— 见 18-account.md。
+CREATE UNIQUE INDEX uk_user_phone_hash ON account."user" (phone_hash) WHERE status <> 3;
 
 CREATE TABLE account.user_address (
   id             BIGINT        PRIMARY KEY,
@@ -162,6 +173,23 @@ CREATE TABLE account.user_address (
 CREATE INDEX idx_user_address_user ON account.user_address (user_id, status);
 -- 每个用户最多一个默认地址
 CREATE UNIQUE INDEX uk_user_address_default ON account.user_address (user_id) WHERE is_default AND status = 1;
+
+-- 账号状态流转流水（不可变审计）。封禁/解封/注销/运营重置密码各留一行：
+-- "谁在什么时候对谁做了什么、为什么"必须查得到。
+-- user_id **刻意不建外键** —— 注销会把用户行匿名化，审计行要能在那之后独立可读。
+-- 应用角色只授 INSERT/SELECT，由 scripts/harden_grants.py 的 IMMUTABLE_TABLES 收紧。
+CREATE TABLE account.user_state_flow (
+  id            BIGINT       GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id       BIGINT       NOT NULL,
+  event         VARCHAR(32)  NOT NULL,  -- BAN/UNBAN/CLOSE/RESET_PASSWORD
+  from_status   SMALLINT     NOT NULL,
+  to_status     SMALLINT     NOT NULL,
+  operator_type SMALLINT     NOT NULL,  -- 复用 core.enums.OperatorType（1用户 4平台）
+  operator_id   VARCHAR(64),            -- 管理员 user id；自助注销时是被注销者自己
+  remark        VARCHAR(255),
+  created_at    TIMESTAMPTZ(3) NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_user_state_flow_user ON account.user_state_flow (user_id, created_at);
 ```
 
 > 表名 `user` 是保留字，必须写成 `account."user"`。SQLAlchemy 模型中设置 `__tablename__ = "user"`、`__table_args__ = {"schema": "account"}`，生成的 SQL 会自动加引号。
@@ -266,6 +294,13 @@ def next_deadline(status: RefundStatus, now: datetime) -> datetime | None:
 ```
 
 ## 4. 本地消息表（outbox，最终一致的基础设施）
+
+> ★ **实现状态（[19 §4.2](19-support.md)）：投递循环已落地，但**没有**走 Redis Streams。**
+>
+> `worker/outbox_delivery.py` 轮询本表并在 worker 进程内就地分派 handler —— 本节
+> 下面那段"推到 Redis Streams、由消费者组消费"的描述**尚未实现**（[14 §6](14-redis-keys.md)
+> 已同样标注）。表结构与投递语义（`status` 状态机、`FOR UPDATE SKIP LOCKED` 取件、
+> 指数退避、重试上限后弃置并写 `ops.alert`）与本节一致。
 
 ```sql
 CREATE TABLE core.local_message (

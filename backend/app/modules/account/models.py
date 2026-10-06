@@ -14,12 +14,12 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     LargeBinary,
     SmallInteger,
     String,
-    UniqueConstraint,
     func,
     text,
 )
@@ -37,7 +37,18 @@ class User(Base):
 
     __tablename__ = "user"
     __table_args__ = (
-        UniqueConstraint("phone_hash", name="uk_user_phone_hash"),
+        # 手机号唯一性**只对未注销的行生效**（部分唯一索引）。
+        # 注销是终态、不可恢复，若仍是普通唯一约束，那个手机号就被永久占死 ——
+        # 用户注销后就再也回不来，是客服投诉点。流程见 service.close_account：
+        # 注销时手机号仍占位（防"注销→立刻重注册"刷新人券），满冷静期后
+        # 由 register 惰性把旧行的 phone_hash 改写成占位值，索引随之腾出。
+        # 先例：product.sku 的 uk_sku_spu_code 也是 drop_constraint + 部分唯一索引。
+        Index(
+            "uk_user_phone_hash",
+            "phone_hash",
+            unique=True,
+            postgresql_where=text("status <> 3"),  # 3 = UserStatus.CLOSED
+        ),
         Index("idx_user_status_time", "status", "register_time"),
         Index("idx_user_role", "role"),
         {"schema": "account"},
@@ -70,7 +81,16 @@ class User(Base):
         comment="buyer/merchant/admin/finance",
     )
     status: Mapped[int] = mapped_column(
-        SmallInteger, nullable=False, server_default=text("1"), comment="1正常 2冻结 3注销"
+        SmallInteger,
+        nullable=False,
+        server_default=text("1"),
+        comment="UserStatus：1正常 2封禁 3注销。2/3 的写入口见 service.ban_user / close_account",
+    )
+    ban_reason: Mapped[str | None] = mapped_column(
+        String(255), comment="封禁理由。**会展示给用户**（登录失败的文案），解封时清空"
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        TS, comment="注销时间。手机号 30 天冷静期以此为基准，见 service.register"
     )
     failed_logins: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("0"))
     locked_until: Mapped[datetime | None] = mapped_column(TS, comment="锁定到期时间，见登录防爆破")
@@ -173,3 +193,38 @@ class UserAddress(Base):
     )
     created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
+
+
+class UserStateFlow(Base):
+    """账号状态流转流水。**不可变的审计日志**。
+
+    仿 ``trade.order_state_flow``：应用账号对这张表只授予 INSERT/SELECT
+    （见 ``scripts/harden_grants.py`` 的 ``IMMUTABLE_TABLES``），从**权限层面**
+    保证不可改。封禁/解封/注销/运营重置密码都往这里留一行 ——
+    "谁在什么时候对谁做了什么、为什么"必须查得到，否则处置无法解释。
+
+    ``user_id`` 刻意**不建外键**：注销会把用户行匿名化，审计行要能在那之后
+    依然独立可读（也因此记的是 id 而不是关联对象）。
+    """
+
+    __tablename__ = "user_state_flow"
+    __table_args__ = (
+        Index("idx_user_state_flow_user", "user_id", "created_at"),
+        {"schema": "account"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event: Mapped[str] = mapped_column(
+        String(32), nullable=False, comment="BAN/UNBAN/CLOSE/RESET_PASSWORD"
+    )
+    from_status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    to_status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    operator_type: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, comment="复用 OperatorType：1用户 2商家 3系统 4平台"
+    )
+    operator_id: Mapped[str | None] = mapped_column(
+        String(64), comment="管理员 user id；自助注销时就是被注销的用户自己"
+    )
+    remark: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())

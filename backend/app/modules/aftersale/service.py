@@ -780,37 +780,36 @@ async def _dispatch_refund(session: AsyncSession, refund: RefundOrder) -> None:
     )
 
 
-async def _stock_items_of_refund(
-    session: AsyncSession, refund_no: str
-) -> list[StockItem]:
-    """把售后明细聚合成库存操作要的行（按 SKU 合并）。
+async def _stock_items_of_refund(session: AsyncSession, refund: RefundOrder) -> list[StockItem]:
+    """把售后明细聚合成库存操作要的行（按 SKU 合并，都在**同一个仓**）。
 
-    同一个 SKU 可能出现在多行（不同订单项），库存按 SKU 记账，必须先合并 ——
-    否则同一 SKU 会走两次幂等键不同的回补，Redis 侧还会互相覆盖。
+    ★ **不重新路由**：发货仓取自这张售后单所属子单记录的 ``warehouse_id`` ——
+      也就是"当初从哪个仓发的"。用路由重算的话，商家事后调整区域规则就会让退货
+      入到一个根本没发过货的仓，账面越滚越乱。
+
+    ★ 按 SKU 合并是安全的：``refund_order.order_sub_no`` 非空，**一个售后单必属于一个
+      子单**，而一个子单所有商品同仓（见 trade.create_order）。所以合并出来的每一行
+      都在同一个仓、也共用同一个幂等键。
+      （若将来支持"跨子单售后"，这里要改成按 ``(sku, 仓)`` 聚合、幂等键也要带上仓。）
     """
-    items = await repo.list_items(session, refund_no)
+    items = await repo.list_items(session, refund.refund_no)
     if not items:
         return []
     merged: dict[int, int] = {}
     for item in items:
         merged[int(item.sku_id)] = merged.get(int(item.sku_id), 0) + item.refund_num
-    warehouses = await inventory_service.batch_sku_warehouses(session, list(merged))
-    result: list[StockItem] = []
-    for sku_id, num in merged.items():
-        wh_id = warehouses.get(sku_id)
-        if wh_id is None:
-            raise BizError(
-                ErrorCode.SKU_NOT_SUPPORTED, f"商品 {sku_id} 没有可用的仓库，无法回补库存"
-            )
-        result.append(StockItem(sku_id=sku_id, warehouse_id=wh_id, num=num))
-    return result
+    warehouse_id = await trade_service.warehouse_id_of_sub(session, str(refund.order_sub_no))
+    return [
+        StockItem(sku_id=sku_id, warehouse_id=warehouse_id, num=num)
+        for sku_id, num in merged.items()
+    ]
 
 
 async def _restore_unshipped_stock(session: AsyncSession, refund: RefundOrder) -> None:
     """未发货仅退款的库存回补：``frozen → available``（总量不变）。"""
     await inventory_service.unshipped_refund(
         session,
-        await _stock_items_of_refund(session, refund.refund_no),
+        await _stock_items_of_refund(session, refund),
         f"REFUND_STOCK:{refund.refund_no}",
         order_no=refund.refund_no,
     )
@@ -821,7 +820,7 @@ async def _restore_returned_stock(session: AsyncSession, refund: RefundOrder) ->
     """退货质检合格的库存回补：``total += n, available += n``（货真的回来了）。"""
     await inventory_service.return_in(
         session,
-        await _stock_items_of_refund(session, refund.refund_no),
+        await _stock_items_of_refund(session, refund),
         f"RETURN:{refund.refund_no}",
         order_no=refund.refund_no,
     )
@@ -832,7 +831,7 @@ async def _mark_defective(session: AsyncSession, refund: RefundOrder) -> None:
     """质检不合格：商品进残次品池，不回补可售库存。"""
     await inventory_service.mark_defective(
         session,
-        await _stock_items_of_refund(session, refund.refund_no),
+        await _stock_items_of_refund(session, refund),
         f"DEFECTIVE:{refund.refund_no}",
         order_no=refund.refund_no,
     )
@@ -1180,3 +1179,13 @@ async def reconcile_refunds(session: AsyncSession) -> dict[str, int]:
         )
         logger.error("退款对账异常", extra={"violations": bad})
     return results
+
+
+async def count_open_refunds(session: AsyncSession, user_id: int) -> int:
+    """该用户还有多少笔进行中的售后。
+
+    ★ 给账号注销做前置守卫，理由同 ``trade.service.count_blocking_orders``：
+      account 不能 import aftersale（aftersale → trade → …，反向即环），
+      所以由这里暴露只读查询、account 的路由层来编排。
+    """
+    return await repo.count_user_open_refunds(session, user_id)

@@ -14,6 +14,13 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/ProductDetailView.vue'),
   },
   {
+    // 店铺页。入口在商品详情页那块店铺信息上 —— 不放在商品卡上：
+    // 卡片整体已经是一个 <a>，里面再嵌一个链接是无效 HTML
+    path: '/shops/:shopId',
+    name: 'shop',
+    component: () => import('@/views/ShopView.vue'),
+  },
+  {
     path: '/cart',
     name: 'cart',
     component: () => import('@/views/CartView.vue'),
@@ -79,6 +86,26 @@ const routes: RouteRecordRaw[] = [
     name: 'coupons',
     component: () => import('@/views/CouponCenterView.vue'),
     // 券中心要显示"你已领几张"，接口需要登录，路由也就跟着要
+    meta: { requiresAuth: true },
+  },
+  {
+    // 客服会话列表。带查询参数（shopId / orderMainNo / refundNo）时**直接开会话**
+    // 并跳到那一条 —— 商品页 / 订单页 / 售后页的「联系客服」入口都用这个深链接。
+    path: '/support',
+    name: 'support',
+    component: () => import('@/views/SupportView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/support/:ticketNo',
+    name: 'support-ticket',
+    component: () => import('@/views/SupportTicketView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    path: '/notifications',
+    name: 'notifications',
+    component: () => import('@/views/NotificationView.vue'),
     meta: { requiresAuth: true },
   },
   {

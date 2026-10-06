@@ -77,6 +77,8 @@ export type SearchSort = 'relevance' | 'sales' | 'newest' | 'price_asc' | 'price
 export interface SearchParams {
   keyword?: string
   categoryId?: string
+  /** 只看这家店的商品（店铺页用）。不传就是全平台 */
+  shopId?: string
   priceFrom?: number
   priceTo?: number
   sort?: SearchSort

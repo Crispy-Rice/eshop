@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from app.core.schemas import CamelModel, Quantity, SnowflakeId
+from app.modules.promotion.models import SITE_SKIN_PATTERN
 
 
 # ============================================================
@@ -206,13 +207,24 @@ class CalcPriceOut(CamelModel):
     shop_discount: int = Field(description="店铺级优惠")
     platform_discount: int = Field(description="平台级优惠")
     point_deduction: int = Field(default=0, description="积分抵扣。本期未实现，恒为 0")
-    freight: int = Field(default=0, description="运费。本期未实现，恒为 0")
+    freight: int = Field(default=0, description="运费合计（分）。未选收货地址时为 0")
+    freight_by_shop: dict[int, int] = Field(
+        default_factory=dict,
+        description="各店铺各自的运费（分），Σ == freight。跨店单里每个子单按它记账 —— "
+        "退款退的就是这个数（docs/06 §6）",
+    )
     payable_amount: int = Field(description="应付 = 总额 - 各级优惠 + 运费")
 
     unavailable_coupons: list[UnavailableCouponOut] = Field(default_factory=list)
 
     # 让前端明确知道哪些优惠没参与计算，不要以为算错了
     notices: list[str] = Field(default_factory=list)
+
+    can_submit: bool = Field(
+        default=True,
+        description="能不能提交下单。**按仓**判定：某个子单的货没有哪个仓库能一次发齐时为 false，"
+        "理由在 notices 里。缺货**不会**让算价本身失败（用户可能只是想看看多少钱）",
+    )
 
 
 # ============================================================
@@ -362,3 +374,103 @@ class BannerUpdateRequest(CamelModel):
     link_url: str | None = Field(default=None, max_length=255, pattern=r"^(/.*)?$")
     sort: int | None = None
     status: int | None = Field(default=None, ge=1, le=2)
+
+
+# ============================================================
+# 站点主题（全站单行配置）
+# ============================================================
+class SkinOptionOut(CamelModel):
+    """皮肤的可选项。``label`` 只在后台用 —— 商城那边按 id 查自己的配色。"""
+
+    value: str
+    label: str
+
+
+class SiteThemeOut(CamelModel):
+    """当前皮肤 + 可选项。
+
+    ★ 一并下发 ``options``，是为了让**后台的选择器不必自己维护一份皮肤清单** ——
+      清单只存在于后端的 ``SITE_SKINS``，两边不会漂移。
+    """
+
+    skin: str
+    options: list[SkinOptionOut]
+
+
+class SiteThemeUpdateRequest(CamelModel):
+    """改成哪套皮肤。★ 正则由后端白名单生成（``SITE_SKIN_PATTERN``），
+    非法值在 Pydantic 层就被挡下，不会写进库。"""
+
+    skin: str = Field(pattern=SITE_SKIN_PATTERN, description="皮肤 id")
+
+
+# ============================================================
+# 客服联系方式（全站单行配置）
+# ============================================================
+# 邮箱的**粗校验**：只挡明显的手误（漏域名、把 @ 打成空格）。
+# 完整的 RFC 校验没有意义 —— 一个邮箱到底能不能收到信，只有发一封才知道。
+SERVICE_EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+
+
+class SiteContactOut(CamelModel):
+    """平台客服联系方式。
+
+    ★ 三项都可能为 ``None`` = **未配置**。买家端据此只展示真正填了的那几项，
+      一项都没有就只陈述事实，不承诺一个不存在的渠道。
+    """
+
+    service_email: str | None = None
+    service_phone: str | None = None
+    service_hours: str | None = None
+
+
+class SiteContactUpdateRequest(CamelModel):
+    """整行覆盖客服联系方式。
+
+    ★ 三项**一起写**，不是部分更新：后台那个表单本来就一次提交三个输入框，
+      而"清空某一项"必须能被表达 —— 在部分更新语义下，"传 null" 和 "没传"
+      分不清，运营永远删不掉一条填错的联系方式。
+
+    ★ 空串归一成 ``None``（未配置），与 ``product.sku.sku_code`` 同一个取舍：
+      "没填"只有一种表示，前端写 `if (contact.serviceEmail)` 就够了。
+      用 ``mode="before"`` 是因为归一必须**发生在正则校验之前** —— 否则运营把邮箱
+      清空（提交一个空串）会撞上 ``SERVICE_EMAIL_PATTERN`` 吃一个 400，
+      而不是"取消配置"。
+    """
+
+    service_email: str | None = Field(default=None, max_length=128, pattern=SERVICE_EMAIL_PATTERN)
+    service_phone: str | None = Field(default=None, max_length=32)
+    service_hours: str | None = Field(default=None, max_length=64)
+
+    @field_validator("service_email", "service_phone", "service_hours", mode="before")
+    @classmethod
+    def _blank_to_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+
+class ActiveActivityOut(CamelModel):
+    """进行中的活动（买家端顶部公告用）。
+
+    ★ 刻意**只给名字与结束时间**：公告要的是"现在有什么活动、什么时候结束"，
+      不搬优惠规则（门槛/折扣率/范围都在算价里，搬出来只会两处口径不一致）。
+    """
+
+    id: SnowflakeId
+    name: str
+    level: int = Field(description="0单品 1店铺 2平台")
+    end_at: datetime
+
+
+class ActivePromotionsOut(CamelModel):
+    """进行中的平台级活动 + **真实总数**。
+
+    ★ 为什么要单独给 ``total``，而不是让调用方数 ``items`` 的长度：
+      公告带只放得下几条（``ACTIVE_ACTIVITY_LIMIT``），列表会截断，而
+      "还有 N 个活动进行中"里的 N 必须是**真实数量**。拿截断后的长度去算，
+      超出的那些活动就既看不到、也不计数 —— 等于凭空少了几个。
+    """
+
+    items: list[ActiveActivityOut]
+    total: int = Field(description="进行中的平台级活动总数，可能大于 len(items)")

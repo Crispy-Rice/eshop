@@ -33,17 +33,22 @@ import {
   createCouponTemplate,
   createPromoActivity,
   fetchShopsByIds,
+  fetchSiteContact,
+  fetchSiteTheme,
   issueCoupon,
   listCouponIssues,
   listCouponTemplates,
   listPromoActivities,
   lookupUserByPhone,
+  updateSiteContact,
+  updateSiteTheme,
   voidCouponTemplate,
   voidPromoActivity,
   type AdminCouponTemplate,
   type AdminPromoActivity,
   type CouponIssueRecord,
   type CouponIssueSummary,
+  type SkinOption,
   type UserLookup,
 } from '@/api/promotion'
 import ScopePicker from '@/components/ScopePicker.vue'
@@ -55,7 +60,28 @@ const auth = useAuthStore()
 /** 营销台是运营专属：后端接口只放给 admin / finance，商家看不到这个页面 */
 const isAdmin = computed(() => auth.user?.role === 'admin' || auth.user?.role === 'finance')
 
-const tab = ref<'coupon' | 'activity'>('coupon')
+const tab = ref<'coupon' | 'activity' | 'site'>('coupon')
+
+// ---------- 站点设置：全站皮肤 ----------
+/** 当前选中的皮肤（未保存前只是本地选择） */
+const siteSkin = ref('neutral')
+/** 已保存的皮肤 —— 用它判断"改了没有"，避免白提交一次 */
+const savedSkin = ref('neutral')
+/** 可选清单来自后端，前端不维护第二份 */
+const skinOptions = ref<SkinOption[]>([])
+const skinLoading = ref(false)
+const skinSaving = ref(false)
+
+// ---------- 站点设置：客服联系方式 ----------
+/**
+ * 三项都按**字符串**编辑（空串 = 不填）。
+ *
+ * ★ 后端把"空"存成 NULL，这里用空串表达同一件事：`el-input` 的 v-model 是字符串，
+ *   中间再插一层 null ↔ '' 的转换只会多一处出错的地方。提交时后端做归一，
+ *   返回的归一化结果再回填表单（见 saveSiteContact）。
+ */
+const contactForm = reactive({ serviceEmail: '', servicePhone: '', serviceHours: '' })
+const contactSaving = ref(false)
 
 // ---------- 券模板列表 ----------
 const coupons = ref<AdminCouponTemplate[]>([])
@@ -656,11 +682,84 @@ async function loadActivities(reset = true): Promise<void> {
   }
 }
 
-async function switchTab(next: 'coupon' | 'activity'): Promise<void> {
+async function switchTab(next: 'coupon' | 'activity' | 'site'): Promise<void> {
   if (tab.value === next) return
   tab.value = next
   if (next === 'coupon') await loadCoupons(true)
-  else await loadActivities(true)
+  else if (next === 'activity') await loadActivities(true)
+  else await loadSiteSettings()
+}
+
+/** 工具栏那个「刷新」按当前页签刷新 —— 三个页签各有各的数据源 */
+function refreshCurrent(): void {
+  if (tab.value === 'coupon') void loadCoupons(true)
+  else if (tab.value === 'activity') void loadActivities(true)
+  else void loadSiteSettings()
+}
+
+/**
+ * 读两张站点配置：皮肤 + 客服联系方式。
+ *
+ * ★ 一起拉、共用一个 loading：它们同属一个页签，分两次 loading 只会让面板闪两下。
+ * ★ 皮肤的 `options` 也一并从后端取：清单只有后端一份（`SITE_SKINS`），前端不另存
+ *   数组 —— 否则会出现"后台能选、买家端不认"的漂移。
+ */
+async function loadSiteSettings(): Promise<void> {
+  skinLoading.value = true
+  try {
+    const [theme, contact] = await Promise.all([fetchSiteTheme(), fetchSiteContact()])
+    siteSkin.value = theme.skin
+    savedSkin.value = theme.skin
+    skinOptions.value = theme.options
+    contactForm.serviceEmail = contact.serviceEmail ?? ''
+    contactForm.servicePhone = contact.servicePhone ?? ''
+    contactForm.serviceHours = contact.serviceHours ?? ''
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '加载站点设置失败')
+  } finally {
+    skinLoading.value = false
+  }
+}
+
+/**
+ * 保存站点皮肤，**立刻对全站生效**。
+ *
+ * ★ 不做二次确认：它不是破坏性操作，而且随时能改回来。这个页面里真正需要
+ *   确认的是**作废**活动/券模板（不可逆），那是另一回事。
+ */
+async function saveSiteTheme(): Promise<void> {
+  if (skinSaving.value || siteSkin.value === savedSkin.value) return
+  skinSaving.value = true
+  try {
+    savedSkin.value = (await updateSiteTheme(siteSkin.value)).skin
+    ElMessage.success('已切换全站皮肤，买家端刷新后生效')
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '保存失败')
+  } finally {
+    skinSaving.value = false
+  }
+}
+
+/**
+ * 保存客服联系方式。
+ *
+ * ★ 保存后**用返回值回填表单**：后端会把空串 / 纯空格归一成 null，回填的是归一化
+ *   之后的值 —— 否则界面上留着空格、库里其实已经清了，运营下次看到会以为没保存上。
+ */
+async function saveSiteContact(): Promise<void> {
+  if (contactSaving.value) return
+  contactSaving.value = true
+  try {
+    const saved = await updateSiteContact({ ...contactForm })
+    contactForm.serviceEmail = saved.serviceEmail ?? ''
+    contactForm.servicePhone = saved.servicePhone ?? ''
+    contactForm.serviceHours = saved.serviceHours ?? ''
+    ElMessage.success('已保存客服联系方式')
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '保存失败')
+  } finally {
+    contactSaving.value = false
+  }
 }
 
 async function switchStatus(value: number | undefined): Promise<void> {
@@ -703,29 +802,30 @@ onMounted(async () => {
         券与活动建出来后立即生效；下单时会按层级依次计算，具体叠加规则由平台配置
       </span>
       <div class="spacer" />
-      <el-button
-        size="small"
-        :loading="loading"
-        @click="tab === 'coupon' ? loadCoupons(true) : loadActivities(true)"
-      >
-        刷新
-      </el-button>
+      <el-button size="small" :loading="loading" @click="refreshCurrent">刷新</el-button>
     </div>
 
     <el-empty v-if="!isAdmin" description="营销中心仅对平台运营开放" />
 
     <template v-else>
       <div class="tabs">
-        <el-radio-group :model-value="tab" size="small" @change="switchTab($event as 'coupon' | 'activity')">
+        <el-radio-group
+          :model-value="tab"
+          size="small"
+          @change="switchTab($event as 'coupon' | 'activity' | 'site')"
+        >
           <el-radio-button value="coupon">优惠券</el-radio-button>
           <el-radio-button value="activity">促销活动</el-radio-button>
+          <el-radio-button value="site">站点设置</el-radio-button>
         </el-radio-group>
         <div class="spacer" />
         <!-- 补发记录：让"谁给谁发了多少"看得见。这是约束运营发券的主要手段 -->
         <el-button v-if="tab === 'coupon'" size="small" @click="openIssueRecords">
           补发记录
         </el-button>
+        <!-- 站点设置是两个配置表单，没有"新建"这个动作 -->
         <el-button
+          v-if="tab !== 'site'"
           type="primary"
           size="small"
           @click="tab === 'coupon' ? openCouponDialog() : openActivityDialog()"
@@ -734,7 +834,9 @@ onMounted(async () => {
         </el-button>
       </div>
 
+      <!-- 状态档只有两个列表页用：站点设置没有状态可筛 -->
       <el-radio-group
+        v-if="tab !== 'site'"
         :model-value="tab === 'coupon' ? couponStatus : activityStatus"
         size="small"
         @change="switchStatus($event as number | undefined)"
@@ -893,6 +995,73 @@ onMounted(async () => {
           <el-button size="small" :loading="loadingMore" @click="loadActivities(false)">
             加载更多
           </el-button>
+        </div>
+      </div>
+
+      <!-- ---------- 站点设置 ---------- -->
+      <!-- 两张**全站**配置：皮肤 + 客服联系方式。皮肤保存后买家端所有人下次加载就
+           换过来，买家自己不能选（docs/17 §3），所以文案要写清影响面，别让运营
+           以为只是改了自己看到的样子。联系方式同理 —— 它也不是"给谁看的偏好"。 -->
+      <div v-if="tab === 'site'" v-loading="skinLoading" class="panel">
+        <div class="site-body">
+          <section class="site-block">
+            <h3 class="site-title">全站皮肤</h3>
+            <p class="site-lead">皮肤由平台在这里启用，保存后全站生效，买家端没有切换入口。</p>
+            <el-radio-group v-model="siteSkin">
+              <el-radio-button v-for="o in skinOptions" :key="o.value" :value="o.value">
+                {{ o.label }}
+              </el-radio-button>
+            </el-radio-group>
+            <p class="hint">
+              没有大促时保持「默认·中性」。大促皮肤与促销活动是两件事：皮肤管外观，
+              顶部那条活动公告读的是真实进行中的活动。
+            </p>
+            <el-button
+              type="primary"
+              :loading="skinSaving"
+              :disabled="siteSkin === savedSkin"
+              @click="saveSiteTheme"
+            >
+              保存
+            </el-button>
+          </section>
+
+          <section class="site-block">
+            <h3 class="site-title">客服联系方式</h3>
+            <p class="site-lead">
+              展示在买家端的登录页与「账号被冻结」提示上。这两个位置正是给登不进来的人
+              看的，所以这一项不是装饰：三项全留空，那些用户就没有任何联系入口。
+            </p>
+            <el-form :model="contactForm" label-width="80px" class="site-form">
+              <el-form-item label="客服邮箱">
+                <el-input
+                  v-model="contactForm.serviceEmail"
+                  maxlength="128"
+                  placeholder="如：service@example.com"
+                />
+              </el-form-item>
+              <el-form-item label="客服电话">
+                <el-input
+                  v-model="contactForm.servicePhone"
+                  maxlength="32"
+                  placeholder="如：400-000-1234"
+                />
+              </el-form-item>
+              <el-form-item label="服务时间">
+                <el-input
+                  v-model="contactForm.serviceHours"
+                  maxlength="64"
+                  placeholder="如：工作日 9:00-18:00"
+                />
+              </el-form-item>
+              <el-form-item>
+                <el-button type="primary" :loading="contactSaving" @click="saveSiteContact">
+                  保存
+                </el-button>
+                <span class="hint">留空就是取消该一项。</span>
+              </el-form-item>
+            </el-form>
+          </section>
         </div>
       </div>
     </template>
@@ -1348,5 +1517,45 @@ onMounted(async () => {
 .load-more {
   margin-top: var(--space-3);
   text-align: center;
+}
+
+/* ---------- 站点设置 ---------- */
+
+.site-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-5);
+}
+
+/* 两块配置各保存各的，用描边分开 —— 别让运营以为一个「保存」管两件事 */
+.site-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.site-title {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+
+.site-lead {
+  max-width: 60em;
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--color-text);
+}
+
+/* 输入框撑满一块，否则默认宽度装不下一个邮箱 */
+.site-form {
+  width: 100%;
+  max-width: 460px;
 }
 </style>

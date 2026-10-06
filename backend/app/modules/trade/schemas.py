@@ -214,6 +214,9 @@ class MerchantOrderOut(CamelModel):
     delivery_status_text: str
 
     shop_id: SnowflakeId
+    # 下单时**路由**到的发货仓：决定"这单从哪打包"。历史老单可能为空
+    warehouse_id: SnowflakeId | None = None
+    warehouse_name: str = ""
     buyer_name: str = Field(description="收货人。发货要用的")
     buyer_phone: str
 
@@ -397,6 +400,7 @@ def to_merchant_order_out(
     main: OrderMain,
     items: list[OrderItem],
     deliveries: list[DeliveryOrder],
+    warehouse_name: str = "",
 ) -> MerchantOrderOut:
     return MerchantOrderOut(
         order_sub_no=sub.order_sub_no,
@@ -406,6 +410,8 @@ def to_merchant_order_out(
         delivery_status=sub.delivery_status,
         delivery_status_text=DELIVERY_STATUS_TEXT.get(int(sub.delivery_status), "未知"),
         shop_id=sub.shop_id,
+        warehouse_id=sub.warehouse_id,
+        warehouse_name=warehouse_name,
         buyer_name=main.receiver_name,
         buyer_phone=main.receiver_phone,
         total_amount=sub.total_amount,

@@ -69,8 +69,10 @@ async def calc_price(session: AsyncSession, user_id: int, req: CalcPriceRequest)
         if s.spu_status != SPU_ON_SHELF or s.status != SKU_ENABLED:
             raise BizError(ErrorCode.SKU_OFF_SHELF, f"「{s.title}」已下架，请重新选择")
 
-    # ---------- ② 加载库存（只读，不预占；预占在下单时做）----------
-    stock = await inventory_service.batch_available(session, sku_ids)
+    # ---------- ② 库存 ----------
+    # ★ 这里**不查库存**：可提交性必须**按仓**判（一个子单的货得落进同一个仓），
+    #   而那要等⑥.5 择仓之后才知道 —— 见末段的 can_submit。
+    #   跨仓求和是 v1 的口径，它正是"结算说能买、下单说没货"的来源。
 
     # ---------- ③ 组装计算行 ----------
     now = datetime.now(UTC)
@@ -123,7 +125,9 @@ async def calc_price(session: AsyncSession, user_id: int, req: CalcPriceRequest)
     )
 
     # ---------- ⑥.5 运费 ----------
-    freight, freight_notices = await _calc_freight(session, user_id, req, sku_ids)
+    freight, freight_notices, choices, shop_freight = await _calc_freight(
+        session, user_id, req, sku_ids
+    )
 
     # ---------- ⑥.6 运费券抵扣 ----------
     freight, freight_notices = _apply_freight_coupon(
@@ -161,11 +165,33 @@ async def calc_price(session: AsyncSession, user_id: int, req: CalcPriceRequest)
             )
         )
 
-    # 库存不足只提示，不阻断算价 —— 用户可能只是想看看多少钱
+    # ---------- ⑥.7 可提交性：**按仓**判，不再跨仓求和 ----------
+    #
+    # ★ 一个子单的所有商品必须能落进**同一个**仓（否则要拆发货单，见 inventory.routing），
+    #   所以判据是"该店择出来的那个仓够不够这一单"，而不是"全站加起来够不够"。
+    # ★ 算价**不因为缺货而失败**（用户可能就是想看看多少钱）——只把 can_submit 置 false
+    #   并给一句能照着做的提示，前端据此禁用提交按钮。
+    # ★ 缺货两种原因的补救办法不同：``short_sku_ids`` 里的是"哪个仓都不够"（只能等补货）；
+    #   它为空则只是"凑不到同一个仓"，那种情况**分开下单真的能解决**。
     notices = list(freight_notices)
+    can_submit = req.address_id is not None
     for it in result.items:
-        if stock.get(it.sku_id, 0) < it.num:
-            notices.append(f"「{it.title}」库存不足，下单前请调整数量")
+        choice = choices.get(int(it.sku_id))
+        if choice is None:
+            # 没选地址 → 无从判断（也没算运费）；前端另有"请先选择地址"的禁用
+            if req.address_id is not None:
+                can_submit = False
+                _add_notice(notices, f"「{it.title}」所属店铺还没有配置发货仓库，暂时无法下单")
+            continue
+        if choice.covered:
+            continue
+        can_submit = False
+        if int(it.sku_id) in choice.short_sku_ids:
+            _add_notice(notices, f"「{it.title}」库存不足，暂时无法下单")
+        elif choice.split_across:
+            _add_notice(
+                notices, "这单的商品分散在不同仓库，没有哪个仓库能一次发齐；可以把商品分开下单"
+            )
 
     return CalcPriceOut(
         items=out_items,
@@ -185,11 +211,19 @@ async def calc_price(session: AsyncSession, user_id: int, req: CalcPriceRequest)
         platform_discount=result.platform_discount,
         point_deduction=0,
         freight=freight,
+        freight_by_shop=shop_freight,
         # 应付 = 商品总额 - 各级商品优惠 + 运费（运费券已经在 freight 里扣掉了）
         payable_amount=result.payable_amount + freight,
         unavailable_coupons=unavailable,
         notices=notices,
+        can_submit=can_submit,
     )
+
+
+def _add_notice(notices: list[str], text: str) -> None:
+    """同一句提示只留一条 —— 按仓判断是**每店一次**的结论，逐行 append 会重复。"""
+    if text not in notices:
+        notices.append(text)
 
 
 @dataclass(slots=True)
@@ -210,19 +244,40 @@ async def _calc_freight(
     user_id: int,
     req: CalcPriceRequest,
     sku_ids: list[int],
-) -> tuple[int, list[str]]:
-    """算运费。返回 ``(运费, 提示)``。
+) -> tuple[int, list[str], dict[int, inventory_service.WarehouseChoice], dict[int, int]]:
+    """算运费。返回 ``(运费, 提示, 择仓结果, 各店运费)``。
 
     **没传地址时按 0 计并说明** —— 结算页要先能展示商品金额，用户选完地址再来算运费。
-    这不是"没实现"，是"还不知道发到哪"。
+    这不是"没实现"，是"还不知道发到哪"（那种情况下择仓结果为空）。
+
+    ★ 择仓结果往外传，是因为**可提交性要按它判**（``calc_price`` 末段）：一个子单的货
+      必须能落进**同一个**仓，跨仓求和判断不出来。
+
+    ★ 各店运费往外传，是因为**子单要按它记账**（``trade._split``）：运费券抵扣前，
+      每个子单的运费就是它自己那个包裹的运费。少了它，拆单只能按商品金额占比摊，
+      而退款退的正是子单那个数（docs/06 §6 / §8）。
     """
     if req.address_id is None:
-        return 0, ["选择收货地址后才会计算运费"]
+        return 0, ["选择收货地址后才会计算运费"], {}, {}
 
     address = await account_service.get_address_for_order(
         session, user_id, int(req.address_id)
     )
-    warehouses = await inventory_service.batch_sku_warehouses(session, sku_ids)
+    # 重量与金额从商品查，避免调用方重复传
+    skus = {
+        int(s.id): s
+        for s in await product_service.batch_get_skus(session, sku_ids, only_on_shelf=False)
+    }
+    # ★ 发货仓按**收货区划**择仓，规则仓盖不住时按候选链兜底（见 inventory.routing）。
+    #   这里必须与下单时拿到**同一个**仓：算价与下单用同一套判断（同一份 need），
+    #   否则会出现"算价说能买、下单说不能"。运费本身不随仓变（模板按 SKU、包裹按仓、
+    #   一店一仓），所以兜底不会改变报价。
+    choices = await inventory_service.route_warehouses(
+        session,
+        region_code=address.region_code,
+        sku_to_shop={sid: int(sku.shop_id) for sid, sku in skus.items()},
+        need={int(i.sku_id): int(i.num) for i in req.items},
+    )
 
     lines = [
         freight_service.FreightLine(
@@ -234,11 +289,6 @@ async def _calc_freight(
         )
         for i in req.items
     ]
-    # 重量与金额从商品查，避免调用方重复传
-    skus = {
-        int(s.id): s
-        for s in await product_service.batch_get_skus(session, sku_ids, only_on_shelf=False)
-    }
     for ln in lines:
         sku = skus.get(ln.sku_id)
         if sku is not None:
@@ -248,9 +298,24 @@ async def _calc_freight(
             ln.title = sku.title
 
     result = await freight_service.estimate(
-        session, lines=lines, region_code=address.region_code, warehouses=warehouses
+        session,
+        lines=lines,
+        region_code=address.region_code,
+        warehouses=inventory_service.warehouses_of(choices),
     )
-    return result.total, list(result.notices)
+
+    # 包裹 → 店。★ 一个包裹只会装一个店的货：仓属于店（``inventory.Warehouse.shop_id``），
+    # 而**同一个店的所有 SKU 一定落在同一个仓**（``inventory_service.route_warehouses``）。
+    # 万一这个前提被破坏（例如某店没有可用仓，它的 SKU 全落到 sentinel 0 挤成一包），
+    # 下面的 min() 仍让每个包裹**只计一次** —— 总额照样守恒，不会把守恒断言
+    # 报在 trade 那句"还没有配置发货仓库"前面。
+    shop_freight: dict[int, int] = {}
+    for pkg in result.packages:
+        shops = sorted({int(skus[s].shop_id) for s in pkg.sku_ids if s in skus})
+        if shops:
+            shop_freight[shops[0]] = shop_freight.get(shops[0], 0) + pkg.freight
+
+    return result.total, list(result.notices), choices, shop_freight
 
 
 def _apply_freight_coupon(

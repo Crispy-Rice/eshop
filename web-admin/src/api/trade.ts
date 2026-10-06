@@ -50,6 +50,9 @@ export interface MerchantOrder {
   deliveryStatusText: string
 
   shopId: string
+  /** 下单时路由到的发货仓。历史老单可能为空 */
+  warehouseId: string | null
+  warehouseName: string
   buyerName: string
   buyerPhone: string
 

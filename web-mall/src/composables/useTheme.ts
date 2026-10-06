@@ -1,11 +1,15 @@
-import { computed, ref, watch } from 'vue'
+import { ref, watch } from 'vue'
 
-import { DEFAULT_THEME, THEMES, isThemeId, THEME_LIST, type ThemeId } from '@/theme/themes'
+import { DEFAULT_THEME, THEMES, isThemeId, type ThemeId } from '@/theme/themes'
 
 /**
  * ★ 这个 key 必须和 `index.html` 里那段内联脚本用的字符串一致。
  *   内联脚本负责首屏前设好 data-theme（避免刷新时闪一下默认主题），
  *   改这里就要同步改那边。
+ *
+ * ★ 它的角色是**缓存**，不是用户偏好：存的是"上次从后端读到的站点皮肤"。
+ *   皮肤由**运营**在后台启用、全站生效（docs/17 §3），买家端没有切换器，
+ *   所以这里没有任何用户写入的入口 —— 只有 `applyServerSkin`。
  */
 const STORAGE_KEY = 'eshop.theme'
 
@@ -13,7 +17,7 @@ const STORAGE_KEY = 'eshop.theme'
 const SWITCH_CLASS = 'theme-switching'
 const SWITCH_MS = 280
 
-function readStored(): ThemeId {
+function readCached(): ThemeId {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     return isThemeId(raw) ? raw : DEFAULT_THEME
@@ -24,7 +28,7 @@ function readStored(): ThemeId {
 }
 
 /** 模块级单例：主题是全局状态，各处读到的必须是同一份 */
-const current = ref<ThemeId>(readStored())
+const current = ref<ThemeId>(readCached())
 
 function apply(id: ThemeId): void {
   document.documentElement.dataset.theme = id
@@ -55,12 +59,16 @@ export function useTheme() {
   return {
     /** 当前皮肤 id */
     theme: current,
-    /** 当前皮肤的完整元数据，营销带和切换器都读它 */
-    themeDef: computed(() => THEMES[current.value]),
-    /** 全部皮肤，供切换器渲染 */
-    themes: THEME_LIST,
-    setTheme(id: ThemeId): void {
-      current.value = id
+    /**
+     * 应用**后端下发的站点皮肤**（应用外壳启动时调一次，见 App.vue 的 onMounted）。
+     *
+     * ★ 认不出的 id 一律忽略：后端上了新皮肤而前端还是旧版本时，回落到当前值
+     *   比切到一个没有配色定义的主题安全（那会让整站颜色变成一堆未定义变量）。
+     * ★ 与当前值相同时直接返回，不触发 watch —— 也就没有那 280ms 的过渡闪动。
+     */
+    applyServerSkin(skin: string): void {
+      if (!isThemeId(skin) || skin === current.value) return
+      current.value = skin
     },
   }
 }

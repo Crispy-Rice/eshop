@@ -104,6 +104,11 @@ export interface CalcPriceResult {
   payableAmount: number
   unavailableCoupons: UnavailableCoupon[]
   notices: string[]
+  /**
+   * 能不能提交下单。**按仓**判定：某个子单的货没有哪个仓库能一次发齐时为 false
+   * （理由在 `notices` 里）。缺货**不会**让算价本身失败 —— 用户可能只是想看看多少钱。
+   */
+  canSubmit: boolean
 }
 
 export function fetchAvailableCoupons(): Promise<ReceivableCoupon[]> {

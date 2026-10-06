@@ -330,7 +330,15 @@ async def estimate_freight(
         int(s.id): s
         for s in await product_service.batch_get_skus(session, sku_ids, only_on_shelf=False)
     }
-    warehouses = await inventory_service.batch_sku_warehouses(session, sku_ids)
+    # ★ 与算价/下单**同一套择仓**（规则优先、缺货按候选链兜底，见 inventory.routing）
+    #   —— 三处必须给出同一个仓，不然购物车预估的运费会和结算页/下单时的对不上。
+    #   （运费本身不随仓变：模板按 SKU、包裹按仓、一店一仓。）
+    choices = await inventory_service.route_warehouses(
+        session,
+        region_code=address.region_code,
+        sku_to_shop={sid: int(sku.shop_id) for sid, sku in skus.items()},
+        need={int(i.sku_id): int(i.num) for i in body.items},
+    )
 
     def line_of(sku_id: str, num: int) -> service.FreightLine:
         sku = skus.get(int(sku_id))
@@ -347,7 +355,7 @@ async def estimate_freight(
         session,
         lines=[line_of(i.sku_id, i.num) for i in body.items],
         region_code=address.region_code,
-        warehouses=warehouses,
+        warehouses=inventory_service.warehouses_of(choices),
     )
     return ApiResponse.ok(
         FreightEstimateOut(

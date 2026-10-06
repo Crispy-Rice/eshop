@@ -215,6 +215,11 @@ onMounted(() => {
           <span>{{ target.buyerName }} {{ target.buyerPhone }}</span>
         </div>
         <div class="ship-line">
+          <span class="ship-label">发货仓</span>
+          <!-- 多仓之后"从哪个仓打包"是下单时按收货地区路由定的，发货单会记它 -->
+          <span>{{ target.warehouseName || '默认仓' }}</span>
+        </div>
+        <div class="ship-line">
           <span class="ship-label">地址</span>
           <span class="ship-addr">{{ target.receiverFull }}</span>
         </div>

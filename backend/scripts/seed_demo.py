@@ -461,6 +461,63 @@ def ensure_coupons(client: httpx.Client, admin_h: dict[str, str]) -> int:
     return created
 
 
+def ensure_activities(client: httpx.Client, admin_h: dict[str, str]) -> int:
+    """建一条**平台级**演示活动，已存在的按名字跳过。
+
+    ★ 为什么特意要平台级的：买家端顶部那条**活动公告只播平台级活动**
+      （店铺级活动的名字是商家起的，播到全站公告上等于平台替商家打广告）。
+      没有它，演示环境的公告带就是空的 —— 那条带正是"公告说的是真活动"的证据。
+
+    ★ 时间窗盖住当前：公告只播**正在进行**的活动，所以 start 要落在过去、
+      end 落在未来，否则演示时看不到。
+    """
+    page = unwrap(client.get("/admin/promotions", params={"limit": 50}, headers=admin_h))
+    existing = {item["name"] for item in page["items"]}
+
+    now = datetime.now(UTC)
+    created = 0
+    for name, threshold in (("全平台满 200 减 20", 20000),):
+        if name in existing:
+            continue
+        unwrap(
+            client.post(
+                "/admin/promotions",
+                json={
+                    "name": name,
+                    "level": 2,  # 平台级
+                    "type": "PROMO_ORDER_PLATFORM",
+                    "calcType": 1,  # 直降：减 discountValue
+                    "discountValue": 2000,
+                    "threshold": threshold,
+                    "startAt": (now - timedelta(days=1)).isoformat(),
+                    "endAt": (now + timedelta(days=30)).isoformat(),
+                },
+                headers=admin_h,
+            )
+        )
+        created += 1
+    return created
+
+
+def ensure_site_contact(client: httpx.Client, admin_h: dict[str, str]) -> bool:
+    """填一套平台客服联系方式。返回是否真的写了（幂等：内容一致就跳过）。
+
+    ★ 为什么演示环境**必须有**：买家端在**登录页**与**账号被冻结的提示**上展示它
+      （`/site-contact` 是公开接口）。三项全空的话，被封的账号只能看到一句
+      "已被冻结" —— 那条链路看起来仍然是断的，演示不出"用户能找平台"。
+    ★ 值刻意用 example.com 与 400 号：演示环境不该出现一个真会被打爆的邮箱或电话。
+    """
+    wanted = {
+        "serviceEmail": "service@example.com",
+        "servicePhone": "400-000-1234",
+        "serviceHours": "工作日 9:00-18:00",
+    }
+    if unwrap(client.get("/site-contact")) == wanted:
+        return False
+    unwrap(client.put("/admin/site-contact", json=wanted, headers=admin_h))
+    return True
+
+
 def ensure_banners(
     client: httpx.Client,
     admin_h: dict[str, str],
@@ -1318,6 +1375,12 @@ def main() -> int:
 
         coupon_count = ensure_coupons(client, admin_h)
         print(f"券模板就绪：新建 {coupon_count} 个（已存在的跳过）")
+
+        activity_count = ensure_activities(client, admin_h)
+        print(f"平台活动就绪：新建 {activity_count} 个（已存在的跳过；买家端公告读它）")
+
+        contact_written = ensure_site_contact(client, admin_h)
+        print(f"客服联系方式：{'已写入' if contact_written else '跳过（已存在）'}（登录页与被冻结提示读它）")
 
         # ---------- 商家 ----------
         merchant_h = login_or_register(client, MERCHANT_PHONE, "演示商家")

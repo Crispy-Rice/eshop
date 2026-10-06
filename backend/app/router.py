@@ -25,10 +25,12 @@ from app.modules.cart.router import router as cart_router
 from app.modules.files.router import router as files_router
 from app.modules.freight.router import router as freight_router
 from app.modules.inventory.router import router as inventory_router
+from app.modules.notify.router import router as notify_router
 from app.modules.payment.router import router as payment_router
 from app.modules.product.router import router as product_router
 from app.modules.promotion.router import router as promotion_router
 from app.modules.review.router import router as review_router
+from app.modules.support.router import router as support_router
 from app.modules.trade.router import router as trade_router
 
 MODULE_ROUTERS: list[APIRouter] = [
@@ -43,6 +45,8 @@ MODULE_ROUTERS: list[APIRouter] = [
     aftersale_router,
     files_router,
     review_router,
+    support_router,
+    notify_router,
 ]
 
 

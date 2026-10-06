@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 
-import { isBizError } from '@/api/errors'
+import { ErrorCode, accountBlockOf, isBizError } from '@/api/errors'
+import { fetchSiteContact, type SiteContact } from '@/api/site'
 import { useAuthStore } from '@/stores/auth'
 import { rememberPasswordInBrowser } from '@/utils/credential'
 
@@ -44,7 +45,40 @@ onMounted(() => {
     form.phone = saved
     rememberPhone.value = true
   }
+  void loadContact()
 })
+
+/**
+ * 平台客服联系方式。
+ *
+ * ★ 登录页之所以要显示它：需要联系平台的典型场景（**账号被冻结、登不进来**）
+ *   恰恰是用户还没登录的时候。这也是 `GET /api/site-contact` 做成公开接口的原因。
+ * ★ 三项可能**都没配**（运营还没填）：这时面板只说事实，不给一个假入口。
+ */
+const contact = ref<SiteContact | null>(null)
+const hasContact = computed(
+  () =>
+    !!(contact.value?.serviceEmail || contact.value?.servicePhone || contact.value?.serviceHours),
+)
+
+async function loadContact(): Promise<void> {
+  try {
+    contact.value = await fetchSiteContact()
+  } catch {
+    // 静默：拉不到只是不显示联系方式，不该影响登录本身
+  }
+}
+
+/** 面板标题。冻结与注销是两回事 —— 前者可解封，后者是终态。 */
+const blockedTitle = computed(() =>
+  auth.blocked?.code === ErrorCode.ACCOUNT_CLOSED ? '账号已注销' : '账号已被冻结',
+)
+
+// 换一个手机号，上一条结论就不再适用（它可能是另一个账号、或上一次输入的结论）
+watch(
+  () => form.phone,
+  () => auth.clearBlocked(),
+)
 
 const rules: FormRules = {
   phone: [
@@ -54,6 +88,26 @@ const rules: FormRules = {
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
     { min: 8, max: 128, message: '密码至少 8 位', trigger: 'blur' },
+    {
+      /**
+       * ★ 只在**注册**时校验"至少两类字符"，与后端 `core/security.py` 的
+       *   `validate_password_strength` 对齐。
+       *
+       *   登录不能校这条：登录是对**已有口令**的校验，客户端再加一条规则，
+       *   只会在服务端认为没问题时把用户挡在门外。原来这里的占位文案写着
+       *   "含字母/数字/符号中的两类"，但规则里只有长度 —— 前后端口径不一致。
+       */
+      validator: (_rule, value: string, callback) => {
+        if (mode.value !== 'register') return callback()
+        const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((re) =>
+          re.test(value),
+        ).length
+        return classes >= 2
+          ? callback()
+          : callback(new Error('需包含字母、数字、符号中的至少两类'))
+      },
+      trigger: 'blur',
+    },
   ],
   confirmPassword: [
     {
@@ -111,6 +165,15 @@ async function onSubmit(): Promise<void> {
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     await router.push(redirect)
   } catch (e) {
+    /**
+     * ★ 账号被冻结**不是**"操作失败"：它是一个用户无法自行绕过的终态拦截，
+     *   而且还要给出联系渠道。所以走卡片上那个**持久面板**，不是 3 秒就消失的 toast
+     *   —— 错过之后只剩"点了登录没反应"，连重读一遍都做不到。
+     */
+    if (isBizError(e, ErrorCode.ACCOUNT_BANNED)) {
+      auth.setBlocked(accountBlockOf(e))
+      return
+    }
     ElMessage.error(isBizError(e) ? e.message : '操作失败，请重试')
   }
 }
@@ -125,6 +188,33 @@ function switchMode(): void {
   <div class="wrap">
     <el-card class="card" shadow="never">
       <h2 class="title">{{ mode === 'login' ? '登录' : '注册' }}</h2>
+
+      <!-- 账号被冻结 / 已注销。**持久**面板，不是 toast：见 onSubmit 里的说明。
+           联系方式只在运营**真的配了**的时候出现 —— 一项都没配就只说事实，
+           不去承诺一个并不存在的渠道（那正是原来那句"请联系客服"的毛病）。 -->
+      <section v-if="auth.blocked" class="blocked">
+        <p class="blocked-title">{{ blockedTitle }}</p>
+        <p v-if="auth.blocked.reason" class="blocked-row">
+          <span class="blocked-label">原因</span>
+          <span>{{ auth.blocked.reason }}</span>
+        </p>
+
+        <template v-if="hasContact">
+          <p class="blocked-lead">如有疑问，可通过以下方式联系我们：</p>
+          <p v-if="contact?.serviceEmail" class="blocked-row">
+            <span class="blocked-label">客服邮箱</span>
+            <span>{{ contact.serviceEmail }}</span>
+          </p>
+          <p v-if="contact?.servicePhone" class="blocked-row">
+            <span class="blocked-label">客服电话</span>
+            <span>{{ contact.servicePhone }}</span>
+          </p>
+          <p v-if="contact?.serviceHours" class="blocked-row">
+            <span class="blocked-label">服务时间</span>
+            <span>{{ contact.serviceHours }}</span>
+          </p>
+        </template>
+      </section>
 
       <el-form
         ref="formRef"
@@ -227,6 +317,45 @@ function switchMode(): void {
   font-size: var(--text-xl);
   font-weight: var(--weight-semibold);
   color: var(--color-text);
+}
+
+/* 冻结 / 注销说明。柔和危险底 + 左侧色条：和表单明显分开，但不至于刺眼 ——
+   用户可能是误输了别人的手机号，别一进门就给他一片红。 */
+.blocked {
+  margin-bottom: var(--space-5);
+  padding: var(--space-3) var(--space-4);
+  border-left: 3px solid var(--color-danger);
+  border-radius: var(--radius-sm);
+  background: var(--color-danger-soft);
+}
+
+.blocked-title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+
+.blocked-row {
+  display: flex;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+}
+
+/* 标签定宽：几行值才能左对齐成一条线 */
+.blocked-label {
+  flex: 0 0 auto;
+  width: 4em;
+  color: var(--color-text-tertiary);
+}
+
+.blocked-lead {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
 }
 
 .submit {

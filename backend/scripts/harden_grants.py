@@ -44,7 +44,13 @@ from app.core.logging import get_logger, setup_logging
 logger = get_logger(__name__)
 
 # 不可变的审计表：(schema, 表名)
-IMMUTABLE_TABLES: tuple[tuple[str, str], ...] = (("trade", "order_state_flow"),)
+IMMUTABLE_TABLES: tuple[tuple[str, str], ...] = (
+    ("trade", "order_state_flow"),
+    # 账号状态流转（封禁/解封/注销/重置密码）：同样只该被追加，不该被改
+    ("account", "user_state_flow"),
+    # 客服会话状态流转（开单/关闭/重开）：同上
+    ("support", "ticket_state_flow"),
+)
 
 # 角色名要拼进 SQL（PG 的 REVOKE 不接受标识符做参数），所以先卡一道格式。
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

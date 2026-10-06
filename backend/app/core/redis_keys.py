@@ -166,3 +166,8 @@ def stream(topic: str) -> str:
 
 def stream_dead(topic: str) -> str:
     return f"stream:dead:{topic}"
+
+
+def support_send_rate(user_id: int) -> str:
+    """客服发消息的限流计数（docs/19 §4）。固定窗口，60 秒。"""
+    return f"support:ratelimit:{user_id}"

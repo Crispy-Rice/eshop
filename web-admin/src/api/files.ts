@@ -7,7 +7,14 @@ import { post } from './http'
  *   `/data/media` 下的哪个目录，服务端会再校验一次。抽成类型是为了别让
  *   「api 层」和「ImageUploader 组件」各维护一份而悄悄漂移。
  */
-export type BizLine = 'reviews' | 'aftersale' | 'products' | 'shops' | 'avatars' | 'banners'
+export type BizLine =
+  | 'reviews'
+  | 'aftersale'
+  | 'products'
+  | 'shops'
+  | 'avatars'
+  | 'banners'
+  | 'support'
 
 /**
  * 上传单张图片（商品图、店铺 LOGO、售后的质检留证）。

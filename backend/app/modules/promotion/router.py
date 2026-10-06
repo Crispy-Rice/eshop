@@ -31,16 +31,21 @@ from app.modules.promotion.models import (
     COUPON_TYPE_TEXT,
     DISCOUNT_TYPE_TEXT,
     LEVEL_ITEM,
+    LEVEL_PLATFORM,
     LEVEL_TEXT,
     PROMO_TYPE_BY_LEVEL,
     SCOPE_ALL,
+    SITE_SKINS,
     VALID_DAYS_AFTER,
     VALID_FIXED,
     Banner,
     CouponTemplate,
     PromoActivity,
+    SiteContact,
 )
 from app.modules.promotion.schemas import (
+    ActiveActivityOut,
+    ActivePromotionsOut,
     AdminCouponTemplateListOut,
     AdminCouponTemplateOut,
     AdminIssueRequest,
@@ -62,6 +67,11 @@ from app.modules.promotion.schemas import (
     MyCouponOut,
     PromoActivityCreateRequest,
     ReceivableCouponOut,
+    SiteContactOut,
+    SiteContactUpdateRequest,
+    SiteThemeOut,
+    SiteThemeUpdateRequest,
+    SkinOptionOut,
     UserLookupOut,
 )
 
@@ -745,3 +755,128 @@ async def delete_banner(session: DbSession, banner_id: int, _: AdminDep) -> ApiR
         raise BizError(ErrorCode.NOT_FOUND, "轮播图不存在")
     await repo.delete_banner(session, banner_id)
     return ApiResponse.ok(None)
+
+
+# ============================================================
+# 站点主题（运营启用、全站生效）
+# ============================================================
+# 公告最多展示几个活动。多到几个之后用户也读不过来，第一句最重要。
+ACTIVE_ACTIVITY_LIMIT = 5
+
+
+def _site_theme_out(skin: str) -> SiteThemeOut:
+    """当前皮肤 + 可选项。``options`` 给后台的选择器用，省得它自己维护一份清单。"""
+    return SiteThemeOut(
+        skin=skin,
+        options=[SkinOptionOut(value=value, label=label) for value, label in SITE_SKINS],
+    )
+
+
+@router.get("/api/site-theme", response_model=ApiResponse[SiteThemeOut], summary="当前站点主题")
+async def get_site_theme(session: DbSession) -> ApiResponse[SiteThemeOut]:
+    """**公开接口**：买家端启动时读它，决定全站用哪套皮肤。
+
+    ★ 皮肤由**运营**在后台启用（见下面那个 PUT），买家端没有切换器 ——
+      所以这里是"当前全站长什么样"的唯一来源。
+
+    ★ 与 banner 同理，这一组不单独加 service 层：只有一行配置、一条规则，
+      没必要为它多一层。
+    """
+    return ApiResponse.ok(_site_theme_out(await repo.get_site_theme_skin(session)))
+
+
+@router.put(
+    "/api/admin/site-theme", response_model=ApiResponse[SiteThemeOut], summary="设置站点主题"
+)
+async def update_site_theme(
+    body: SiteThemeUpdateRequest, _admin: AdminDep, session: DbSession
+) -> ApiResponse[SiteThemeOut]:
+    """切换全站皮肤。保存后**立刻对所有人生效** —— 买家端下次加载就会读到新值。
+
+    ★ 非法皮肤在 ``SiteThemeUpdateRequest`` 的正则那层就被挡下（400、不进库），
+      这里不重复校验。
+    """
+    await repo.update_site_theme_skin(session, body.skin)
+    return ApiResponse.ok(_site_theme_out(body.skin))
+
+
+# ============================================================
+# 客服联系方式（运营填、买家端展示）
+# ============================================================
+def _site_contact_out(row: SiteContact | None) -> SiteContactOut:
+    """缺行或某项没填都回 ``None`` —— 前端只展示真正有值的项。"""
+    if row is None:
+        return SiteContactOut()
+    return SiteContactOut(
+        service_email=row.service_email,
+        service_phone=row.service_phone,
+        service_hours=row.service_hours,
+    )
+
+
+@router.get(
+    "/api/site-contact", response_model=ApiResponse[SiteContactOut], summary="平台客服联系方式"
+)
+async def get_site_contact(session: DbSession) -> ApiResponse[SiteContactOut]:
+    """**公开接口**：买家端在**登录页**与**封禁提示**处展示它。
+
+    ★ 为什么必须是公开的：需要联系平台的典型场景（被封禁、登不进来）恰恰是
+      用户**还没登录**的时候。藏在「我的」里的联系方式，对被封的人等于不存在 ——
+      而"请联系客服"这句话正是说给他们的。
+    """
+    return ApiResponse.ok(_site_contact_out(await repo.get_site_contact(session)))
+
+
+@router.put(
+    "/api/admin/site-contact",
+    response_model=ApiResponse[SiteContactOut],
+    summary="设置平台客服联系方式",
+)
+async def update_site_contact(
+    body: SiteContactUpdateRequest, _admin: AdminDep, session: DbSession
+) -> ApiResponse[SiteContactOut]:
+    """整行覆盖。存空（或留空）就是**取消配置**那一项。
+
+    ★ 与 site-theme 同理，这一组不单独加 service 层：只有一行配置、没有业务规则要守，
+      ``SiteContactUpdateRequest`` 的长度与邮箱校验已经覆盖了全部约束。
+    """
+    await repo.update_site_contact(
+        session,
+        service_email=body.service_email,
+        service_phone=body.service_phone,
+        service_hours=body.service_hours,
+    )
+    return ApiResponse.ok(_site_contact_out(await repo.get_site_contact(session)))
+
+
+@router.get(
+    "/api/promotions/active",
+    response_model=ApiResponse[ActivePromotionsOut],
+    summary="进行中的平台活动（公开）",
+)
+async def list_active_promotions(session: DbSession) -> ApiResponse[ActivePromotionsOut]:
+    """买家端顶部公告用：**正在进行的平台级活动**，最快结束的排在最前。
+
+    ★ **只要平台级（level=2）**。公告是**平台**的口径，而店铺级 / 单品级活动的
+      名字是**商家**起的 —— 播到全站公告上等于平台替商家打广告，也挡不住标题党。
+    ★ 一条都没有就返回空 items，买家端据此整条不渲染（而不是显示一句空话）。
+    ★ ``total`` 是**真实条数**，与 ``items`` 的长度可能不等：公告带只放得下
+      ``ACTIVE_ACTIVITY_LIMIT`` 条，而"还有 N 个"要说真话。
+    ★ 查询同时过滤 ``status=2``（挡掉已作废的）与时间窗（挡掉时间已过、状态还没
+      翻过来的）。代价是**刚开场的活动最多晚一分钟**出现在公告上 ——
+      状态由每分钟一次的 cron 推进，这个滞后可以接受。
+    """
+    rows = await repo.list_active_activities(
+        session, now=datetime.now(UTC), levels=(LEVEL_PLATFORM,)
+    )
+    # list_active_activities 的序是给算价用的（level → priority → id），不是展示序
+    rows.sort(key=lambda a: a.end_at)
+    return ApiResponse.ok(
+        ActivePromotionsOut(
+            items=[
+                ActiveActivityOut(id=a.id, name=a.name, level=a.level, end_at=a.end_at)
+                for a in rows[:ACTIVE_ACTIVITY_LIMIT]
+            ],
+            total=len(rows),
+        )
+    )

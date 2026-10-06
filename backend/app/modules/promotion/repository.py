@@ -20,7 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.promotion.models import (
     BANNER_ENABLED,
     CODE_LOCKED,
+    DEFAULT_SITE_SKIN,
     ISSUE_BIZ_KEY_PREFIX,
+    SITE_CONTACT_ID,
+    SITE_THEME_ID,
     Banner,
     CouponCode,
     CouponFlow,
@@ -28,6 +31,8 @@ from app.modules.promotion.models import (
     CouponUserQuota,
     PromoActivity,
     PromoStackRule,
+    SiteContact,
+    SiteTheme,
 )
 
 
@@ -588,3 +593,63 @@ async def update_banner_fields(session: AsyncSession, banner_id: int, values: di
 
 async def delete_banner(session: AsyncSession, banner_id: int) -> None:
     await session.execute(delete(Banner).where(Banner.id == banner_id))
+
+
+# ============================================================
+# 站点主题（单行）
+# ============================================================
+async def get_site_theme_skin(session: AsyncSession) -> str:
+    """读当前启用的皮肤 id。
+
+    ★ 迁移里已经插好了 id=1 那一行，所以正常情况永远读得到。万一缺行（只可能是
+      手工改库），**回落到中性**而不是报错 —— 这是每个访客都会打的公开接口，
+      为了一行配置把整个商城打不开不划算。
+    """
+    row = await session.get(SiteTheme, SITE_THEME_ID)
+    return row.skin if row is not None else DEFAULT_SITE_SKIN
+
+
+async def update_site_theme_skin(session: AsyncSession, skin: str) -> None:
+    """改全站皮肤。只有一行可改，所以不需要 id 参数。"""
+    await session.execute(
+        update(SiteTheme)
+        .where(SiteTheme.id == SITE_THEME_ID)
+        .values(skin=skin, updated_at=func.now())
+    )
+
+
+# ============================================================
+# 客服联系方式（单行）
+# ============================================================
+async def get_site_contact(session: AsyncSession) -> SiteContact | None:
+    """读平台联系方式那一行。
+
+    ★ 与 ``get_site_theme_skin`` 不同，这里**不做回落** —— 皮肤缺行要回落到中性
+      （不然全站没样式），联系方式缺行只意味着"没配联系方式"，如实返回 ``None``
+      让调用方决定怎么展示。这两件事的兜底要求本来就不一样。
+    """
+    return await session.get(SiteContact, SITE_CONTACT_ID)
+
+
+async def update_site_contact(
+    session: AsyncSession,
+    *,
+    service_email: str | None,
+    service_phone: str | None,
+    service_hours: str | None,
+) -> None:
+    """**整行覆盖**联系方式。
+
+    是覆盖而不是部分更新：运营得能删掉一条填错的值。空串在 schema 层已经归一成
+    ``None``，所以这里拿到的 ``None`` 就是"把这一项清掉"。
+    """
+    await session.execute(
+        update(SiteContact)
+        .where(SiteContact.id == SITE_CONTACT_ID)
+        .values(
+            service_email=service_email,
+            service_phone=service_phone,
+            service_hours=service_hours,
+            updated_at=func.now(),
+        )
+    )

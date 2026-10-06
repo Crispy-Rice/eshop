@@ -1,6 +1,6 @@
 """inventory 模块的 ORM 模型。
 
-对应 docs/03-inventory.md 与 docs/13-schema.md §1。四张表，各有一条关键约束：
+对应 docs/03-inventory.md 与 docs/13-schema.md §1。五张表，各有一条关键约束：
 
 1. ``sku_stock`` 的 **CHECK 恒等式** ``total = available + locked + frozen``
    与 **非负约束**——任何代码 Bug 导致的负库存或等式破坏，都会让事务直接失败，
@@ -11,6 +11,8 @@
    分区键，把 biz_key 放在流水表上就失去了全局唯一性，防重复回补就失效了
    （docs/03 §8）。所以幂等键独立成一张小表。
 4. ``warehouse`` 上用一个 partial unique index 保证**每店铺最多一个默认仓**。
+5. ``warehouse_region_rule`` 的唯一键是 ``(shop_id, region_code)`` —— 一个区划码
+   只能由一个仓发货，于是**不需要优先级**，具体性由区划码长度决定（见 routing.py）。
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    ForeignKey,
     Identity,
     Index,
     Integer,
@@ -66,7 +69,16 @@ CHANGE_TYPE_TEXT: dict[int, str] = {
 
 
 class Warehouse(Base):
-    """仓库。第一期每个店铺一个默认仓，由 ``ensure_default_warehouse`` 懒创建。"""
+    """仓库。**商家可自建多个**，每店铺最多一个默认仓（partial unique index 保证）。
+
+    ★ 每个仓有地址（省市区 + 详细地址 + 联系人/电话）。``region_code`` 是**最细一级
+      的区划码**，与 ``account.user_address.region_code`` 同一口径 —— **路由匹配它的
+      前缀**（见 ``routing.py``）。之前这一列没有任何代码读它，这一轮才真正开始用。
+
+    ★ ``is_default`` 是**路由的兜底**：地址没命中任何区域规则时发这个仓。所以
+      "每店必有且仅有一个默认仓"是一条不变量，**默认仓不允许停用**
+      （要换先设另一个为默认）—— 否则路由会没有兜底。
+    """
 
     __tablename__ = "warehouse"
     __table_args__ = (
@@ -81,16 +93,79 @@ class Warehouse(Base):
     shop_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="跨 schema 不建外键")
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     region_code: Mapped[str] = mapped_column(
-        String(16), nullable=False, server_default=text("''"), comment="区划码，运费计算用"
+        String(16),
+        nullable=False,
+        server_default=text("''"),
+        comment="最细一级的行政区划码（6 位），路由按它的前缀匹配",
+    )
+    # 地址与联系人。命名与 account.user_address 对齐，商城的地址表单可以照着抄
+    province: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default=text("''"), comment="省/直辖市，展示用"
+    )
+    city: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default=text("''"), comment="市"
+    )
+    district: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default=text("''"), comment="区/县"
+    )
+    detail: Mapped[str] = mapped_column(
+        String(255), nullable=False, server_default=text("''"), comment="详细地址（街道门牌）"
+    )
+    contact_name: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default=text("''"), comment="联系人"
+    )
+    contact_phone: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("''"), comment="联系电话"
     )
     is_default: Mapped[bool] = mapped_column(
-        nullable=False, server_default=text("false"), comment="每店铺最多一个"
+        nullable=False, server_default=text("false"), comment="每店铺最多一个。路由的兜底仓"
     )
     status: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, server_default=text("1"), comment="1启用 2停用"
     )
     created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
+
+
+class WarehouseRegionRule(Base):
+    """仓的发货覆盖区划 —— "这个仓发往哪些地方"。
+
+    ★ 唯一键是 ``(shop_id, region_code)``：**一个区划码只能由一个仓发货**。
+      于是这张表**不需要优先级**，具体性完全由**区划码长度**决定 ——
+      "4403 深圳 → 深圳仓" 比 "44 广东 → 广州仓" 更具体，收货地址 ``440305``
+      两条都命中，取码更长的那个（见 ``routing.warehouse_candidates``）。
+      商家的心智也因此简单：一个地方只由一个仓发货。
+
+    ★ 这是**首选**意义上的：规则仓没货时会按候选链兜到别的仓
+      （规则仓 → 默认仓 → 其余启用仓）。唯一键保证的只是"不会有两个仓抢同一个区划"。
+
+    ★ ``shop_id`` 是冗余列：路由要按店**批量**取规则（一个订单可能跨店），
+      带上它就不必 join ``warehouse``。
+
+    ``region_level`` 由码长推导、**匹配时不参与**，只为后台展示（照 freight 的取舍）。
+    """
+
+    __tablename__ = "warehouse_region_rule"
+    __table_args__ = (
+        UniqueConstraint("shop_id", "region_code", name="uk_warehouse_rule_shop_region"),
+        Index("idx_warehouse_rule_shop", "shop_id"),
+        {"schema": "inventory", "comment": "仓库的发货覆盖区划"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="冗余：按店批量查规则必需"
+    )
+    warehouse_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("inventory.warehouse.id"), nullable=False
+    )
+    region_code: Mapped[str] = mapped_column(
+        String(16), nullable=False, comment='前缀匹配；"0" = 该仓兜底覆盖全国'
+    )
+    region_level: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, comment="1省 2市 3区，由码长推导，匹配时不参与"
+    )
+    created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
 
 
 class SkuStock(Base):

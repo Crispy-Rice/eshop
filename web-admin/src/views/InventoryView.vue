@@ -127,11 +127,11 @@ async function submitAdjust(): Promise<void> {
   }
 }
 
-/** 后台仓是每店铺一个默认仓，第一次进来时列表为空，引导建仓 */
+/** 商家第一次进库存页时列表为空，兜底建一个默认仓（仓库的地址等信息去「仓库」页维护） */
 async function ensureWarehouse(): Promise<void> {
   if (warehouses.value.length > 0) return
   try {
-    const wh = await createWarehouse('默认仓库')
+    const wh = await createWarehouse({ name: '默认仓库' })
     warehouses.value = [wh]
     warehouseFilter.value = wh.id
   } catch (e) {

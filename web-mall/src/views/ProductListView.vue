@@ -1,22 +1,20 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
-import { fetchShops } from '@/api/auth'
 import { isBizError } from '@/api/errors'
 import { fetchCategoryTree, searchProducts, type Category, type SearchSort, type SpuCard } from '@/api/product'
 import BannerCarousel from '@/components/BannerCarousel.vue'
-import { formatPriceRange, yuanToFen } from '@/utils/money'
-import { onImageError, thumbFallback, thumbSrc } from '@/utils/placeholder'
+import ProductGrid from '@/components/ProductGrid.vue'
+import { useShelf } from '@/composables/useShelf'
+import { yuanToFen } from '@/utils/money'
 
 const router = useRouter()
 const route = useRoute()
 
 const categories = ref<Category[]>([])
 const items = ref<SpuCard[]>([])
-/** shopId → 店铺名。卡片上任它显示卖家是谁 */
-const shopNames = ref<Record<string, string>>({})
 const loading = ref(false)
 const loadingMore = ref(false)
 const nextCursor = ref<string | null>(null)
@@ -27,7 +25,10 @@ const searched = ref(false)
 
 const filters = reactive({
   keyword: '',
-  categoryId: '' as string,
+  // ★ 类目要在**setup 期**就从 URL 认下来，不能等 onMounted：
+  //   第一屏是网格量完列数后触发的（见 useShelf），那时 onMounted 还没跑 ——
+  //   晚一步认，带 `?categoryId=x` 进来会先拉一屏全量结果。
+  categoryId: typeof route.query.categoryId === 'string' ? route.query.categoryId : '',
   priceFrom: undefined as number | undefined,
   priceTo: undefined as number | undefined,
   sort: 'relevance' as SearchSort,
@@ -68,65 +69,12 @@ const resultText = computed(() => {
 })
 
 /**
- * 解析这批商品所属的店铺名，显示在卡片上。
+ * 一页铺几行、页大小是多少，**都交给网格自己量**（见 `useShelf` 与 `ProductGrid`）。
  *
- * ★ **一次批量请求**，不要每张卡各发一个 —— 一页十来个商品往往只来自一两个店，
- *   去重之后通常只有一个 id 要查。已经查过的直接跳过，"加载更多"不会重复请求。
- *
- * 店名只是附加信息：拉不到只是卡片上少一行，不该弹错、更不该拖住列表。
+ * ★ 量完它 emit 一次，`onGridPageSize` 顺手把第一屏拉出来 —— 所以下面的
+ *   `onMounted` **不再自己拉第一屏**，否则同一屏会请求两次。
  */
-async function loadShopNames(list: SpuCard[]): Promise<void> {
-  const missing = [...new Set(list.map((item) => item.shopId))].filter(
-    (id) => shopNames.value[id] === undefined,
-  )
-  if (missing.length === 0) return
-  try {
-    for (const shop of await fetchShops(missing)) {
-      shopNames.value[shop.id] = shop.name
-    }
-  } catch {
-    // 静默降级
-  }
-}
-
-/**
- * 一页铺几行。**页大小 = 列数 × 这个值**，不是写死的。
- *
- * ★ 列数是响应式的（`repeat(auto-fill, minmax(200px, 1fr))`）：宽屏 5 列、中等 4 列、
- *   窄屏 3 列。写死一个数字，必然在某些宽度上剩半行 —— 原来写 12，
- *   偏偏在 **5 列的宽屏上剩 2 张吊在最后一行**，而桌面默认就是 5 列。
- *   取「列数 × 行数」之后，除了最后一页（总数本来就不整除），每一页都是整行。
- */
-const SHELF_ROWS = 3
-
-/** 首次挂载还没量过列数，先用一个安全值，量完立刻覆盖 */
-const pageSize = ref(12)
-const shelfEl = ref<HTMLElement | null>(null)
-
-/** 网格当前几列。视口一变就变，所以每次现测，不能缓存 */
-function shelfColumns(): number {
-  const el = shelfEl.value
-  if (!el) return 0
-  return getComputedStyle(el).gridTemplateColumns.split(' ').filter(Boolean).length
-}
-
-/** 按当前列数定页大小。返回是否发生了变化 */
-function syncPageSize(): boolean {
-  const cols = shelfColumns()
-  if (!cols) return false
-  const next = cols * SHELF_ROWS
-  if (next === pageSize.value) return false
-  pageSize.value = next
-  return true
-}
-
-/**
- * 列数变了要**重新取第一页** —— 页大小是"整行"的依据，旧的分页不再成立。
- * 连续 resize 只会触发一次：列数不变时 `syncPageSize` 直接返回 false。
- */
-function onResize(): void {
-  if (syncPageSize()) void load(true)
-}
+const { pageSize, onGridPageSize, ensureLoaded } = useShelf((reset) => void load(reset))
 
 async function load(reset: boolean): Promise<void> {
   if (reset) {
@@ -154,8 +102,8 @@ async function load(reset: boolean): Promise<void> {
     // 只有首页带 total；翻页响应里是 null，不能拿它覆盖已经拿到手的值
     if (reset) total.value = result.total
     searched.value = true
-    // 不 await：商品先渲染出来，店名稍后补上，别为了附加信息拖住列表
-    void loadShopNames(result.items)
+    // 店名由 ProductGrid 自己跟着 items 去解析（一次批量请求、按 id 去重），
+    // 页面不用管 —— 那是卡片的事，不是搜索的事
   } catch (e) {
     ElMessage.error(isBizError(e) ? e.message : '加载失败')
   } finally {
@@ -254,35 +202,16 @@ function onReset(): void {
   void load(true)
 }
 
-/**
- * 商品卡片一律在**新标签页**打开（照淘宝的做法）。
- *
- * 详情页会顶掉列表页，用户看完一款想再看别款就得靠浏览器后退 ——
- * 新标签页让列表始终留在原处，"返回上一级"这个问题就不存在了。
- * 卡片是真 `<a>`，于是中键 / Ctrl+点击这些浏览器原生行为也都跟着有。
- */
-function detailHref(spu: SpuCard): string {
-  return router.resolve({ name: 'product-detail', params: { spuId: spu.id } }).href
-}
-
 onMounted(async () => {
-  // 先认 URL 上的类目（banner / 分享链接会带过来），再拉第一屏
-  const fromQuery = route.query.categoryId
-  if (typeof fromQuery === 'string') filters.categoryId = fromQuery
-
-  // ★ 页大小要在**第一次请求之前**定下来，否则第一页取错数量、还得再重来一次
-  syncPageSize()
-  window.addEventListener('resize', onResize)
-
   try {
     categories.value = await fetchCategoryTree()
   } catch {
     // 类目拉不到不影响商品列表，静默即可
   }
-  await load(true)
+  // ★ 第一屏**不在这里拉**：网格比页面先挂载，它量完列数就 emit 了一次，
+  //   那次已经把第一屏带出来了（见 useShelf）。这里只是兜住"网格一个都没量出来"
+  ensureLoaded()
 })
-
-onBeforeUnmount(() => window.removeEventListener('resize', onResize))
 </script>
 
 <template>
@@ -362,51 +291,15 @@ onBeforeUnmount(() => window.removeEventListener('resize', onResize))
       <span class="result-hint">价格区间：{{ priceRange }}</span>
     </div>
 
-    <div v-loading="loading" class="shelf-wrap">
-      <el-empty v-if="searched && items.length === 0" description="没有找到符合条件的商品" />
-
-      <!-- v-show 而不是 v-else：网格要**一直在 DOM 里**才量得到列数。
-           挂载时 searched 还是 false，所以这一刻它是可见的、量得准 -->
-      <div v-show="!(searched && items.length === 0)" ref="shelfEl" class="shelf">
-        <a
-          v-for="item in items"
-          :key="item.id"
-          class="card"
-          :href="detailHref(item)"
-          target="_blank"
-          rel="noopener"
-        >
-          <div class="card-media">
-            <img
-              :src="thumbSrc(item.mainImage, item.mainImageMid, item.title)"
-              :data-fallback-src="thumbFallback(item.mainImage, item.mainImageMid)"
-              :alt="item.title"
-              loading="lazy"
-              @error="onImageError"
-            />
-          </div>
-          <div class="card-body">
-            <h3 class="card-title" :title="item.title">{{ item.title }}</h3>
-            <div
-              v-if="shopNames[item.shopId]"
-              class="card-shop"
-              :title="shopNames[item.shopId]"
-            >
-              {{ shopNames[item.shopId] }}
-            </div>
-            <div class="card-price tnum">{{ formatPriceRange(item.priceMin, item.priceMax) }}</div>
-            <div class="card-meta">
-              <span class="tnum">已售 {{ item.totalSold }}</span>
-              <span v-if="item.reviewCount > 0" class="tnum">{{ item.avgScore.toFixed(1) }} 分</span>
-            </div>
-          </div>
-        </a>
-      </div>
-
-      <div v-if="hasMore" class="more">
-        <el-button :loading="loadingMore" @click="load(false)">加载更多</el-button>
-      </div>
-    </div>
+    <ProductGrid
+      :items="items"
+      :loading="loading"
+      :loading-more="loadingMore"
+      :has-more="hasMore"
+      empty-text="没有找到符合条件的商品"
+      @load-more="load(false)"
+      @page-size="onGridPageSize"
+    />
   </div>
 </template>
 
@@ -541,118 +434,9 @@ onBeforeUnmount(() => window.removeEventListener('resize', onResize))
   color: var(--color-text-secondary);
 }
 
-/* --------------------------------------------------------------------------
- * 货架
- *
- * "货架感"来自**严格的行列对齐**，不是装饰：
- *   - 图片区用 aspect-ratio 锁死比例，列宽变化时所有图仍然等高
- *   - 标题固定两行高度，整排卡片的标题槽位一致
- *   - card-price 用 margin-top:auto 压到底部，价格行跨卡片对齐
- * 少了任何一条，卡片就会参差不齐，"货架"立刻散架。
- * ------------------------------------------------------------------------*/
-
-.shelf-wrap {
-  min-height: 200px;
-}
-
-.shelf {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: var(--space-4);
-}
-
-.card {
-  display: flex;
-  flex-direction: column;
-  background: var(--card-bg);
-  border: var(--card-border);
-  border-radius: var(--card-radius);
-  overflow: hidden;
-  cursor: pointer;
-  /* 卡片是 <a>，把链接的默认样式抹掉 */
-  text-decoration: none;
-  color: inherit;
-  transition:
-    border-color var(--dur) var(--ease-out),
-    box-shadow var(--dur) var(--ease-out),
-    transform var(--dur) var(--ease-out);
-}
-
-.card:hover,
-.card:focus-visible {
-  border-color: var(--color-border-strong);
-  box-shadow: var(--card-shadow-hover);
-  transform: translateY(-2px);
-}
-
-.card-media {
-  aspect-ratio: 1 / 1;
-  background: var(--media-bg);
-  overflow: hidden;
-}
-
-.card-media img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  transition: transform var(--dur-slow) var(--ease-out);
-}
-
-.card:hover .card-media img {
-  transform: scale(1.03);
-}
-
-.card-body {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4) var(--space-4);
-}
-
-.card-title {
-  /* 固定两行的高度：这是整排卡片能对齐的关键 */
-  height: calc(var(--text-base) * var(--leading-snug) * 2);
-  font-size: var(--text-base);
-  font-weight: var(--weight-normal);
-  line-height: var(--leading-snug);
-  color: var(--color-text);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-/* 卖家。锁单行省略 —— 店名长短不一会把同一排卡片撑得参差 */
-.card-shop {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.card-price {
-  /* 把价格行顶到卡片底部，跨卡片对齐 */
-  margin-top: auto;
-  font-size: var(--text-lg);
-  font-weight: var(--weight-semibold);
-  line-height: var(--leading-tight);
-  color: var(--color-price);
-}
-
-.card-meta {
-  display: flex;
-  justify-content: space-between;
-  gap: var(--space-2);
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-}
-
-.more {
-  margin-top: var(--space-6);
-  text-align: center;
-}
+/* 货架（网格 + 卡片 + 加载更多）的样式全在 `ProductGrid.vue` 里 —— 搜索页与店铺页
+   共用同一份。"货架感"那几条讲究（图片锁比例、标题两行、价格压底）只维护一处，
+   否则下次给卡片加个促销角标就会只改其中一边 */
 
 /* --------------------------------------------------------------------------
  * 响应式

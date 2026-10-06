@@ -43,24 +43,27 @@ http.interceptors.request.use((config) => {
 })
 
 /** 令牌过期时跳登录页——由应用启动时注册，避免这里硬依赖 router */
-let onUnauthorized: (() => void) | null = null
-export function setUnauthorizedHandler(handler: () => void): void {
+let onUnauthorized: ((blocked?: BizError) => void) | null = null
+export function setUnauthorizedHandler(handler: (blocked?: BizError) => void): void {
   onUnauthorized = handler
 }
 
 type RetriableConfig = AxiosRequestConfig & { _retried?: boolean }
 
+/** 刷新结果。失败时若原因**是账号本身**（被冻结 / 已注销），把那个异常带出来。 */
+type RefreshResult = { ok: true } | { ok: false; blocked?: BizError }
+
 /**
  * 刷新令牌。多个请求同时 401 时共用同一次刷新，避免并发刷新把
  * refresh token 轮换掉（我们的刷新是**轮换式**的，旧的一次只能用一次）。
  */
-let refreshing: Promise<boolean> | null = null
+let refreshing: Promise<RefreshResult> | null = null
 
-async function refreshAccessToken(): Promise<boolean> {
+async function refreshAccessToken(): Promise<RefreshResult> {
   const refreshToken = getRefreshToken()
-  if (!refreshToken) return false
+  if (!refreshToken) return { ok: false }
 
-  refreshing ??= (async () => {
+  refreshing ??= (async (): Promise<RefreshResult> => {
     try {
       const resp = await axios.post<ApiResponse<{ accessToken: string; refreshToken: string }>>(
         '/api/auth/refresh',
@@ -68,11 +71,22 @@ async function refreshAccessToken(): Promise<boolean> {
         { headers: { 'Content-Type': 'application/json' } },
       )
       const data = resp.data.data
-      if (!data) return false
+      if (!data) return { ok: false }
       setTokens(data.accessToken, data.refreshToken)
-      return true
-    } catch {
-      return false
+      return { ok: true }
+    } catch (e) {
+      /**
+       * ★ 刷新被拒有**两种**原因，必须分开：
+       *   - 令牌本身过期 / 已轮换 → 重新登录就好，这是常态；
+       *   - **账号被冻结或已注销** → 重新登录不会成功。
+       *   这里原来是一个裸 `catch { return false }`，把两者都当成第一种，
+       *   于是被封的人看到的是「登录已过期，请重新登录」——一个死循环的指引。
+       *   现在把后者带出去，交给调用方去登录页说清楚。
+       */
+      if (e instanceof AxiosError && e.response?.data?.code === ErrorCode.ACCOUNT_BANNED) {
+        return { ok: false, blocked: new BizError(e.response.data) }
+      }
+      return { ok: false }
     } finally {
       // 交回主流程前清掉，下一次 401 可以重新发起刷新
       setTimeout(() => (refreshing = null), 0)
@@ -91,11 +105,12 @@ http.interceptors.response.use(
     // 401 且没重试过 → 尝试刷新一次令牌后重放
     if (status === 401 && original && !original._retried && getRefreshToken()) {
       original._retried = true
-      if (await refreshAccessToken()) {
+      const result = await refreshAccessToken()
+      if (result.ok) {
         return http.request(original)
       }
       clearTokens()
-      onUnauthorized?.()
+      onUnauthorized?.(result.blocked)
     }
 
     const body = error.response?.data
