@@ -18,6 +18,17 @@
       "port": 8000
     },
     {
+      "name": "worker",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "run",
+        "--directory",
+        "backend",
+        "arq",
+        "app.worker.main.WorkerSettings"
+      ]
+    },
+    {
       "name": "web-mall",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "web-mall", "run", "dev"],

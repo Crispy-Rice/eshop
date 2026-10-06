@@ -156,6 +156,22 @@ async def list_shops_by_ids(session: AsyncSession, shop_ids: Sequence[int]) -> l
     return list(await session.scalars(select(Shop).where(Shop.id.in_(shop_ids))))
 
 
+async def search_shops(session: AsyncSession, *, keyword: str | None, limit: int) -> list[Shop]:
+    """按名称模糊搜店铺，最新在前。
+
+    ★ 给运营侧的"指定店铺"选择器用，**刻意不做游标分页**：那是个"输入关键词收窄"
+      的选择器，不是列表页 —— 在选择器里翻页没有意义，多打两个字比翻页快。
+      所以只给它 ``keyword`` 加一个结果上限。
+
+    不按状态过滤：关掉的店也列出来，由界面标出"已关闭"。
+    过滤掉反而会让运营搜不到自己的店，且说不清为什么。
+    """
+    stmt = select(Shop)
+    if keyword:
+        stmt = stmt.where(Shop.name.ilike(f"%{keyword}%"))
+    return list(await session.scalars(stmt.order_by(Shop.id.desc()).limit(limit)))
+
+
 async def list_users_by_ids(session: AsyncSession, user_ids: Sequence[int]) -> list[User]:
     """批量取用户。评价列表要展示昵称与头像，逐个查就是 N+1。"""
     if not user_ids:

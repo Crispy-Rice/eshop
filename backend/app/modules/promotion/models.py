@@ -167,6 +167,16 @@ LEVEL_TEXT: dict[int, str] = {
     LEVEL_POINT: "积分级",
 }
 
+# 层级 → 活动类型标识。**必须一一对应**：``level`` 决定"在哪一层算"，
+# ``type`` 只用来查冲突组与叠加矩阵。两者配歪了的后果，两层还不一样 ——
+# 单品层压根不看 ``type``（照样生效），订单层按 ``type`` 过滤（静默不生效）。
+# 同一种错、两种表现，属于最难查的那类，所以建活动的接口照这张表卡死。
+PROMO_TYPE_BY_LEVEL: dict[int, str] = {
+    LEVEL_ITEM: DISCOUNT_ITEM_PROMO,
+    LEVEL_SHOP: DISCOUNT_SHOP_PROMO,
+    LEVEL_PLATFORM: DISCOUNT_PLATFORM_PROMO,
+}
+
 # 活动计算方式。含义决定 discount_value 的单位：直降是分、折扣是万分比、特价是分
 CALC_DIRECT = 1  # 直降：减 discount_value
 CALC_RATE = 2  # 折扣：discount_value 是折扣率（8500 = 85 折）
@@ -189,6 +199,12 @@ class CouponTemplate(Base):
     ★ 模板一旦有券发出，**核心字段不可修改**（docs/04 §11 的推荐做法）：
     已发出的券必须使用领取时的规则，否则历史券的退款逻辑会跟着新规则漂移。
     修改入口由 service 层拦（``issued_count > 0`` 就拒绝），只能作废后新建。
+
+    ``status`` 的 ``1/2/3`` 是有效期的投影，由 ``tasks.refresh_promo_status``
+    推进（建模板时一律先写"进行中"，见 ``router.create_template``）；
+    ``4``（已作废）只由运营的作废端点写入，定时任务不会把它复活。
+    ``valid_start`` / ``valid_end`` 为 ``NULL`` 的「领取后 N 天」型没有统一时间窗，
+    恒为进行中。
     """
 
     __tablename__ = "coupon_template"
@@ -412,6 +428,12 @@ class PromoActivity(Base):
     - **订单促销**（``level=1/2``）：满减 / 满折，作用在店铺或平台的符合范围金额上
 
     ``level`` 决定它参与哪一层计算（docs/05 §3），这是引擎的调度依据。
+
+    ``status`` 由两处维护：建活动时按当时的窗口算一次，之后由
+    ``tasks.refresh_promo_status`` 按窗口推进（1 → 2 → 3）。``4``（已作废）
+    只能由运营的作废端点写入，且定时任务**不会**把它复活。
+    ★ 算价查询要求 ``status = 2``（``repository.list_active_activities``），
+      所以这一列就是活动的开关 —— 时间窗是"什么时候自动关"，作废是"现在就关"。
     """
 
     __tablename__ = "promo_activity"

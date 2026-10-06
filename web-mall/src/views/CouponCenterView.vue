@@ -112,6 +112,11 @@ onMounted(load)
             <span v-if="c.template.maxDiscount > 0">
               最高减 ¥{{ formatYuan(c.template.maxDiscount) }} ·
             </span>
+            <!-- 限领多张时要说清"已领几张"，否则领完一张按钮还是「立即领取」，
+                 用户会以为没领上（其实是还能再领） -->
+            <span v-if="c.template.perUserLimit > 1">
+              每人限领 {{ c.template.perUserLimit }} 张（已领 {{ c.received }}） ·
+            </span>
             <span>剩余 {{ c.remain }} 张</span>
           </p>
         </div>

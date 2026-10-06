@@ -211,6 +211,13 @@ Level 3（积分/余额）：
   allocate(pointDeduct, all items)
 ```
 
+**两个字段只属于订单级** —— 它们在 Level 0 的伪代码里根本没出现：
+
+| 字段 | 归属 | 说明 |
+|---|---|---|
+| `threshold`（门槛） | Level 1/2 | 只用来**过滤候选**（`eligible < threshold` 就跳过）。Level 0 压根不读它，所以**接口直接拒**单品级带门槛的请求：单品级填"满 50 减 10"，实际是"每一件都减 10"—— 连 8999 的笔记本也减，而列表上还写着"满 ¥50.00"。要"满 X 减 Y"就建店铺级 / 平台级活动 |
+| `scopeType` / `scopeValue`（适用范围） | 全部层级 | Level 0 在收集候选时按行过滤（`_in_scope`），Level 1/2 用它算"参与优惠金额"（`_eligible_amount`）。**选了范围却不给目标 = 永远匹配不到任何商品**，接口同样拒。★ 「指定类目」**含该类的全部子类目**，展开在 `checkout._expand_category_scopes` 做 —— 商品只能挂在末级类目，所以精确比对父类目是一条都匹配不到的 |
+
 ### 5.3 折扣计算的两个坑
 
 **坑 1：折扣是按行算还是按总额算**
@@ -597,6 +604,12 @@ COMMENT ON TABLE trade.order_discount_snapshot IS '订单优惠快照（审计�
 **为什么需要 `rule_snapshot`**：退款时按比例退还是按原额退，需要知道当时的规则。运营半年后改了活动规则，历史订单的退款逻辑不能跟着变。JSONB 快照存下 `{"threshold":20000,"discountValue":3000,"scope":"SHOP","rate":null}`。
 
 **`uk_discount_snap` 的唯一约束**：防止同一活动的优惠被重复记账（幂等）。`source_id` 用 `NOT NULL DEFAULT 0` 而不是可空——PG 的唯一约束中 `NULL` 互不相等，可空列会让积分类快照绕过唯一性。唯一约束的首列 `order_main_no` 同时覆盖了按母单查询，不需要再单独建索引。
+
+**★ 写入时必须按活动聚合成一行**：引擎对单品级/店铺级是**逐行**产出优惠的（一个"全场单品直降"命中 3 件就是 3 条），而这张表的唯一键是"一个活动一行"。所以 `_write_discount_snapshots` 按 `(level, source_type, source_id)` 合并、金额累加；**逐行的金额本来就在 `order_item.discount_amount` 上**（退款直接读它，不重算）。不合并的话，同一次算价里的两条记录会撞上唯一键，**整单回滚**，买家只看到一句"系统繁忙"。
+
+**活动为什么只能"作废"不能删**：`source_id` 指着 `promo_activity.id`，删行会让历史订单的快照变成查不到来源的孤儿（`source_name` 兜底不至于显示空白，但审计链断了）。所以运营侧给的是 `POST /api/admin/promotions/{id}/void`，把 `status` 置 4 —— 算价查询要求 `status = 2`（`list_active_activities`），因此**当场失效**；历史订单读自己的快照，不受影响。
+
+`status` 的 `1/2/3` 是**时间窗的投影**，由 `tasks.refresh_promo_status` 每分钟推进一次（建活动那一刻算一次是不够的：没有这一步，"未开始"的活动永远不会开始）；`4` 只由作废端点写入，且不在那个任务的 `WHERE` 里 —— 作废压过时间窗。那个任务同一条 SQL 里也推进**券模板**的状态（[04](04-coupon.md)）：过期券再也不会在运营列表里挂着"进行中"。
 
 ## 10. 测试用例（必须覆盖）
 

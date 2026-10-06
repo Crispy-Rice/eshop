@@ -168,6 +168,39 @@ def _category_out(category: Category) -> CategoryOut:
     )
 
 
+async def category_subtree_ids(
+    session: AsyncSession, category_ids: list[int]
+) -> dict[int, set[int]]:
+    """``{类目 id: 含自身的整棵子树}``，给算价的「指定类目」范围用。
+
+    ★ 一次把整棵类目树读进内存再串，而不是逐个子树做 ``path`` 前缀查询 ——
+      类目是几十个节点的小表，一次查询就够；逐个查会变成 N 次往返。
+      也刻意用 ``only_active=False``：这里判断的是"商品归在哪一类"，
+      跟该类目当下是否对买家展示无关。
+
+    ★ 为什么算价需要这个：选「图书」必须覆盖小说 / 童书 / 教育考试。
+      精确比对会让父类目下的活动**一件商品也匹配不到**，而界面上它和正常活动
+      长得一模一样 —— 见 ``promotion.checkout._expand_category_scopes``。
+    """
+    rows = await repo.list_categories(session, only_active=False)
+    children: dict[int | None, list[int]] = {}
+    for c in rows:
+        children.setdefault(c.parent_id, []).append(int(c.id))
+
+    out: dict[int, set[int]] = {}
+    for cid in category_ids:
+        stack = [int(cid)]
+        seen: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(children.get(cur, ()))
+        out[int(cid)] = seen
+    return out
+
+
 async def list_admin_category_tree(session: AsyncSession) -> list[AdminCategoryTreeOut]:
     """完整类目树，**含停用节点**。
 
@@ -981,6 +1014,29 @@ async def list_deleted_sku_ids(session: AsyncSession, shop_id: int) -> list[int]
     return await repo.list_deleted_sku_ids(session, shop_id)
 
 
+async def sku_ids_of_owned_spu(session: AsyncSession, shop_id: int, spu_id: int) -> list[int]:
+    """本店某 SPU 下**未删**的 SKU id（顺带做了归属校验）。
+
+    给"上架前检查运费模板配全了没"用：那个检查在路由层做（product 不能 import
+    freight，见 ``router.py`` 的说明），要先拿到这个商品的规格列表。
+    """
+    spu = await _get_owned_spu(session, shop_id, spu_id)
+    return [s.id for s in await repo.list_skus_by_spu(session, spu.id)]
+
+
+async def get_spu_brief(session: AsyncSession, spu_id: int) -> tuple[int, list[int]] | None:
+    """``(shop_id, 未删 SKU id 列表)``；商品不存在返回 None。
+
+    ★ 平台审核通过是把商品**直接上架**的（运营手上只有 spu_id，没有店铺），
+      而"上架前的运费校验"两样都要 —— 店铺用来找默认运费模板，
+      SKU 列表用来判断有没有漏配。
+    """
+    spu = await repo.get_spu(session, spu_id)
+    if spu is None:
+        return None
+    return spu.shop_id, [s.id for s in await repo.list_skus_by_spu(session, spu_id)]
+
+
 async def apply_review_stat_delta(
     session: AsyncSession,
     spu_id: int,
@@ -1005,6 +1061,26 @@ async def apply_review_stat_delta(
         score_delta=score_delta,
         good_delta=good_delta,
     )
+
+
+async def apply_sold_delta(session: AsyncSession, counts: dict[int, int]) -> None:
+    """累加商品的**累计销量**（列表与详情上的「已售」）。由 trade 在支付成功的同一事务里调用。
+
+    谁拥有 schema 谁提供写入口 —— trade 不能直接改 ``product.spu``，
+    与 ``apply_review_stat_delta`` 同一套做法。
+
+    ★ 为什么不按 docs/02 §336 写的"支付成功事件中异步累加"：那条链路指的是
+      outbox → Redis Stream → 消费者（docs/13 §4），而**投递循环与消费者都还没实现**
+      （``core.local_message`` 至今只写不读）。而累加本身只是一条 UPDATE ——
+      为它先造一套消息总线是本末倒置。同步做还少了一致性窗口：
+      "付完款回到商品页，已售就变了"。等那条总线真为通知/积分建起来时，
+      这里换成写事件即可，调用点不用动。
+
+    ★ 退款**不扣减**：字段语义是"累计"（models 里那列的注释、docs/02 §47）。
+      要"净销量"得另立字段，别把累计做成会回退的数 —— 那样历史快照对不上。
+    """
+    if counts:
+        await repo.add_spu_sold(session, counts)
 
 
 async def get_sku_for_order(session: AsyncSession, sku_id: int) -> tuple[Sku, Spu]:

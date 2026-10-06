@@ -276,7 +276,9 @@ onMounted(load)
       width="420px"
       :close-on-click-modal="false"
     >
-      <el-form ref="returnFormRef" :model="returnForm" :rules="returnRules" label-width="76px">
+      <!-- 90px 而不是 76px：标签是 4 个汉字（快递公司/快递单号），76 减掉 12px 右内边距
+           只剩 64px，字体度量稍宽一点就折行成两行（地址表单的 4 字标签也用 90px） -->
+      <el-form ref="returnFormRef" :model="returnForm" :rules="returnRules" label-width="90px">
         <el-form-item label="快递公司" prop="expressCompany">
           <el-select
             v-model="returnForm.expressCompany"

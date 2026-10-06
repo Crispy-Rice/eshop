@@ -160,6 +160,9 @@ EXPECTED: dict[tuple[ReviewStatus, AuditAction], ReviewStatus] = {
     (S.PENDING_AUDIT, A.APPROVE): S.PUBLISHED,
     (S.PENDING_AUDIT, A.REJECT): S.REJECTED,
     (S.PUBLISHED, A.BLOCK): S.BLOCKED,
+    # 抽检队列里的"确认无误"：状态自己到自己。作用是把这条移出抽检队列
+    # （``cas_status`` 顺手清掉 ``need_second_audit``），不是"把已发布的再发一次"
+    (S.PUBLISHED, A.APPROVE): S.PUBLISHED,
     (S.BLOCKED, A.UNBLOCK): S.PUBLISHED,
 }
 

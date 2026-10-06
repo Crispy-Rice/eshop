@@ -232,7 +232,11 @@ class CouponTemplateCreateRequest(CamelModel):
     valid_end: datetime | None = None
     valid_days: int | None = Field(default=None, ge=1, le=365)
     scope_type: int = Field(default=1, ge=1, le=4)
-    scope_value: list[int] | None = None
+    # ★ 用 SnowflakeId 而不是 int：这些 id 前端只能以**字符串**传来 ——
+    #   JS 的 number 装不下 2^53 以上的雪花 id，`Number("991234…")` 会静默截断成
+    #   另一个数，存进去之后 `item.sku_id in scope_value` 永远为假，券看着正常、
+    #   却一辈子不生效。SnowflakeId 既接受字符串，又校验它确实是数字。
+    scope_value: list[SnowflakeId] | None = None
 
 
 class AdminIssueRequest(CamelModel):
@@ -253,6 +257,19 @@ class UserLookupOut(CamelModel):
     user_id: SnowflakeId
     nickname: str
     phone_masked: str
+
+
+class AdminShopOptionOut(CamelModel):
+    """建券挑「指定店铺」时的候选项。
+
+    跟上面那个按手机号找人是一类东西：券里存的是 shopId，而运营手上只有**店名**
+    —— 店铺 id 他同样拿不到。带上 ``status`` 是为了让界面标出「已关闭」：
+    给一家关掉的店建券等于白发。
+    """
+
+    id: SnowflakeId
+    name: str
+    status: int
 
 
 # ---------------- 客服补发的记录与配额 ----------------
@@ -308,7 +325,7 @@ class PromoActivityCreateRequest(CamelModel):
     threshold: int = Field(default=0, ge=0)
     shop_id: SnowflakeId = 0
     scope_type: int = Field(default=1, ge=1, le=4)
-    scope_value: list[int] | None = None
+    scope_value: list[SnowflakeId] | None = None
     start_at: datetime
     end_at: datetime
     priority: int = 0

@@ -56,6 +56,17 @@ CREATE INDEX idx_coupon_tpl_status_time ON promotion.coupon_template (status, va
 COMMENT ON TABLE promotion.coupon_template IS '优惠券模板';
 ```
 
+`status` 的 `1/2/3` 是**有效期的投影**，由 `promotion.tasks.refresh_promo_status` 每分钟推进
+（建模板时一律先写"进行中"，由它在一分钟内校正）—— 没有这一步，**过期的券在运营列表里
+永远挂着"进行中"**，而运营就是照着这一列判断"这张券还能不能领"。`valid_start` / `valid_end`
+为 `NULL` 的「领取后 N 天」型没有统一时间窗，恒为进行中。
+
+**`4`（已作废）只由运营的 `POST /api/admin/coupons/templates/{id}/void` 写入** ——
+它是**下线**，不是删除，而且**只止住新的领取**：`claim_template_quota` 那道 SQL 本来就要求
+`status = 2`，所以作废当场生效；但已经发出去的券照旧能用 —— 券一旦发出去就是承诺，
+运营反悔不能把用户手上的券作废掉。同理不提供删除：券码里记着 `coupon_template_id`，
+删模板会让那些券查不到来源。促销活动走的是同一条路（见 [05 §9](05-promotion-engine.md)）。
+
 ### 2.2 用户券实例
 
 ```sql
@@ -378,6 +389,10 @@ return 1
    → 全场 → 直接通过
    → 指定店铺 → 比对 shop_id（购物车内店铺集合）
    → 指定类目 → 比对购物车内商品的类目（需 category 缓存）
+     ★ **含该类的全部子类目**：商品**只能挂在末级类目**下（`product._resolve_category`），
+       所以"只匹配所选类目本身"在父类目上永远匹配不到任何东西 —— 而活动/券在列表上
+       和正常的没区别。展开发生在 `promotion.checkout._expand_category_scopes`
+       （引擎是纯函数，读不了类目树）
    → 指定商品 → 比对 spuId/skuId 集合（用 Redis SET 或 Bloom，避免大 JSON 解析）
 
 第 4 层：精确计算该券能抵多少（见 05-promotion-engine）

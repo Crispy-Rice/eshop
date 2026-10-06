@@ -1,4 +1,4 @@
-"""promotion 的定时任务：券过期、对账、僵尸锁清理。
+"""promotion 的定时任务：券过期、对账、僵尸锁清理、活动状态推进。
 
 准时注册在 ``app/worker/main.py`` 的 ``CRON_JOBS``。
 
@@ -184,3 +184,25 @@ async def unlock_stale_coupons(ctx: dict[str, Any]) -> dict[str, Any]:
     if unlocked:
         logger.warning("清理了僵尸锁定的券", extra={"count": unlocked})
     return {"unlocked": unlocked}
+
+
+async def refresh_promo_status(ctx: dict[str, Any]) -> dict[str, Any]:
+    """把促销活动与券模板的状态按时间窗推进。
+
+    ★ 没有这一步，"未开始"的活动**永远不会开始**：状态是建活动那一刻算一次就
+      写死的，而算价查询硬性要求 ``status = 2``。券模板同样的毛病，只是后果轻
+      一些 —— 过期券在运营列表里永远显示"进行中"。两处的来由见
+      ``repo.refresh_activity_status`` / ``repo.refresh_coupon_template_status``。
+
+    一张表一条 SQL，不分批 —— 活动和券模板都是运营手工建的，量级是几十到几百条，
+    不是券实例那种百万行。两条 SQL 共用一个事务，它们本来就是同一件事。
+    """
+    session_factory = ctx["session_factory"]
+    async with session_factory() as session:
+        activities = await repo.refresh_activity_status(session)
+        templates = await repo.refresh_coupon_template_status(session)
+        await session.commit()
+
+    if activities or templates:
+        logger.info("促销状态已按时间窗推进", extra={"activities": activities, "templates": templates})
+    return {"activities": activities, "templates": templates}

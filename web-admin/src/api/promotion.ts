@@ -149,7 +149,12 @@ export interface CouponTemplateInput {
   validEnd?: string | null
   validDays?: number | null
   scopeType?: number
-  scopeValue?: number[] | null
+  /**
+   * ★ **字符串**数组，不是 number[]：里面是雪花 ID，超过 2^53，
+   * `Number()` 会静默截断成另一个数 —— 存进去之后算价时
+   * `item.skuId in scopeValue` 永远为假，券看着正常却一辈子不生效。
+   */
+  scopeValue?: string[] | null
 }
 
 export interface PromoActivityInput {
@@ -162,7 +167,8 @@ export interface PromoActivityInput {
   threshold?: number
   shopId?: string
   scopeType?: number
-  scopeValue?: number[] | null
+  /** 同券那份：**字符串**数组（雪花 ID 超过 2^53，`Number()` 会静默截断） */
+  scopeValue?: string[] | null
   startAt: string
   endAt: string
   priority?: number
@@ -276,4 +282,50 @@ export function createPromoActivity(
   payload: PromoActivityInput,
 ): Promise<{ id: string; name: string }> {
   return post<{ id: string; name: string }>('/admin/promotions', payload)
+}
+
+/**
+ * 作废一个促销活动。
+ *
+ * ★ **下线用"作废"而不是删除**：活动一旦产生过订单，订单里的优惠快照就指着它 ——
+ *   删行会让那些快照变成查不到来源的孤儿。作废是改状态，算价当场不再带它，
+ *   历史订单照旧。后端会拒掉重复作废（两个运营都点了，第二个得知道自己白点了）。
+ */
+export function voidPromoActivity(activityId: string): Promise<null> {
+  return post<null>(`/admin/promotions/${activityId}/void`)
+}
+
+/** 作废一个券模板。**已经发出去的券不受影响** —— 券有自己的一生，只是不再能被领取。 */
+export function voidCouponTemplate(templateId: string): Promise<null> {
+  return post<null>(`/admin/coupons/templates/${templateId}/void`)
+}
+
+/** 建券挑「指定店铺」时的候选项。 */
+export interface ShopOption {
+  id: string
+  name: string
+  /** 1 正常 / 2 关闭 / 3 审核中 —— 界面要能标出「已关闭」，给关掉的店建券等于白发 */
+  status: number
+}
+
+/**
+ * 按店名搜店铺（建券的「指定店铺」用）。
+ *
+ * ★ 券里存的是 shopId，而运营手上只有**店名** —— 跟"按手机号找用户"是同一类问题。
+ *   不分页：这是选择器不是列表页，多打两个字收窄比翻页快。
+ */
+export function searchShops(keyword: string): Promise<ShopOption[]> {
+  return get<ShopOption[]>('/admin/shops', {
+    params: { keyword: keyword || undefined, limit: 30 },
+  })
+}
+
+/**
+ * 按 id 批量取店铺 —— `searchShops` 的反方向。
+ *
+ * 已经存下来的「指定店铺」范围里只有 id，要看"这条到底限了哪几家店"
+ * 就得按 id 换回名字。
+ */
+export function fetchShopsByIds(ids: string[]): Promise<ShopOption[]> {
+  return get<ShopOption[]>('/admin/shops', { params: { ids: ids.join(',') } })
 }

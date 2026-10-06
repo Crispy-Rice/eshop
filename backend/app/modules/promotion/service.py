@@ -32,12 +32,14 @@ from app.core.redis import get_lua, get_redis
 from app.core.snowflake import next_id
 from app.modules.promotion import repository as repo
 from app.modules.promotion.models import (
+    ACTIVITY_STATUS_VOID,
     CODE_LOCKED,
     CODE_SOURCE_MANUAL,
     CODE_SOURCE_SYSTEM,
     CODE_STATUS_TEXT,
     CODE_UNUSED,
     CODE_USED,
+    COUPON_TPL_VOID,
     ISSUE_BIZ_KEY_PREFIX,
     ISSUE_MAX_PER_OPERATOR_24H,
     ISSUE_MAX_PER_USER_TPL,
@@ -130,6 +132,18 @@ async def receive(
     tpl = await repo.get_template(session, tpl_id)
     if tpl is None:
         raise BizError(ErrorCode.COUPON_NOT_FOUND)
+
+    # ★ 作废的券模板不再放行。这里**单独查一次状态**是为了文案：
+    #   不放行最终由下面 ``claim_template_quota`` 的 ``status = 2`` 条件兜住
+    #   （那道 SQL 才是权威），但它失败时只能报"已领完"（COUPON_SOLD_OUT）——
+    #   券是被下架了却告诉用户"抢光了"，会让人以为还能等补货。
+    #   走到这里的现实场景是"页面还开着，运营那边把券撤了"。
+    #
+    #   ★ 只看 ``VOID``，不看整个"非进行中"：``1``（未开始）和 ``3``（已结束）
+    #     是**时间窗**的投影，脚本那边有更准确的文案（"活动未开始或已结束"）；
+    #     把它们也判成"已下架"，等于用一个笼统的说法盖掉更具体的那句。
+    if tpl.status == COUPON_TPL_VOID:
+        raise BizError(ErrorCode.ACTIVITY_ENDED, "该券已下架")
 
     await _ensure_warmed(redis, session, tpl)
 
@@ -468,6 +482,45 @@ async def list_admin_activities(
         "has_more": has_more,
         "next_cursor": _encode_cursor(page[-1].id) if has_more and page else None,
     }
+
+
+# ============================================================
+# 运营写操作：作废
+# ============================================================
+async def void_activity(session: AsyncSession, activity_id: int) -> None:
+    """作废一个促销活动。
+
+    ★ 用**作废**而不是删除。活动一旦产生过订单，``trade.order_discount_snapshot``
+      的 ``source_id`` 就指着它 —— 删行会让那些快照变成查不到来源的孤儿
+      （快照里有 ``source_name`` 兜底，不至于显示空白，但审计链断了）。
+      同一取舍在券模板那边早就写明了："只能作废后新建"（见 models 的注释）。
+
+    作废**当场失效**：算价查询要求 ``status = 2``，置 4 之后下一次算价就不带它了。
+    历史订单不受影响 —— 它们读的是自己下单时落下的优惠快照。
+    """
+    act = await repo.get_activity(session, activity_id)
+    if act is None:
+        raise BizError(ErrorCode.NOT_FOUND, "活动不存在")
+    if act.status == ACTIVITY_STATUS_VOID:
+        # 拦住重复作废：两个运营都点了，后一个以为自己关掉了，实际早关了
+        raise BizError(ErrorCode.VALIDATION_ERROR, "该活动已经作废了")
+    act.status = ACTIVITY_STATUS_VOID
+
+
+async def void_coupon_template(session: AsyncSession, tpl_id: int) -> None:
+    """作废一个券模板。
+
+    ★ **已经发出去的券不受影响**。券码有自己的生命周期（未使用 / 已使用 / 已过期），
+      作废模板只是：券中心不再展示、``claim_template_quota`` 不再放行
+      （那道 SQL 本来就要求 ``status = 2``，所以作废当场止住新的领取）。
+      已经领到券的人照常用 —— 券一旦发出去就是承诺，不能因为运营反悔而作废。
+    """
+    tpl = await repo.get_template(session, tpl_id)
+    if tpl is None:
+        raise BizError(ErrorCode.NOT_FOUND, "券模板不存在")
+    if tpl.status == COUPON_TPL_VOID:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "该券模板已经作废了")
+    tpl.status = COUPON_TPL_VOID
 
 
 # ============================================================

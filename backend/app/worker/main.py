@@ -32,6 +32,7 @@ from app.modules.inventory.tasks import (
 from app.modules.promotion.tasks import (
     expire_coupons,
     reconcile_coupons,
+    refresh_promo_status,
     unlock_stale_coupons,
 )
 from app.modules.review.tasks import recompute_spu_stats
@@ -82,6 +83,7 @@ FUNCTIONS: list[Any] = [
     ensure_flow_partition,
     expire_coupons,
     reconcile_coupons,
+    refresh_promo_status,
     unlock_stale_coupons,
     # 延迟任务：下单时按 pay_deadline 投递
     close_order_if_unpaid,
@@ -114,6 +116,10 @@ CRON_JOBS: list[Any] = [
     cron(expire_coupons, minute=23, second=0, unique=True),
     # 僵尸锁：券被锁超 40 分钟未释放，10 分钟扫一次
     cron(unlock_stale_coupons, minute=set(range(4, 60, 10)), second=37, unique=True),
+    # 活动与券模板的状态推进：1 分钟一次。整点开始的活动迟一分钟才开始，
+    # 就等于运营写的"零点开抢"第一天是假的 —— 与售后超时同样的理由。
+    # 代价可忽略：两条"只在真的变化时才写"的批量 UPDATE，量级几十到几百行。
+    cron(refresh_promo_status, minute=set(range(0, 60)), second=43, unique=True),
     # ---------- 订单 ----------
     # 超时关单兜底：延迟任务可能丢，2 分钟扫一次（命中部分索引，代价极低）
     cron(scan_timeout_orders, minute=set(range(0, 60, 2)), second=11, unique=True),

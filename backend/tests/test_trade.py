@@ -29,7 +29,15 @@ from app.modules.freight import service as freight_service
 from app.modules.inventory import service as inv
 from app.modules.inventory.models import Warehouse
 from app.modules.promotion import service as promotion_service
-from app.modules.promotion.models import CouponTemplate
+from app.modules.promotion.models import (
+    CALC_DIRECT,
+    DISCOUNT_ITEM_PROMO,
+    LEVEL_ITEM,
+    SCOPE_ALL,
+    SCOPE_SKU,
+    CouponTemplate,
+    PromoActivity,
+)
 from app.modules.trade import service as trade_service
 from app.modules.trade.models import (
     ORDER_CLOSED,
@@ -485,6 +493,52 @@ async def _coupon_status(code_id: int) -> int:
                 text("SELECT status FROM promotion.coupon_code WHERE id = :c"), {"c": code_id}
             )
         )
+
+
+async def _spu_of_sku(sku_id: int) -> int:
+    async with get_session_factory()() as s:
+        return int(await s.scalar(text("SELECT spu_id FROM product.sku WHERE id = :i"), {"i": sku_id}))
+
+
+async def _spu_sold(spu_id: int) -> int:
+    async with get_session_factory()() as s:
+        return int(
+            await s.scalar(text("SELECT total_sold FROM product.spu WHERE id = :i"), {"i": spu_id})
+        )
+
+
+async def test_payment_increments_sold_count(client: AsyncClient, session) -> None:
+    """★ 支付成功后商品的「已售」按件数累加，且**只加一次**。
+
+    这个字段以前**只有读、没有写**：买家付完款回到商品页，「已售」纹丝不动
+    （文档说要"支付成功后累加"，但那条链路只有写入侧、没有消费者）。
+    现在在支付成功的同一个事务里累加，所以幂等由订单状态那道条件更新兜住 ——
+    重放的支付回调在 ``mark_main_paid`` 就返回了，走不到累加那一步。
+    """
+    ctx = await _prepare(client, session)
+    spu_id = await _spu_of_sku(int(ctx["sku_ids"][0]))
+    assert await _spu_sold(spu_id) == 0
+
+    order = await _create_order(client, ctx, num=2, idem="sold-1")
+    assert await _spu_sold(spu_id) == 0, "下了单还没付钱，不算成交"
+
+    resp = await client.post(
+        "/api/payments",
+        json={"orderMainNo": order["orderMainNo"]},
+        headers=ctx["buyer_headers"],
+    )
+    pay_no = resp.json()["data"]["payNo"]
+    await client.post(f"/api/payments/{pay_no}/mock-callback", json={})
+    assert await _spu_sold(spu_id) == 2, "支付后按件数累加"
+
+    # 回调重放两次，不能再加
+    await client.post(f"/api/payments/{pay_no}/mock-callback", json={})
+    await client.post(f"/api/payments/{pay_no}/mock-callback", json={})
+    assert await _spu_sold(spu_id) == 2, "回调重放不该重复计数"
+
+    # 商城读到的也是这个数（列表卡片与详情用的是同一列）
+    detail = (await client.get(f"/api/spus/{spu_id}")).json()["data"]
+    assert detail["totalSold"] == 2
 
 
 async def test_create_payment_is_idempotent(client: AsyncClient, session) -> None:
@@ -1201,3 +1255,268 @@ async def test_order_item_snapshot_carries_fallback_cover(
             {"n": order["orderMainNo"]},
         )
     assert img == "/media/ip16.webp", "快照该是回落后的商品主图，不是空串"
+
+
+# ============================================================
+# ⑩ 平台优惠的子单归属
+#
+# ★ 子单的四个优惠字段**一律取"该店铺各行分摊额之和"**。唯一一次分摊发生在
+#   引擎里（按行、按参与金额），拆单这一层只做聚合 —— 如果在这里再按
+#   "子单原价占比"摊一遍，两个基数不同、结果会差几分，于是
+#   `Σ行实付 + 子单运费 > 子单应付`，而售后正是拿子单应付当退款上限
+#   （docs/08 §10）：差一分，**整单退都会被 422 拦掉**。
+# ============================================================
+async def _prepare_two_shops(client: AsyncClient, session) -> dict:
+    """两家店，**甲店两件、乙店一件**，都配好运费与库存；外加买家与地址。
+
+    ★ 必须两家店才暴露问题：单店铺时平台优惠整个归那一个子单，两条分摊路径
+      恰好一致，看不出差别。
+
+    ★ 甲店必须**占两行**，而且优惠金额要选对：一个子单只有一行时，"按行摊"
+      与"按子单原价摊"必然同值（单个基数的比例恒为 1）；两行同子单时也可能
+      撞上巧合（取到 2000 分就恰好一致）。测试里的 ``value=200`` 是**算过**的
+      分歧点：按行 A=137/B=63，按子单 A=136/B=64。
+    """
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "智能手机")
+    admin_headers = auth_header(admin["accessToken"])
+
+    sku_ids: list[str] = []
+    for idx, (phone, take) in enumerate((("13800138041", 2), ("13800138042", 1))):
+        merchant = await register(client, phone=phone)
+        shop_id = await open_shop(client, merchant["accessToken"], name=f"两店测试{idx}")
+        mh = auth_header(merchant["accessToken"])
+
+        resp = await client.post("/api/merchant/spus", json=_spu_payload(category), headers=mh)
+        assert resp.status_code == 200, resp.text
+        spu_id = resp.json()["data"]["id"]
+        picked = [s["id"] for s in resp.json()["data"]["skus"][:take]]
+        sku_ids.extend(picked)
+
+        async with get_session_factory()() as s, s.begin():
+            wh = Warehouse(id=next_id(), shop_id=int(shop_id), name="仓", is_default=True)
+            s.add(wh)
+        wh_id = int(wh.id)
+        async with get_session_factory()() as s, s.begin():
+            tpl = await freight_service.create_template(s, int(shop_id), _template_req())
+        for i, sku_id in enumerate(picked):
+            async with get_session_factory()() as s, s.begin():
+                await inv.init(
+                    s, sku_id=int(sku_id), warehouse_id=wh_id, qty=10, biz_key=f"two-{idx}-{i}"
+                )
+            async with get_session_factory()() as s, s.begin():
+                await freight_service.bind_sku(
+                    s,
+                    int(shop_id),
+                    sku_id=int(sku_id),
+                    template_id=int(tpl.id),
+                    warehouse_id=wh_id,
+                )
+
+        await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=mh)
+        await client.post(
+            f"/api/admin/spus/{spu_id}/audit", json={"approved": True}, headers=admin_headers
+        )
+
+    buyer = await register(client, phone=BUYER2_PHONE)
+    bh = auth_header(buyer["accessToken"])
+    return {
+        "buyer_headers": bh,
+        "buyer_id": await _user_id(BUYER2_PHONE),
+        "address_id": await _make_address(client, bh),
+        "sku_ids": sku_ids,
+    }
+
+
+async def _create_multi_order(
+    client: AsyncClient, ctx: dict, *, coupon_ids: list[int] | None = None, idem: str = "multi-1"
+) -> dict:
+    """**多行多店**下单。``_create_order`` 只下一个 SKU，构造不出拆单场景。"""
+    body: dict = {
+        "items": [{"skuId": sid, "num": 1} for sid in ctx["sku_ids"]],
+        "addressId": ctx["address_id"],
+    }
+    if coupon_ids:
+        body["couponCodeIds"] = coupon_ids
+    resp = await client.post(
+        "/api/orders", json=body, headers={**ctx["buyer_headers"], "Idempotency-Key": idem}
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["data"]
+
+
+async def _sub_amounts(order_main_no: str) -> list[tuple]:
+    """每个子单的 (子单号, 运费, 应付, 平台优惠, 该子单各行实付之和)。"""
+    async with get_session_factory()() as s:
+        rows = await s.execute(
+            text(
+                "SELECT s.order_sub_no, s.freight_amount, s.payable_amount, s.platform_discount,"
+                "       COALESCE((SELECT SUM(i.payable_amount) FROM trade.order_item i"
+                "                  WHERE i.order_sub_no = s.order_sub_no), 0) AS item_payable"
+                "  FROM trade.order_sub s"
+                " WHERE s.order_main_no = :n ORDER BY s.order_sub_no"
+            ),
+            {"n": order_main_no},
+        )
+        return [tuple(r) for r in rows]
+
+
+async def test_sub_amounts_aggregate_item_allocations(client: AsyncClient, session) -> None:
+    """★ 子单应付 == 该子单**各行实付之和 + 子单运费**（每个子单都要成立）。
+
+    这条不变式是退款上限的依据（docs/08 §10）。它一旦被破坏，整单退都会被拦，
+    而报错只会说"退款金额超限"，完全指不到拆单那一步。
+    """
+    ctx = await _prepare_two_shops(client, session)
+    tpl_id = await _make_coupon(threshold=100, value=200)
+    coupon_id = await _receive_coupon(tpl_id, ctx["buyer_id"], "two-shop-coupon")
+
+    order = await _create_multi_order(client, ctx, coupon_ids=[coupon_id], idem="two-shop")
+
+    subs = await _sub_amounts(order["orderMainNo"])
+    assert len(subs) == 2, "两家店应该拆成两个子单"
+
+    for sub_no, freight, payable, _platform, item_payable in subs:
+        assert payable == item_payable + freight, (
+            f"{sub_no}: 子单应付 {payable} != 各行实付之和 {item_payable} + 运费 {freight}"
+        )
+
+    # 母单守恒：子单应付之和仍等于母单应付（用户付过的钱一分不动）
+    async with get_session_factory()() as s:
+        main_payable = await s.scalar(
+            text("SELECT payable_amount FROM trade.order_main WHERE order_main_no = :n"),
+            {"n": order["orderMainNo"]},
+        )
+    assert sum(r[2] for r in subs) == main_payable
+
+
+# ============================================================
+# ⑪ 活动的适用范围
+# ============================================================
+async def test_item_promo_hitting_two_lines_can_be_ordered(client: AsyncClient, session) -> None:
+    """★ 一个单品活动命中多行时，订单照样能下。
+
+    引擎对单品级是**逐行**产出优惠的（"全场单品直降"命中两行就是两条），而
+    ``order_discount_snapshot`` 的唯一键 ``uk_discount_snap`` 是"一个活动一行"。
+    不聚合的话第二条就撞唯一键、**整单回滚** —— 买家只看到一句"系统繁忙"。
+    """
+    ctx = await _prepare(client, session)
+    now = datetime.now(UTC)
+    async with get_session_factory()() as s, s.begin():
+        s.add(
+            PromoActivity(
+                id=next_id(),
+                name="全场单品直降",
+                level=LEVEL_ITEM,
+                type=DISCOUNT_ITEM_PROMO,
+                calc_type=CALC_DIRECT,
+                discount_value=500,
+                max_discount=0,
+                threshold=0,
+                shop_id=0,
+                scope_type=SCOPE_ALL,
+                scope_value=None,
+                start_at=now - timedelta(hours=1),
+                end_at=now + timedelta(days=1),
+                status=2,
+                priority=0,
+            )
+        )
+
+    # 两行（同一 SPU 的两个 SKU）都会被这个活动命中
+    resp = await client.post(
+        "/api/orders",
+        json={
+            "items": [
+                {"skuId": ctx["sku_ids"][0], "num": 1},
+                {"skuId": ctx["sku_ids"][1], "num": 1},
+            ],
+            "addressId": ctx["address_id"],
+        },
+        headers={**ctx["buyer_headers"], "Idempotency-Key": "two-line-promo"},
+    )
+    assert resp.status_code == 200, resp.text
+    order = resp.json()["data"]
+    assert order["discountAmount"] == 1000, order
+
+    async with get_session_factory()() as s:
+        rows = await s.execute(
+            text(
+                "SELECT source_type, discount_amount FROM trade.order_discount_snapshot"
+                " WHERE order_main_no = :n ORDER BY level, source_type"
+            ),
+            {"n": order["orderMainNo"]},
+        )
+        snapshots = [tuple(r) for r in rows]
+    assert snapshots == [("PROMO_ITEM", 1000)], "一个活动只该有一行快照，金额是各行之和"
+
+
+async def test_scoped_item_activity_only_hits_its_own_sku(client: AsyncClient, session) -> None:
+    """★ 限了范围的单品活动只作用于范围内的规格。
+
+    这条守的是"活动表单补上适用范围"这件事：界面上选得出范围，算价就得真的按范围来
+    —— 只限定 A 生效时，B 那一行一分也不能少。
+    """
+    from tests.test_product import _create_and_publish
+
+    async with get_session_factory()() as s:
+        spu_id, _merchant_token = await _create_and_publish(client, s)
+
+    detail = (await client.get(f"/api/spus/{spu_id}")).json()["data"]
+    skus = detail["skus"]
+    in_scope, out_of_scope = skus[0], skus[1]
+
+    async with get_session_factory()() as s, s.begin():
+        wh = Warehouse(id=next_id(), shop_id=int(detail["shopId"]), name="测试仓", is_default=True)
+        s.add(wh)
+        wh_id = wh.id
+    async with get_session_factory()() as s, s.begin():
+        for i, sku in enumerate((in_scope, out_of_scope)):
+            await inv.init(
+                s, sku_id=int(sku["id"]), warehouse_id=wh_id, qty=100, biz_key=f"scope-{i}"
+            )
+
+    now = datetime.now(UTC)
+    async with get_session_factory()() as s, s.begin():
+        s.add(
+            PromoActivity(
+                id=next_id(),
+                name="只对第一个规格",
+                level=LEVEL_ITEM,
+                type=DISCOUNT_ITEM_PROMO,
+                calc_type=CALC_DIRECT,
+                discount_value=5000,
+                max_discount=0,
+                threshold=0,
+                shop_id=0,
+                scope_type=SCOPE_SKU,
+                scope_value=[int(in_scope["id"])],
+                start_at=now - timedelta(hours=1),
+                end_at=now + timedelta(days=1),
+                status=2,
+                priority=0,
+            )
+        )
+
+    buyer = await register(client, phone=BUYER_PHONE)
+    resp = await client.post(
+        "/api/checkout/calc",
+        json={
+            "items": [
+                {"skuId": in_scope["id"], "num": 1},
+                {"skuId": out_of_scope["id"], "num": 1},
+            ]
+        },
+        headers=auth_header(buyer["accessToken"]),
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    lines = {ln["skuId"]: ln for ln in data["items"]}
+
+    assert lines[in_scope["id"]]["discountAmount"] == 5000
+    assert lines[in_scope["id"]]["promoPrice"] == in_scope["price"] - 5000
+
+    # ★ 范围外那一行完全没被碰到
+    assert lines[out_of_scope["id"]]["discountAmount"] == 0
+    assert lines[out_of_scope["id"]]["promoPrice"] == out_of_scope["price"]
+    assert data["itemDiscount"] == 5000

@@ -16,6 +16,13 @@ export interface FreightTemplate {
   /** 1同仓取首重最高 2各算各的 */
   mergeType: number
   status: number
+  /**
+   * 店铺默认模板（一店只有一条）。
+   *
+   * 没绑定模板的规格算运费时**回落到它** —— 绑定是逐条 SKU 的，新发布的商品
+   * 天然在模板之外，没有这条回落就只能在买家结算时才发现算不出运费。
+   */
+  isDefault: boolean
   /** 影响面：这个模板绑了多少 SKU */
   boundSkuCount: number
 }
@@ -91,6 +98,16 @@ export function updateTemplate(
 
 export function listRegionRules(templateId: string): Promise<FreightRegionRule[]> {
   return get<FreightRegionRule[]>(`/merchant/freight/templates/${templateId}/regions`)
+}
+
+/**
+ * 设为店铺默认模板。
+ *
+ * 一个店只有一条，设新的会顶掉旧的。默认模板是**没绑定模板的规格的兜底** ——
+ * 一条默认都没有时，新发布的商品算不出运费，也就上不了架。
+ */
+export function setDefaultTemplate(templateId: string): Promise<FreightTemplate> {
+  return put<FreightTemplate>(`/merchant/freight/templates/${templateId}/default`, {})
 }
 
 /** 整体替换区域规则。后端会校验"必须保留一条全国默认"。 */

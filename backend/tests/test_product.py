@@ -6,7 +6,14 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
 
-from tests.conftest import auth_header, make_admin, open_shop, register
+from app.core.db import get_session_factory
+from tests.conftest import (
+    auth_header,
+    ensure_freight_template,
+    make_admin,
+    open_shop,
+    register,
+)
 
 # ============================================================
 # 测试数据构造
@@ -1689,3 +1696,105 @@ async def test_replace_specs_blocked_when_on_shelf_or_pending(client: AsyncClien
     )
     assert on_shelf.status_code == 400
     assert "先下架" in on_shelf.json()["message"]
+
+
+# ============================================================
+# 上架前的运费检查
+# ============================================================
+async def _merchant_without_freight(client: AsyncClient, session, *, phone: str) -> dict:
+    """造一个**没有可用运费模板**的店 + 一个草稿商品。
+
+    ★ 开店本来会自带一条默认模板（``account.create_shop`` 调
+      ``freight.ensure_default_template``），这里**把它摘掉** —— 这些用例要的
+      正是"既没绑定、店铺也没有默认模板"那个状态。
+    """
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "智能手机")
+    merchant = await register(client, phone=phone)
+    shop_id = int(await open_shop(client, merchant["accessToken"]))
+    async with get_session_factory()() as s, s.begin():
+        await s.execute(
+            text("UPDATE freight.freight_template SET is_default = false WHERE shop_id = :i"),
+            {"i": shop_id},
+        )
+
+    headers = auth_header(merchant["accessToken"])
+    return {
+        "token": merchant["accessToken"],
+        "headers": headers,
+        "adminHeaders": auth_header(admin["accessToken"]),
+        "spuId": await _create_spu(client, headers, category),
+    }
+
+
+async def test_reshelf_requires_freight(client: AsyncClient, session) -> None:
+    """★ 重新上架也要过运费检查。
+
+    商家的「上架」入口是把**已下架**的商品重新挂上去（草稿 / 待审核直接上架会被
+    "尚未通过审核"挡住，那条路径本来就是靠平台审核通过的）。而"下架期间把运费
+    模板删了"是很自然的事 —— 不检查的话，买家就会撞上算不出运费。
+    """
+    admin = await make_admin(client, session)
+    category = await _make_category(client, admin["accessToken"], "智能手机")
+    merchant = await register(client, phone="13800138071")
+    shop_id = int(await open_shop(client, merchant["accessToken"]))
+    headers = auth_header(merchant["accessToken"])
+    spu_id = await _create_spu(client, headers, category)
+
+    # 走正规流程挂上架，再下架
+    assert (
+        await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=headers)
+    ).status_code == 200
+    assert (
+        await client.post(
+            f"/api/admin/spus/{spu_id}/audit",
+            json={"approved": True},
+            headers=auth_header(admin["accessToken"]),
+        )
+    ).status_code == 200
+    assert (
+        await client.post(f"/api/merchant/spus/{spu_id}/off-shelf", headers=headers)
+    ).status_code == 200
+
+    # 下架期间把店铺的运费模板都摘掉
+    async with get_session_factory()() as s, s.begin():
+        await s.execute(
+            text("UPDATE freight.freight_template SET is_default = false WHERE shop_id = :i"),
+            {"i": shop_id},
+        )
+
+    blocked = await client.post(f"/api/merchant/spus/{spu_id}/on-shelf", headers=headers)
+    assert blocked.status_code == 400, blocked.text
+    assert "运费" in blocked.json()["message"]
+
+    # 补一条模板（自动成为默认）就能重新上架
+    await ensure_freight_template(client, merchant["accessToken"])
+    ok = await client.post(f"/api/merchant/spus/{spu_id}/on-shelf", headers=headers)
+    assert ok.status_code == 200, ok.text
+
+
+async def test_audit_approve_requires_freight(client: AsyncClient, session) -> None:
+    """★ 平台审核通过也得过同一道检查，但**驳回不受影响**。
+
+    审核通过就是直接上架，只在商家那条路上挡，审核就成了绕过它的后门 ——
+    商品照样卖不出去，只是没人知道，直到买家点结算。
+    """
+    ctx = await _merchant_without_freight(client, session, phone="13800138072")
+    spu_id = ctx["spuId"]
+    assert (
+        await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=ctx["headers"])
+    ).status_code == 200
+
+    approve = await client.post(
+        f"/api/admin/spus/{spu_id}/audit", json={"approved": True}, headers=ctx["adminHeaders"]
+    )
+    assert approve.status_code == 400, approve.text
+    assert "运费" in approve.json()["message"]
+
+    # 驳回不上架，照常可以（否则没配运费的商品连退都退不回去）
+    reject = await client.post(
+        f"/api/admin/spus/{spu_id}/audit",
+        json={"approved": False, "remark": "规格写错了"},
+        headers=ctx["adminHeaders"],
+    )
+    assert reject.status_code == 200, reject.text

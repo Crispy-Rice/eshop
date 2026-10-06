@@ -274,6 +274,7 @@ async def _prepare_product(client: AsyncClient, session) -> tuple[dict, str, str
     merchant = await register(client, phone="13800138031")
     shop_id = await open_shop(client, merchant["accessToken"])
     mh = auth_header(merchant["accessToken"])
+    # 不用手动建模板：开店自带一条默认模板，而没绑定的 SKU 就是回落到它
 
     resp = await client.post(
         "/api/merchant/spus", json=_spu_payload(category), headers=mh
@@ -368,10 +369,42 @@ async def test_calc_without_address_says_so(client: AsyncClient, session) -> Non
     assert any("收货地址" in n for n in data["notices"])
 
 
-async def test_unbound_sku_rejected(client: AsyncClient, session) -> None:
-    """没绑运费模板的商品算不出运费，只能拒单（docs/06 §10）。"""
+async def test_unbound_sku_falls_back_to_default_template(client: AsyncClient, session) -> None:
+    """没绑模板的规格回落到**店铺默认模板**（docs/06 §404 写的那半句）。
+
+    ★ 绑定是逐条 SKU 的，新发布的商品天然在模板之外；以前这种情况直接拒单，
+      而且报错发生在**买家结算**那一刻 —— 商家那边毫无感知。
+    ★ 这里**显式指定**一条默认模板（首重 ¥12.34），而不是依赖"开店送的那条"：
+      断言才是在验"回落"，而不是在验默认模板自己的参数。
+    """
     ctx, sku_id, _spu = await _prepare_product(client, session)
     headers = ctx["headers"]
+
+    tpl = await _make_template(ctx["shop_id"], name="兜底模板", first_price=1234)
+    async with get_session_factory()() as s, s.begin():
+        await service.set_default_template(s, ctx["shop_id"], tpl)
+
+    address_id = await _make_address(client, headers)
+    resp = await client.post(
+        "/api/checkout/calc",
+        json={"items": [{"skuId": sku_id, "num": 1}], "addressId": address_id},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    # 商品 199g < 首重 1000g → 收兜底模板的首重价
+    assert resp.json()["data"]["freight"] == 1234
+
+
+async def test_unbound_sku_rejected_without_default(client: AsyncClient, session) -> None:
+    """连默认模板都没有，才是真的算不出来，必须拒（docs/06 §10）。"""
+    ctx, sku_id, _spu = await _prepare_product(client, session)
+    headers = ctx["headers"]
+    # 摘掉默认标记，模拟"这个店一条模板都没配"
+    async with get_session_factory()() as s, s.begin():
+        await s.execute(
+            text("UPDATE freight.freight_template SET is_default = false WHERE shop_id = :i"),
+            {"i": ctx["shop_id"]},
+        )
     address_id = await _make_address(client, headers)
 
     resp = await client.post(
@@ -381,6 +414,29 @@ async def test_unbound_sku_rejected(client: AsyncClient, session) -> None:
     )
     assert resp.status_code == 422
     assert resp.json()["code"] == "SKU_NOT_SUPPORTED"
+    # 提示要说清是"既没绑定、也没默认"，而不是含糊的"没绑模板"
+    assert "默认模板" in resp.json()["message"]
+
+
+async def test_disabled_default_template_rejected(client: AsyncClient, session) -> None:
+    """默认模板被停用 = 没有兜底。提示要指明是"停用了"，别让人以为压根没配。"""
+    ctx, sku_id, _spu = await _prepare_product(client, session)
+    headers = ctx["headers"]
+    async with get_session_factory()() as s, s.begin():
+        await s.execute(
+            text("UPDATE freight.freight_template SET status = 2 WHERE shop_id = :i"),
+            {"i": ctx["shop_id"]},
+        )
+    address_id = await _make_address(client, headers)
+
+    resp = await client.post(
+        "/api/checkout/calc",
+        json={"items": [{"skuId": sku_id, "num": 1}], "addressId": address_id},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "SKU_NOT_SUPPORTED"
+    assert "停用" in resp.json()["message"]
 
 
 async def test_excluded_region_rejected(client: AsyncClient, session) -> None:
@@ -638,10 +694,9 @@ async def test_deleted_product_leaves_bind_list_and_count(
         await client.get(f"/api/merchant/freight/templates/{tpl_id}/binds", headers=mh)
     ).json()["data"]
     assert len(rows) == 1
-    count = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"][
-        0
-    ]["boundSkuCount"]
-    assert count == 1
+    # ★ 按 id 找自己那条：开店自带一条默认模板，列表里不止一条，不能用 [0]
+    tpls = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"]
+    assert next(t for t in tpls if t["id"] == str(tpl_id))["boundSkuCount"] == 1
 
     spu_id = await _only_spu_id(client, mh)
     assert (await client.delete(f"/api/merchant/spus/{spu_id}", headers=mh)).status_code == 200
@@ -650,9 +705,8 @@ async def test_deleted_product_leaves_bind_list_and_count(
         await client.get(f"/api/merchant/freight/templates/{tpl_id}/binds", headers=mh)
     ).json()["data"]
     assert rows == []
-    count = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"][
-        0
-    ]["boundSkuCount"]
+    tpls = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"]
+    count = next(t for t in tpls if t["id"] == str(tpl_id))["boundSkuCount"]
     assert count == 0, "计数必须和明细一致，否则商家看到空明细配个 1"
     # 行本身留在库里：将来若做"恢复已删商品"，绑定关系还在
     assert (
@@ -715,3 +769,64 @@ async def test_bind_rejects_another_shops_sku(client: AsyncClient, session) -> N
         )
         == 0
     )
+
+
+# ============================================================
+# 店铺默认模板（未绑定的 SKU 回落到它）
+# ============================================================
+async def test_extra_template_does_not_steal_default(client: AsyncClient, session) -> None:
+    """默认位只有一条：开店自带的那条是默认，之后建的不会抢走它。
+
+    （"开店自带一条默认模板"这件事本身在 ``test_account.py`` 里测 ——
+      那是 account 的行为。）
+    """
+    merchant = await register(client, phone="13800138061")
+    shop_id = int(await open_shop(client, merchant["accessToken"]))
+    mh = auth_header(merchant["accessToken"])
+    auto = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"][0]
+
+    second = await _make_template(shop_id, name="第二条")
+
+    rows = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"]
+    assert [t["id"] for t in rows if t["isDefault"]] == [auto["id"]]
+    assert str(second) in [t["id"] for t in rows]
+
+
+async def test_set_default_moves_the_flag(client: AsyncClient, session) -> None:
+    """设为默认会顶掉旧的 —— 一个店只能有一条默认（部分唯一索引兜着）。"""
+    merchant = await register(client, phone="13800138062")
+    shop_id = int(await open_shop(client, merchant["accessToken"]))
+    mh = auth_header(merchant["accessToken"])
+    auto = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"][0]
+    second = await _make_template(shop_id, name="第二条")
+
+    resp = await client.put(f"/api/merchant/freight/templates/{second}/default", headers=mh)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["isDefault"] is True
+
+    rows = (await client.get("/api/merchant/freight/templates", headers=mh)).json()["data"]
+    assert [t["id"] for t in rows if t["isDefault"]] == [str(second)]
+    assert auto["id"] not in [t["id"] for t in rows if t["isDefault"]]
+
+
+async def test_disabled_template_cannot_become_default(client: AsyncClient, session) -> None:
+    """停用的模板不能设成默认。
+
+    默认是"没绑定时的兜底"，一条停用的兜底**等于没有兜底**，却会让商家以为
+    已经配好了 —— 比没设更坏，因为它看起来是配好的。
+    """
+    merchant = await register(client, phone="13800138063")
+    shop_id = int(await open_shop(client, merchant["accessToken"]))
+    mh = auth_header(merchant["accessToken"])
+    second = await _make_template(shop_id, name="第二条")
+
+    off = await client.put(
+        f"/api/merchant/freight/templates/{second}",
+        json={"name": "第二条", "firstPrice": 1000, "addPrice": 300, "status": 2},
+        headers=mh,
+    )
+    assert off.status_code == 200, off.text
+
+    resp = await client.put(f"/api/merchant/freight/templates/{second}/default", headers=mh)
+    assert resp.status_code == 400
+    assert "停用" in resp.json()["message"]

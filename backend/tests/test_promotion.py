@@ -20,12 +20,33 @@ from app.core.snowflake import next_id
 from app.modules.promotion import repository as repo
 from app.modules.promotion import service
 from app.modules.promotion.models import (
+    ACTIVITY_STATUS_ENDED,
+    ACTIVITY_STATUS_NOT_STARTED,
+    ACTIVITY_STATUS_ONGOING,
+    ACTIVITY_STATUS_VOID,
+    CALC_DIRECT,
+    CALC_FIXED,
     CODE_UNUSED,
+    COUPON_TPL_ENDED,
+    COUPON_TPL_NOT_STARTED,
+    COUPON_TPL_ONGOING,
+    COUPON_TPL_VOID,
+    DISCOUNT_ITEM_PROMO,
+    DISCOUNT_PLATFORM_PROMO,
+    DISCOUNT_SHOP_PROMO,
     ISSUE_MAX_PER_USER_TPL,
+    LEVEL_ITEM,
+    LEVEL_PLATFORM,
+    LEVEL_SHOP,
+    SCOPE_CATEGORY,
+    SCOPE_SKU,
+    VALID_DAYS_AFTER,
     CouponCode,
     CouponTemplate,
+    PromoActivity,
 )
-from tests.conftest import auth_header, make_admin, register
+from app.modules.promotion.tasks import refresh_promo_status
+from tests.conftest import auth_header, make_admin, open_shop, register
 
 SHOP_ID = 990101
 BUYER_PHONE = "13900139011"  # 避开 make_admin 的 13900139001
@@ -556,24 +577,39 @@ async def _admin(client: AsyncClient, session) -> dict:
 
 
 async def _create_template_via_api(
-    client: AsyncClient, headers: dict, *, name: str = "满200减30", total: int = 500
+    client: AsyncClient,
+    headers: dict,
+    *,
+    name: str = "满200减30",
+    total: int = 500,
+    starts_in: timedelta = timedelta(hours=-1),
+    ends_in: timedelta = timedelta(days=30),
+    valid_days: int | None = None,
 ) -> str:
-    resp = await client.post(
-        "/api/admin/coupons/templates",
-        json={
-            "name": name,
-            "type": 1,
-            "discountValue": 3000,
-            "threshold": 20000,
-            "totalCount": total,
-            "perUserLimit": 2,
-            "validType": 1,
-            "validStart": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
-            "validEnd": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
-            "scopeType": 1,
-        },
-        headers=headers,
-    )
+    """建一个券模板。默认是"已经在有效期内"的固定区间券。
+
+    给了 ``valid_days`` 就建「领取后 N 天」型 —— 那种没有 ``validStart``/``validEnd``，
+    是验证状态推进时唯一落在"恒为进行中"分支的形状。
+    """
+    now = datetime.now(UTC)
+    payload: dict = {
+        "name": name,
+        "type": 1,
+        "discountValue": 3000,
+        "threshold": 20000,
+        "totalCount": total,
+        "perUserLimit": 2,
+        "scopeType": 1,
+    }
+    if valid_days is not None:
+        payload["validType"] = VALID_DAYS_AFTER
+        payload["validDays"] = valid_days
+    else:
+        payload["validType"] = 1
+        payload["validStart"] = (now + starts_in).isoformat()
+        payload["validEnd"] = (now + ends_in).isoformat()
+
+    resp = await client.post("/api/admin/coupons/templates", json=payload, headers=headers)
     assert resp.status_code == 200, resp.text
     return str(resp.json()["data"]["id"])
 
@@ -940,3 +976,695 @@ async def test_issue_records_are_visible(client: AsyncClient, session) -> None:
     # 汇总让"今天发了多少"一眼可见
     assert data["summary"]["total"] >= 2
     assert any(o["count"] >= 2 for o in data["summary"]["byOperator"])
+
+
+# ============================================================
+# 建券时挑适用范围（选目标，而不是手填 ID）
+# ============================================================
+
+
+async def test_search_shops_by_name(client: AsyncClient, session) -> None:
+    """★ 券里存的是 shopId，运营手上只有**店名** —— 得能按名字查到店。
+
+    跟"按手机号找用户"是同一类问题（那个是发券，这个是建券），
+    所以一样要有个能查的接口，否则运营无从知道自己的店 id 是多少。
+    """
+    merchant_a = await register(client, phone="13800139101")
+    shop_a = await open_shop(client, merchant_a["accessToken"], name="星野数码旗舰店")
+    merchant_b = await register(client, phone="13800139102")
+    shop_b = await open_shop(client, merchant_b["accessToken"], name="蓝天家居生活馆")
+    admin = await _admin(client, session)
+    headers = auth_header(admin["accessToken"])
+
+    # 不给关键词：列出最近的，刚建的两家要在里面
+    all_shops = await client.get("/api/admin/shops", headers=headers)
+    assert all_shops.status_code == 200, all_shops.text
+    assert {s["id"] for s in all_shops.json()["data"]} >= {shop_a, shop_b}
+
+    # 按店名收窄 —— 这就是运营实际要做的事
+    hit = await client.get("/api/admin/shops", params={"keyword": "家居"}, headers=headers)
+    assert hit.status_code == 200, hit.text
+    rows = hit.json()["data"]
+    assert [r["id"] for r in rows] == [shop_b]
+    assert rows[0]["name"] == "蓝天家居生活馆"
+    assert rows[0]["status"] == 1
+
+    # 反方向：已经存下来的范围里只有 id，按 id 回看才能知道"这条限了哪几家店"
+    by_ids = await client.get(
+        "/api/admin/shops", params={"ids": f"{shop_a},{shop_b}"}, headers=headers
+    )
+    assert by_ids.status_code == 200, by_ids.text
+    assert {r["id"] for r in by_ids.json()["data"]} == {shop_a, shop_b}
+
+    # 传进来的 ids 里有垃圾也不该 500 —— 只取认得出的
+    junk = await client.get("/api/admin/shops", params={"ids": f"{shop_a},abc"}, headers=headers)
+    assert junk.status_code == 200, junk.text
+    assert [r["id"] for r in junk.json()["data"]] == [shop_a]
+
+
+async def test_coupon_scope_accepts_string_ids(client: AsyncClient, session) -> None:
+    """★ scopeValue 要接受**字符串** id，而且一个数字都不能变。
+
+    JS 的 number 装不下 2^53 以上的雪花 id：前端要是先 ``Number()`` 再发，
+    存进去的就成了另一个数，pricing 里 ``item.sku_id in scope_value`` 永远为假
+    —— 券看着完全正常，却一辈子不生效。所以前端按字符串传，后端得原样收下、
+    精确落库。
+    """
+    admin = await _admin(client, session)
+    headers = auth_header(admin["accessToken"])
+    sku_ids = [next_id(), next_id()]
+
+    resp = await client.post(
+        "/api/admin/coupons/templates",
+        json={
+            "name": "指定商品券",
+            "type": 1,
+            "discountValue": 1000,
+            "totalCount": 100,
+            "validType": 2,
+            "validDays": 7,
+            "scopeType": 2,
+            "scopeValue": [str(i) for i in sku_ids],
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    tpl_id = int(resp.json()["data"]["id"])
+
+    # 落库的是精确整数（JSONB 存数字，读回来逐位比对）
+    stored = await session.scalar(
+        select(CouponTemplate.scope_value).where(CouponTemplate.id == tpl_id)
+    )
+    assert stored == sku_ids
+    assert all(isinstance(v, int) for v in stored)
+
+    # 出参又转回字符串（雪花 id 出参一律字符串，避免前端再丢一次精度）
+    listed = await client.get("/api/admin/coupons/templates", headers=headers)
+    assert listed.status_code == 200, listed.text
+    row = next(t for t in listed.json()["data"]["items"] if t["id"] == str(tpl_id))
+    assert row["scopeValue"] == [str(i) for i in sku_ids]
+
+
+async def test_coupon_scope_requires_target(client: AsyncClient, session) -> None:
+    """★ 选了「指定商品」却不给目标要当场拒掉。
+
+    空的 scope_value 在 pricing 里恒为假（``item.sku_id in []``），
+    等于一张**永远用不出去的券** —— 而它在列表上和正常券长得一模一样，
+    只有下单时才发现不生效，属于最难查的那类坏法。
+    """
+    admin = await _admin(client, session)
+    resp = await client.post(
+        "/api/admin/coupons/templates",
+        json={
+            "name": "没有目标的券",
+            "type": 1,
+            "discountValue": 1000,
+            "totalCount": 100,
+            "validType": 2,
+            "validDays": 7,
+            "scopeType": 2,
+            "scopeValue": [],
+        },
+        headers=auth_header(admin["accessToken"]),
+    )
+    assert resp.status_code == 400
+    assert "目标" in resp.json()["message"]
+
+
+# ============================================================
+# 促销活动：层级的适用方式
+# ============================================================
+async def _post_activity(
+    client: AsyncClient,
+    headers: dict,
+    *,
+    level: int,
+    atype: str,
+    calc_type: int,
+    name: str = "验证活动",
+    starts_in: timedelta = timedelta(hours=-1),
+    ends_in: timedelta = timedelta(days=7),
+    threshold: int = 0,
+    scope_type: int | None = None,
+    scope_value: list[str] | None = None,
+):
+    """建一个活动。
+
+    ``type`` 由调用方显式给（而不是按 level 推），这样才构造得出"配歪了"的用例。
+    时间窗默认是"已经在进行中"；要验证状态随窗口推进就得自己给偏移量。
+    """
+    now = datetime.now(UTC)
+    payload: dict = {
+        "name": name,
+        "level": level,
+        "type": atype,
+        "calcType": calc_type,
+        "discountValue": 5000,
+        "threshold": threshold,
+        "startAt": (now + starts_in).isoformat(),
+        "endAt": (now + ends_in).isoformat(),
+    }
+    if scope_type is not None:
+        payload["scopeType"] = scope_type
+        payload["scopeValue"] = scope_value
+    return await client.post("/api/admin/promotions", json=payload, headers=headers)
+
+
+async def test_order_level_activity_rejects_fixed_price(client: AsyncClient, session) -> None:
+    """★ 店铺级 / 平台级不能建「特价」。
+
+    「特价」的语义是"把单价设成 discount_value"，只有单品级成立。订单级算的是
+    "从总额里减一笔"，engine 里 ``_compute_discount`` 只处理直降与折扣 ——
+    于是「特价 ¥50」会被当成「减 ¥50」，弹窗上写着"特价即定价"、算出来却是
+    另一个数。建的时候就拒掉，别让它悄悄退化。
+    """
+    admin = await _admin(client, session)
+    headers = auth_header(admin["accessToken"])
+
+    for level, atype in ((LEVEL_SHOP, DISCOUNT_SHOP_PROMO), (LEVEL_PLATFORM, DISCOUNT_PLATFORM_PROMO)):
+        resp = await _post_activity(client, headers, level=level, atype=atype, calc_type=CALC_FIXED)
+        assert resp.status_code == 400, resp.text
+        assert "单品级" in resp.json()["message"]
+
+    # 订单级的直降 / 折扣照常可以建
+    ok = await _post_activity(
+        client, headers, level=LEVEL_SHOP, atype=DISCOUNT_SHOP_PROMO, calc_type=CALC_DIRECT
+    )
+    assert ok.status_code == 200, ok.text
+
+    # 单品级的特价才是它该在的地方
+    ok = await _post_activity(
+        client, headers, level=LEVEL_ITEM, atype=DISCOUNT_ITEM_PROMO, calc_type=CALC_FIXED
+    )
+    assert ok.status_code == 200, ok.text
+
+
+async def test_activity_type_must_match_level(client: AsyncClient, session) -> None:
+    """★ type 必须跟着 level 走。
+
+    ``level`` 决定"在哪一层算"，``type`` 只用来查冲突组与叠加矩阵。两者配歪了的
+    后果两层还不一样：单品层压根不看 ``type``（照样生效），订单层按 ``type`` 过滤
+    （静默不生效）—— 同一种错、两种表现，所以这里要卡死。
+    """
+    admin = await _admin(client, session)
+    headers = auth_header(admin["accessToken"])
+
+    # level=店铺级，却用了单品级的类型
+    resp = await _post_activity(
+        client, headers, level=LEVEL_SHOP, atype=DISCOUNT_ITEM_PROMO, calc_type=CALC_DIRECT
+    )
+    assert resp.status_code == 400, resp.text
+    assert DISCOUNT_SHOP_PROMO in resp.json()["message"]
+
+    # level=平台级，却用了店铺级的类型
+    resp = await _post_activity(
+        client, headers, level=LEVEL_PLATFORM, atype=DISCOUNT_SHOP_PROMO, calc_type=CALC_DIRECT
+    )
+    assert resp.status_code == 400, resp.text
+    assert DISCOUNT_PLATFORM_PROMO in resp.json()["message"]
+
+    # 三档配对了都照常可建
+    for level, atype in (
+        (LEVEL_ITEM, DISCOUNT_ITEM_PROMO),
+        (LEVEL_SHOP, DISCOUNT_SHOP_PROMO),
+        (LEVEL_PLATFORM, DISCOUNT_PLATFORM_PROMO),
+    ):
+        ok = await _post_activity(
+            client, headers, level=level, atype=atype, calc_type=CALC_DIRECT
+        )
+        assert ok.status_code == 200, ok.text
+
+
+async def test_item_level_activity_rejects_threshold(client: AsyncClient, session) -> None:
+    """★ 单品级不能填「门槛」。
+
+    门槛是**订单级**的概念：引擎只在 Level 1/2 用它过滤候选
+    （``_apply_order_level``），单品级压根不读它（``_apply_item_level`` ——
+    只按 ``_per_unit_discount`` 算每件减多少）。
+
+    以前这一栏对三档都显示，于是运营填的"满 50 减 10"实际是**每一件都减 10**：
+    39 元和 8999 元的商品一视同仁，而列表上还明晃晃写着"满 ¥50.00"。
+    填的值没人看，这是最难发现的那种坏法，所以建的时候就拒。
+    """
+    admin = await _admin(client, session)
+    headers = auth_header(admin["accessToken"])
+
+    resp = await _post_activity(
+        client,
+        headers,
+        level=LEVEL_ITEM,
+        atype=DISCOUNT_ITEM_PROMO,
+        calc_type=CALC_DIRECT,
+        threshold=5000,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "订单级" in resp.json()["message"]
+
+    # 订单级（店铺 / 平台）带门槛才是它该在的地方
+    for level, atype in ((LEVEL_SHOP, DISCOUNT_SHOP_PROMO), (LEVEL_PLATFORM, DISCOUNT_PLATFORM_PROMO)):
+        ok = await _post_activity(
+            client,
+            headers,
+            level=level,
+            atype=atype,
+            calc_type=CALC_DIRECT,
+            threshold=5000,
+        )
+        assert ok.status_code == 200, ok.text
+
+
+async def test_activity_scope_needs_a_target(client: AsyncClient, session) -> None:
+    """★ 选了适用范围却没挑到目标 = 一个**永远匹配不到任何商品**的活动。
+
+    pricing 里是 ``item.sku_id in scope_value``，空列表恒为假。
+    它在列表上和正常活动长得一模一样，只有下单时才发现不生效 ——
+    与券那边同一个坑，同一个理由：建的时候就拒。
+    """
+    admin = await _admin(client, session)
+    headers = auth_header(admin["accessToken"])
+
+    resp = await _post_activity(
+        client,
+        headers,
+        level=LEVEL_ITEM,
+        atype=DISCOUNT_ITEM_PROMO,
+        calc_type=CALC_DIRECT,
+        scope_type=SCOPE_SKU,
+        scope_value=[],
+    )
+    assert resp.status_code == 400, resp.text
+    assert "目标" in resp.json()["message"]
+
+    ok = await _post_activity(
+        client,
+        headers,
+        level=LEVEL_ITEM,
+        atype=DISCOUNT_ITEM_PROMO,
+        calc_type=CALC_DIRECT,
+        scope_type=SCOPE_SKU,
+        scope_value=["1001"],
+    )
+    assert ok.status_code == 200, ok.text
+
+
+async def test_scoped_item_activity_only_hits_its_own_sku(client: AsyncClient, session) -> None:
+    """★ 限了范围的单品活动只作用于范围内的规格。
+
+    这条守的是"活动表单补上适用范围"这件事：界面上选得出范围，算价就得真的按范围来
+    —— 只限定 A 生效时，B 那一行一分也不能少。
+    """
+    from tests.test_product import _create_and_publish
+
+    async with get_session_factory()() as s:
+        spu_id, _merchant_token = await _create_and_publish(client, s)
+
+    detail = await client.get(f"/api/spus/{spu_id}")
+    skus = detail.json()["data"]["skus"]
+    in_scope, out_of_scope = skus[0], skus[1]
+
+    from app.modules.inventory import service as inv
+    from app.modules.inventory.models import Warehouse
+
+    async with get_session_factory()() as s, s.begin():
+        wh = Warehouse(id=next_id(), shop_id=SHOP_ID, name="测试仓", is_default=True)
+        s.add(wh)
+        wh_id = wh.id
+    async with get_session_factory()() as s, s.begin():
+        for i, sku in enumerate((in_scope, out_of_scope)):
+            await inv.init(
+                s, sku_id=int(sku["id"]), warehouse_id=wh_id, qty=100, biz_key=f"scope-{i}"
+            )
+
+    admin = await _admin(client, session)
+    created = await _post_activity(
+        client,
+        auth_header(admin["accessToken"]),
+        level=LEVEL_ITEM,
+        atype=DISCOUNT_ITEM_PROMO,
+        calc_type=CALC_DIRECT,
+        name="只对第一个规格",
+        scope_type=SCOPE_SKU,
+        scope_value=[in_scope["id"]],
+    )
+    assert created.status_code == 200, created.text
+
+    buyer = await register(client, phone=BUYER_PHONE)
+    resp = await client.post(
+        "/api/checkout/calc",
+        json={
+            "items": [
+                {"skuId": in_scope["id"], "num": 1},
+                {"skuId": out_of_scope["id"], "num": 1},
+            ]
+        },
+        headers=auth_header(buyer["accessToken"]),
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    lines = {ln["skuId"]: ln for ln in data["items"]}
+
+    # _post_activity 里 discountValue 固定 5000（50 元）
+    assert lines[in_scope["id"]]["discountAmount"] == 5000
+    assert lines[in_scope["id"]]["promoPrice"] == in_scope["price"] - 5000
+
+    # ★ 范围外那一行完全没被碰到
+    assert lines[out_of_scope["id"]]["discountAmount"] == 0
+    assert lines[out_of_scope["id"]]["promoPrice"] == out_of_scope["price"]
+    assert data["itemDiscount"] == 5000
+
+
+async def test_category_scope_includes_subcategories(client: AsyncClient, session) -> None:
+    """★ 「指定类目」含该类的全部子类目。
+
+    商品**只能挂在末级类目**（``product._resolve_category``），所以"只匹配所选
+    类目本身"在父类目上从来就不可能生效过 —— 选「图书」是一条商品都匹配不到的，
+    而活动在列表上和正常的没区别。展开发生在 ``checkout._expand_category_scopes``
+    （引擎是纯函数，读不了类目树）。
+    """
+    from tests.test_product import _make_category, _spu_payload
+
+    admin = await _admin(client, session)
+    ah = auth_header(admin["accessToken"])
+    # ★ _make_category 要的是裸 token（它自己包 header），不是 header dict
+    token = admin["accessToken"]
+    root = await _make_category(client, token, name="图书")
+    child = await _make_category(client, token, name="小说", parent_id=root)
+
+    merchant = await register(client, phone="13800138021")
+    await open_shop(client, merchant["accessToken"], name="书店")
+    mh = auth_header(merchant["accessToken"])
+
+    resp = await client.post("/api/merchant/spus", json=_spu_payload(child), headers=mh)
+    assert resp.status_code == 200, resp.text
+    spu_id = resp.json()["data"]["id"]
+    assert (
+        await client.post(f"/api/merchant/spus/{spu_id}/submit", headers=mh)
+    ).status_code == 200
+    assert (
+        await client.post(
+            f"/api/admin/spus/{spu_id}/audit", json={"approved": True}, headers=ah
+        )
+    ).status_code == 200
+
+    detail = (await client.get(f"/api/spus/{spu_id}")).json()["data"]
+    sku = detail["skus"][0]
+
+    from app.modules.inventory import service as inv
+    from app.modules.inventory.models import Warehouse
+
+    async with get_session_factory()() as s, s.begin():
+        wh = Warehouse(id=next_id(), shop_id=int(detail["shopId"]), name="书店仓", is_default=True)
+        s.add(wh)
+        wh_id = wh.id
+    async with get_session_factory()() as s, s.begin():
+        await inv.init(s, sku_id=int(sku["id"]), warehouse_id=wh_id, qty=10, biz_key="cat-scope")
+
+    # 活动限定**父类目「图书」**，而商品挂在子类目「小说」下
+    created = await _post_activity(
+        client,
+        ah,
+        level=LEVEL_ITEM,
+        atype=DISCOUNT_ITEM_PROMO,
+        calc_type=CALC_DIRECT,
+        name="图书直降",
+        scope_type=SCOPE_CATEGORY,
+        scope_value=[root],
+    )
+    assert created.status_code == 200, created.text
+
+    buyer = await register(client, phone=BUYER_PHONE)
+    resp = await client.post(
+        "/api/checkout/calc",
+        json={"items": [{"skuId": sku["id"], "num": 1}]},
+        headers=auth_header(buyer["accessToken"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["items"][0]["discountAmount"] == 5000
+
+    # 反过来：限到**另一个一级类目**（数码）就不该碰到这本书 ——
+    # 守住展开不会broaden 成"什么都匹配"
+    other = await _make_category(client, token, name="数码")
+    await _void(client, ah, f"/api/admin/promotions/{created.json()['data']['id']}/void")
+    widened = await _post_activity(
+        client,
+        ah,
+        level=LEVEL_ITEM,
+        atype=DISCOUNT_ITEM_PROMO,
+        calc_type=CALC_DIRECT,
+        name="数码直降",
+        scope_type=SCOPE_CATEGORY,
+        scope_value=[other],
+    )
+    assert widened.status_code == 200, widened.text
+    resp = await client.post(
+        "/api/checkout/calc",
+        json={"items": [{"skuId": sku["id"], "num": 1}]},
+        headers=auth_header(buyer["accessToken"]),
+    )
+    assert resp.json()["data"]["items"][0]["discountAmount"] == 0
+
+
+# ============================================================
+# ⑪ 下线：活动与券模板的作废
+#
+# 补的是一个"功能没做"的缺口：运营侧原先只有"新建"，建完之后**没有任何办法
+# 把它关掉**（没有删除，也没有停用）。``status = 4``（已作废）的常量和中文字案
+# 一直都在模型里，只是没有任何代码会写这个值。
+#
+# ★ 缺的是"作废"，不是"删除"：活动一旦产生过订单，
+#   ``trade.order_discount_snapshot.source_id`` 就指着它 —— 删行会让那些快照
+#   变成查不到来源的孤儿。券模板那边早有同样的结论写在模型注释里："只能作废后新建"。
+# ============================================================
+async def _void(client: AsyncClient, headers: dict, path: str):
+    return await client.post(path, headers=headers)
+
+
+async def _status_of(session, activity_id: str) -> int:
+    """读一列，而不是取实体 —— 免得读到同一 session 里的旧对象。"""
+    return int(
+        await session.scalar(
+            select(PromoActivity.status).where(PromoActivity.id == int(activity_id))
+        )
+    )
+
+
+async def _tpl_status_of(session, tpl_id: str) -> int:
+    """券模板的同一件事（读列，不取实体）。"""
+    return int(
+        await session.scalar(
+            select(CouponTemplate.status).where(CouponTemplate.id == int(tpl_id))
+        )
+    )
+
+
+async def test_void_activity_takes_effect_immediately(client: AsyncClient, session) -> None:
+    """★ 作废**当场失效**，不必等窗口结束。
+
+    算价查询要求 ``status = 2``（``repo.list_active_activities``），置 4 之后
+    下一次算价就不带它了。这条用例的时间窗还剩 7 天 —— 所以"不生效"只可能来自
+    作废本身，不可能是窗口到期。
+    """
+    admin = await _admin(client, session)
+    h = auth_header(admin["accessToken"])
+
+    created = await _post_activity(
+        client, h, level=LEVEL_ITEM, atype=DISCOUNT_ITEM_PROMO, calc_type=CALC_DIRECT
+    )
+    assert created.status_code == 200, created.text
+    activity_id = str(created.json()["data"]["id"])
+
+    now = datetime.now(UTC)
+    active = await repo.list_active_activities(session, now=now)
+    assert [str(a.id) for a in active] == [activity_id]
+
+    resp = await _void(client, h, f"/api/admin/promotions/{activity_id}/void")
+    assert resp.status_code == 200, resp.text
+
+    # ★ 行还在，只是状态变了 —— 订单里的优惠快照指着这一行，不能删
+    assert await _status_of(session, activity_id) == ACTIVITY_STATUS_VOID
+    assert await repo.list_active_activities(session, now=now) == []
+
+    # 运营列表里带出"已作废"文案
+    listed = await client.get("/api/admin/promotions", headers=h)
+    row = next(i for i in listed.json()["data"]["items"] if i["id"] == activity_id)
+    assert row["statusText"] == "已作废"
+
+
+async def test_void_activity_rejects_double_void_and_unknown_id(
+    client: AsyncClient, session
+) -> None:
+    """重复作废要被拒（两个运营都点了，第二个会以为自己关掉了），未知 id 报 404。"""
+    admin = await _admin(client, session)
+    h = auth_header(admin["accessToken"])
+
+    created = await _post_activity(
+        client, h, level=LEVEL_SHOP, atype=DISCOUNT_SHOP_PROMO, calc_type=CALC_DIRECT
+    )
+    activity_id = str(created.json()["data"]["id"])
+
+    assert (
+        await _void(client, h, f"/api/admin/promotions/{activity_id}/void")
+    ).status_code == 200
+
+    twice = await _void(client, h, f"/api/admin/promotions/{activity_id}/void")
+    assert twice.status_code == 400, twice.text
+    assert "已经作废" in twice.json()["message"]
+
+    missing = await _void(client, h, f"/api/admin/promotions/{next_id()}/void")
+    assert missing.status_code == 404, missing.text
+
+
+async def test_cron_advances_activity_status_by_time_window(client: AsyncClient, session) -> None:
+    """★ 状态必须按时钟推进，否则"未开始"的活动**永远不会开始**。
+
+    活动状态是建的那一刻算一次就写死的（``router.create_activity``），而算价查询
+    硬性要求 ``status = 2``。没有 ``refresh_activity_status``，运营写的"零点开抢"
+    会永远停在未开始 —— 列表上看着正常，下单却不生效。
+    """
+    admin = await _admin(client, session)
+    h = auth_header(admin["accessToken"])
+
+    async def _make(name: str, starts_in: timedelta, ends_in: timedelta) -> str:
+        resp = await _post_activity(
+            client,
+            h,
+            level=LEVEL_ITEM,
+            atype=DISCOUNT_ITEM_PROMO,
+            calc_type=CALC_DIRECT,
+            name=name,
+            starts_in=starts_in,
+            ends_in=ends_in,
+        )
+        assert resp.status_code == 200, resp.text
+        return str(resp.json()["data"]["id"])
+
+    future = await _make("还没到点", timedelta(days=1), timedelta(days=2))
+    live = await _make("正在跑", timedelta(hours=-1), timedelta(hours=1))
+    past = await _make("窗口整个过去了", timedelta(days=-2), timedelta(days=-1))
+    killed = await _make("已作废", timedelta(hours=-1), timedelta(hours=1))
+    await _void(client, h, f"/api/admin/promotions/{killed}/void")
+
+    # 建出来的初始状态：只有落在窗口里的那条是"进行中"
+    assert await _status_of(session, future) == ACTIVITY_STATUS_NOT_STARTED
+    assert await _status_of(session, live) == ACTIVITY_STATUS_ONGOING
+    assert await _status_of(session, past) == ACTIVITY_STATUS_NOT_STARTED
+    assert await _status_of(session, killed) == ACTIVITY_STATUS_VOID
+
+    changed = await refresh_promo_status({"session_factory": get_session_factory()})
+    # 只碰了"窗口已经到点"的那两条里的**一条** —— live 本来就是进行中，
+    # 「只在真的变化时才写」把它排除了（否则 updated_at 会被每分钟重写）
+    assert changed["activities"] == 1
+    assert await _status_of(session, future) == ACTIVITY_STATUS_NOT_STARTED  # 还没到点，不动
+    assert await _status_of(session, live) == ACTIVITY_STATUS_ONGOING
+    assert await _status_of(session, past) == ACTIVITY_STATUS_ENDED
+    assert await _status_of(session, killed) == ACTIVITY_STATUS_VOID  # 作废不被复活
+
+
+async def test_cron_advances_coupon_template_status(client: AsyncClient, session) -> None:
+    """★ 券模板的状态也要按有效期推进 —— 否则过期券在运营列表里永远是"进行中"。
+
+    与活动同一个毛病（见 ``repo.refresh_coupon_template_status``），后果轻一些：
+    能不能领由 ``valid_end > now()`` 和 ``claim_template_quota`` 管，状态列只是给
+    运营看的 —— 但运营就是照着这一列判断"这张券还能不能领"。
+    """
+    admin = await _admin(client, session)
+    h = auth_header(admin["accessToken"])
+
+    not_started = await _create_template_via_api(
+        client, h, name="还没开始", starts_in=timedelta(days=1), ends_in=timedelta(days=2)
+    )
+    ongoing = await _create_template_via_api(
+        client, h, name="正在发", starts_in=timedelta(days=-1), ends_in=timedelta(days=1)
+    )
+    ended = await _create_template_via_api(
+        client, h, name="早过期了", starts_in=timedelta(days=-3), ends_in=timedelta(days=-2)
+    )
+    # 「领取后 N 天」型没有 validStart/validEnd，是唯一落在"恒进行中"分支的形状
+    days_after = await _create_template_via_api(client, h, name="领取后30天", valid_days=30)
+    killed = await _create_template_via_api(client, h, name="已作废", starts_in=timedelta(days=-1))
+    await _void(client, h, f"/api/admin/coupons/templates/{killed}/void")
+
+    # 建出来一律是"进行中" —— ``router.create_template`` 就是这么写的，
+    # 状态由这个任务在一分钟内校正
+    for tpl_id in (not_started, ongoing, ended, days_after):
+        assert await _tpl_status_of(session, tpl_id) == COUPON_TPL_ONGOING
+
+    counts = await refresh_promo_status({"session_factory": get_session_factory()})
+
+    # 只有"还没开始"和"早过期了"真的变了；ongoing 本来就在进行中，不重写
+    assert counts["templates"] == 2
+    assert await _tpl_status_of(session, not_started) == COUPON_TPL_NOT_STARTED
+    assert await _tpl_status_of(session, ongoing) == COUPON_TPL_ONGOING
+    assert await _tpl_status_of(session, ended) == COUPON_TPL_ENDED
+    assert await _tpl_status_of(session, days_after) == COUPON_TPL_ONGOING
+    assert await _tpl_status_of(session, killed) == COUPON_TPL_VOID  # 作废不被复活
+
+    # 运营列表里能直接看出过期了
+    listed = await client.get("/api/admin/coupons/templates", headers=h)
+    rows = {i["id"]: i["statusText"] for i in listed.json()["data"]["items"]}
+    assert rows[ended] == "已结束"
+    assert rows[not_started] == "未开始"
+    assert rows[killed] == "已作废"
+
+    # 「未开始」的券不再出现在券中心 —— 状态列修正顺带把"没到点就能领"也关掉了
+    buyer = await register(client, phone=BUYER_PHONE)
+    avail = await client.get("/api/coupons/available", headers=auth_header(buyer["accessToken"]))
+    ids = {i["template"]["id"] for i in avail.json()["data"]}
+    assert not_started not in ids
+    assert ongoing in ids
+
+
+async def test_void_coupon_template_stops_claiming_but_keeps_issued(
+    client: AsyncClient, session
+) -> None:
+    """★ 券模板作废：**止住新的领取**，但不碰已经发出去的券。
+
+    "券一旦发出去就是承诺" —— 这是作废与召回的分界。已领到的券有自己的生命周期
+    （未使用 / 已使用 / 已过期），运营反悔不能把它作废掉。
+    """
+    admin = await _admin(client, session)
+    h = auth_header(admin["accessToken"])
+    buyer = await register(client, phone=BUYER_PHONE)
+    bh = auth_header(buyer["accessToken"])
+    tpl_id = await _create_template_via_api(client, h, name="待作废券")
+
+    # 作废前：券中心看得见，也领得到
+    avail = await client.get("/api/coupons/available", headers=bh)
+    assert any(i["template"]["id"] == tpl_id for i in avail.json()["data"])
+
+    claimed = await client.post(
+        f"/api/coupons/{tpl_id}/receive", headers={**bh, "Idempotency-Key": "VOID-BEFORE"}
+    )
+    assert claimed.status_code == 200, claimed.text
+    code_id = claimed.json()["data"]["id"]
+
+    resp = await _void(client, h, f"/api/admin/coupons/templates/{tpl_id}/void")
+    assert resp.status_code == 200, resp.text
+
+    # 券中心不再展示
+    avail = await client.get("/api/coupons/available", headers=bh)
+    assert not any(i["template"]["id"] == tpl_id for i in avail.json()["data"])
+
+    # 直接调领券接口也拿不到，且文案说的是"已下架"而不是"抢光了" ——
+    # 后者会让人以为还能等补货
+    again = await client.post(
+        f"/api/coupons/{tpl_id}/receive", headers={**bh, "Idempotency-Key": "VOID-AFTER"}
+    )
+    assert again.status_code == 422, again.text
+    assert again.json()["code"] == "ACTIVITY_ENDED"
+    assert "下架" in again.json()["message"]
+
+    # 已经领到的那张券照旧在"我的券"里，未使用
+    mine = await client.get("/api/my/coupons", headers=bh)
+    row = next(i for i in mine.json()["data"] if i["id"] == code_id)
+    assert row["statusText"] == "未使用"
+
+    # 运营列表里状态文案是"已作废"
+    listed = await client.get("/api/admin/coupons/templates", headers=h)
+    row = next(i for i in listed.json()["data"]["items"] if i["id"] == tpl_id)
+    assert row["statusText"] == "已作废"
+
+    # 重复作废 → 400
+    twice = await _void(client, h, f"/api/admin/coupons/templates/{tpl_id}/void")
+    assert twice.status_code == 400, twice.text
+    assert "已经作废" in twice.json()["message"]

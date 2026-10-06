@@ -117,13 +117,19 @@ async def cas_status(
     to_status: int,
     audit_remark: str | None = None,
 ) -> bool:
-    """CAS 更新评价状态。``rowcount = 0`` 说明已被别人处置过。"""
+    """CAS 更新评价状态。``rowcount = 0`` 说明已被别人处置过。
+
+    ★ 顺手清掉 ``need_second_audit``：那条标记的含义是"这条进了人工抽检队列"，
+      运营**处置过**（通过 / 驳回 / 屏蔽 / 解除）就算抽检完成。不清的话，
+      "通过"这种不改状态的处置会让它永远赖在抽检队列里 —— 队列只增不减。
+    """
     result = await session.execute(
         update(Review)
         .where(Review.id == review_id, Review.status == from_status)
         .values(
             status=to_status,
             audit_remark=audit_remark,
+            need_second_audit=False,
             updated_at=func.now(),
             version=Review.version + 1,
         )
@@ -291,17 +297,48 @@ async def list_audit_queue(
 ) -> list[Review]:
     """运营审核队列。
 
-    ``second_audit_only`` 用于看"机审放行但标记待抽检"的那批 ——
-    这是 docs/12 §4 混合审核模式里的抽检队列。
+    ★ 两个视图查的是**互不相交**的两批，别把 ``status`` 和 ``need_second_audit``
+      叠在一起：
+
+    - **待审核**（命中高风险词，先审后发）→ ``status = 待审核``
+    - **待抽检**（机审放行，先发后审）→ ``status = 已发布 ∧ need_second_audit``
+
+      ``need_second_audit`` 只在**放行**的行上为 true（``sensitive.machine_audit``），
+      待审核的行必然是 false —— 两者取交集恒为空，抽检视图会永远是空的，
+      哪怕库里堆着一批等抽查的。
     """
-    stmt: Select = select(Review).where(Review.status == status)
+    stmt: Select = select(Review)
     if second_audit_only:
-        stmt = stmt.where(Review.need_second_audit.is_(True))
+        stmt = stmt.where(
+            Review.status == int(ReviewStatus.PUBLISHED),
+            Review.need_second_audit.is_(True),
+        )
+    else:
+        stmt = stmt.where(Review.status == status)
     clause = _cursor_clause(Review.created_at, Review.id, cursor)
     if clause is not None:
         stmt = stmt.where(clause)
     stmt = stmt.order_by(Review.created_at.desc(), Review.id.desc()).limit(limit)
     return list(await session.scalars(stmt))
+
+
+async def count_second_audit(session: AsyncSession) -> int:
+    """待抽检的总条数（**全表**，不是当前页）。
+
+    角标要的是"还有多少条等我抽检"，数当前页等于永远显示 0 —— 那正是它之前的写法
+    （在待审核那一页里数已发布的行）。
+    """
+    return int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Review)
+            .where(
+                Review.status == int(ReviewStatus.PUBLISHED),
+                Review.need_second_audit.is_(True),
+            )
+        )
+        or 0
+    )
 
 
 async def count_by_status(session: AsyncSession) -> dict[int, int]:

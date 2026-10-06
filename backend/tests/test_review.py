@@ -21,6 +21,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 
 from app.core.db import get_session_factory
+from app.core.enums import ReviewStatus
 from app.core.redis import get_redis
 from app.modules.review import service as review_service
 from app.modules.review.models import DAILY_REVIEW_LIMIT
@@ -559,6 +560,69 @@ async def test_audit_queue_shows_pending(client: AsyncClient, session) -> None:
     assert review["reviewId"] in [i["review"]["reviewId"] for i in data["items"]]
     assert data["pendingCount"] >= 1
     assert data["items"][0]["reasonText"] == "机审命中高风险词"
+
+
+async def test_audit_queue_shows_second_audit_items(client: AsyncClient, session) -> None:
+    """★ 抽检队列查的是"机审放行（已发布）但标了待抽检"的那批。
+
+    原来这里把 ``status=待审核``（参数默认值）和 ``need_second_audit`` 叠在一起查，
+    而 ``need_second_audit`` 只在**放行**的行上为 true（``machine_audit``），
+    待审核的行必然是 false —— 两者交集恒为空，抽检视图**永远是空的**，
+    哪怕库里堆着一批等抽查的；角标也一样恒为 0（它在"待审核"那一页里数已发布的行）。
+    """
+    ctx = await _prepare(client, session)
+    admin = await _admin(client, session)
+    ah = auth_header(admin["accessToken"])
+    _, item_id = await _finished_item(client, ctx, idem="q-10")
+    # 内容过机审 → 直接发布 + 标记待抽检
+    review = await _submit(client, ctx, item_id=item_id, content="质量很好，包装扎实", idem="q-11")
+
+    resp = await client.get(
+        "/api/admin/reviews/audit-queue", params={"secondAuditOnly": "true"}, headers=ah
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert review["reviewId"] in [i["review"]["reviewId"] for i in data["items"]]
+    assert data["items"][0]["reasonText"] == "机审放行，待抽检"
+    assert data["secondAuditCount"] >= 1
+
+    # ★ 两个视图互不相交：待审核视图里不该有它
+    pending = (await client.get("/api/admin/reviews/audit-queue", headers=ah)).json()["data"]
+    assert review["reviewId"] not in [i["review"]["reviewId"] for i in pending["items"]]
+
+
+async def test_second_audit_pass_removes_it_from_queue(client: AsyncClient, session) -> None:
+    """★ 抽检处置过就出队 ——「通过」不改状态，只清掉待抽检标记。
+
+    不这么做的话，被抽检过但没问题的评价会永远赖在抽检队列里（队列只增不减）。
+    """
+    ctx = await _prepare(client, session)
+    admin = await _admin(client, session)
+    ah = auth_header(admin["accessToken"])
+    _, item_id = await _finished_item(client, ctx, idem="q-20")
+    review = await _submit(client, ctx, item_id=item_id, content="不错，会回购", idem="q-21")
+
+    resp = await client.post(
+        f"/api/admin/reviews/{review['reviewId']}/audit",
+        json={"action": "APPROVE"},
+        headers=ah,
+    )
+    assert resp.status_code == 200, resp.text
+
+    data = (
+        await client.get(
+            "/api/admin/reviews/audit-queue", params={"secondAuditOnly": "true"}, headers=ah
+        )
+    ).json()["data"]
+    assert review["reviewId"] not in [i["review"]["reviewId"] for i in data["items"]]
+    assert data["secondAuditCount"] == 0
+
+    # 状态仍是「已发布」—— 抽检通过不该把它撤下来
+    async with get_session_factory()() as s:
+        status = await s.scalar(
+            text("SELECT status FROM review.review WHERE id = :i"), {"i": int(review["reviewId"])}
+        )
+    assert int(status) == int(ReviewStatus.PUBLISHED)
 
 
 # ============================================================

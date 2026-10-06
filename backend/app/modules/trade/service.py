@@ -27,6 +27,7 @@ from app.modules.account import service as account_service
 from app.modules.core import outbox
 from app.modules.inventory import service as inventory_service
 from app.modules.inventory.service import StockItem
+from app.modules.product import service as product_service
 from app.modules.promotion import checkout as promotion_checkout
 from app.modules.promotion import service as promotion_service
 from app.modules.promotion.allocation import allocate
@@ -403,6 +404,14 @@ async def _split(session: AsyncSession, calc) -> list[SubDraft]:
 
     shop_names = await account_service.list_shop_names(session, list(by_shop.keys()))
 
+    # ★ 四个优惠字段**一律取"该店铺各行分摊额之和"**，绝不在这里重新分摊一遍。
+    #
+    #   引擎已经把每一层的优惠按「参与金额」摊到了行上，行上的数才是事实
+    #   （商品行显示的实付、退款时按行算的金额都用它）。如果这里再按"子单原价占比"
+    #   把同一个平台优惠摊一次，两个分摊的基数不同、结果会差几分 —— 于是
+    #   `Σ行实付 + 子单运费 > 子单应付`，而退款校验正是拿子单应付当上限
+    #   （docs/08 §10），这笔单**连整单退都会被拦住**，报"退款金额超限"。
+    #   聚合出来的值同样满足母子单守恒：各行分摊之和就是母单的总额。
     subs = [
         SubDraft(
             shop_id=shop_id,
@@ -421,6 +430,12 @@ async def _split(session: AsyncSession, calc) -> list[SubDraft]:
                 for a in it.allocations
                 if a.source_type in ("PROMO_ORDER_SHOP", "COUPON_SHOP")
             ),
+            platform_discount=sum(
+                a.amount
+                for it in items
+                for a in it.allocations
+                if a.source_type in ("PROMO_ORDER_PLATFORM", "COUPON_PLATFORM")
+            ),
             coupon_amount=sum(
                 a.amount
                 for it in items
@@ -430,16 +445,6 @@ async def _split(session: AsyncSession, calc) -> list[SubDraft]:
         )
         for shop_id, items in by_shop.items()
     ]
-
-    # 平台级优惠按「子单商品原价」占比分摊（最大余数法保证 Σ 恰好等于总额）
-    if len(subs) == 1:
-        # 单店铺不用分摊，全部归它 —— 分摊算法在只有一项时结果也一样，
-        # 但直接赋值更清楚，也避免"分摊"这个词造成误解
-        subs[0].platform_discount = calc.platform_discount
-    else:
-        base = [s.total_amount for s in subs]
-        for sub, amount in zip(subs, allocate(calc.platform_discount, base), strict=True):
-            sub.platform_discount = amount
 
     # 运费已按仓库算好并归属到店铺（freight 模块的 packages 带 warehouse 但不带 shop），
     # 这里按运费明细里的店铺归属取。第一期单仓单店，直接全部归第一个子单即可，
@@ -550,7 +555,19 @@ async def _write_items(session: AsyncSession, main_no: str, calc) -> None:
 
 
 async def _write_discount_snapshots(session: AsyncSession, main_no: str, calc) -> None:
-    """写优惠快照 —— 退款时要按**当时**的规则算，不能按现在的。"""
+    """写优惠快照 —— 退款时要按**当时**的规则算，不能按现在的。
+
+    ★ **按 (level, source_type, source_id) 合并成一行。**
+
+    算价引擎对单品级 / 店铺级是**逐行**产生优惠记录的：同一个"全场单品直降"作用在
+    三件商品上就是三条 ``AppliedDiscount``；店铺级还会按店铺各算一遍。而这张表的
+    唯一键 ``uk_discount_snap`` 是"**一个活动一行**"（见 models 里的说明：防同一活动
+    被重复记账）。两边对不上，结果是"一单里有两行被同一个活动命中"就撞唯一键 ——
+    整单回滚，买家只看到 500「系统繁忙」。
+
+    合并是对的，没丢信息：**逐行的优惠金额已经落在 ``order_item.discount_amount``**
+    （退款按行读它，docs/05 §6.4）；这张快照要回答的是"这笔单里哪个活动减了多少"。
+    """
     level_of = {
         "PROMO_ITEM": 0,
         "PROMO_ORDER_SHOP": 1,
@@ -558,23 +575,30 @@ async def _write_discount_snapshots(session: AsyncSession, main_no: str, calc) -
         "PROMO_ORDER_PLATFORM": 2,
         "COUPON_PLATFORM": 2,
     }
-    rows = [
-        OrderDiscountSnapshot(
-            order_main_no=main_no,
-            order_sub_no=None,
-            level=level_of.get(d.source_type, 2),
-            source_type=d.source_type,
-            # 券是 couponCodeId、活动是 promoActivityId。有了它，退款/核销才能
-            # 反查到是**哪一张**券参与了这笔订单（docs/05 §9）
-            source_id=int(d.source_id),
-            source_name=d.source_name,
-            rule_snapshot={"amount": d.amount},
-            discount_amount=d.amount,
-        )
-        for d in calc.discounts
-    ]
-    if rows:
-        await repo.insert_discount_snapshots(session, rows)
+    merged: dict[tuple[int, str, int], OrderDiscountSnapshot] = {}
+    for d in calc.discounts:
+        level = level_of.get(d.source_type, 2)
+        # 券是 couponCodeId、活动是 promoActivityId。有了它，退款/核销才能
+        # 反查到是**哪一张**券参与了这笔订单（docs/05 §9）
+        source_id = int(d.source_id)
+        row = merged.get((level, d.source_type, source_id))
+        if row is None:
+            merged[(level, d.source_type, source_id)] = OrderDiscountSnapshot(
+                order_main_no=main_no,
+                order_sub_no=None,
+                level=level,
+                source_type=d.source_type,
+                source_id=source_id,
+                source_name=d.source_name,
+                rule_snapshot={"amount": d.amount},
+                discount_amount=d.amount,
+            )
+        else:
+            row.discount_amount += d.amount
+            row.rule_snapshot = {"amount": row.discount_amount}
+
+    if merged:
+        await repo.insert_discount_snapshots(session, list(merged.values()))
 
 
 def _freight_detail(calc) -> dict:
@@ -805,6 +829,15 @@ async def mark_paid(session: AsyncSession, order_main_no: str, *, paid_amount: i
             if s.source_type.startswith("COUPON_") and int(s.source_id) > 0
         },
     )
+
+    # ★ 累计销量（商品列表上的「已售」）。按 SPU 汇总——同一个商品买了两行只发一条 UPDATE。
+    #
+    #   放在这里是因为上面那道 ``mark_main_paid`` 是**条件更新**：母单不在待付款就
+    #   返回 False 并提前 return，所以重放的支付回调走不到这儿，不会重复计数。
+    counts: dict[int, int] = {}
+    for item in await repo.list_items_of_subs(session, [s.order_sub_no for s in subs]):
+        counts[int(item.spu_id)] = counts.get(int(item.spu_id), 0) + item.num
+    await product_service.apply_sold_delta(session, counts)
 
     return True
 

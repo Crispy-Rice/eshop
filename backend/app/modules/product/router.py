@@ -14,6 +14,7 @@ from app.core.deps import DbSession, require_role
 from app.core.errors import BizError, ErrorCode
 from app.core.response import ApiResponse
 from app.modules.account.deps import CurrentShopIdDep
+from app.modules.freight import service as freight_service
 from app.modules.product import service
 from app.modules.product.models import SPU_ON_SHELF, SPU_PENDING_AUDIT, SPU_REJECTED
 from app.modules.product.schemas import (
@@ -38,6 +39,29 @@ from app.modules.trade import service as trade_service
 router = APIRouter()
 
 AdminDep = Annotated[CurrentUser, Depends(require_role("admin"))]
+
+
+async def _assert_freight_ready(session: DbSession, *, shop_id: int, sku_ids: list[int]) -> None:
+    """商品"能不能上架"的最后一道检查：不能有算不出运费的规格。
+
+    ★ 没绑运费模板的 SKU，原先只在**买家结算**时才报错（``freight.estimate``），
+      那时商品已经挂在架上了 —— 上架是最后一道能拦住"卖不出去的商品"的关口。
+    ★ 跨模块只读放路由层：product 不能反向 import freight（与「改规格先查订单」
+      同一套路，见 ``replace_spu_specs``）。判据由 freight 给，这里只负责把它
+      变成一句能照着做的提示。
+    ★ **两条**上架路径都要过这道检查：商家的「上架」与平台的「审核通过」——
+      后者直接置为在售，只挡商家那条等于给平台留了个后门。
+    """
+    missing = await freight_service.skus_without_freight(
+        session, shop_id=shop_id, sku_ids=sku_ids
+    )
+    if missing:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            f"这个商品有 {len(missing)} 个规格还算不出运费（既没绑定运费模板，"
+            "店铺也没有设默认模板），无法上架。先到「运费模板」把它们绑定，"
+            "或给店铺设一个默认模板",
+        )
 
 
 # ============================================================
@@ -147,7 +171,7 @@ async def replace_spu_specs(
     """整体替换规格组与 SKU 集合（``spu_id`` 不变，购物车与链接都不受影响）。
 
     ★ **只允许没有订单的商品**。判据在 trade 域，所以在这里先查再交给 product ——
-      这是本文件唯一一处跨模块调用（product 不能反向 import trade）。
+      跨模块调用只能放在路由层（product 不能反向 import trade）。
       在售 / 审核中的商品由 service 再挡一道（与 ``delete_spu`` 同口径）。
     """
     if await trade_service.spu_has_order_items(session, spu_id):
@@ -183,6 +207,10 @@ async def submit_for_audit(spu_id: int, shop_id: CurrentShopIdDep, session: DbSe
 
 @router.post("/api/merchant/spus/{spu_id}/on-shelf", response_model=ApiResponse[None], summary="上架")
 async def on_shelf(spu_id: int, shop_id: CurrentShopIdDep, session: DbSession) -> ApiResponse[None]:
+    # 归属校验就落在 sku_ids_of_owned_spu 里（拿别人店铺的 spu_id 会直接 404）——
+    # 不先过它的话，运费检查会抢在 404 前面报出"这个商品有几个规格"
+    sku_ids = await service.sku_ids_of_owned_spu(session, shop_id, spu_id)
+    await _assert_freight_ready(session, shop_id=shop_id, sku_ids=sku_ids)
     await service.on_shelf(session, shop_id, spu_id)
     return ApiResponse.ok(None)
 
@@ -306,5 +334,13 @@ async def audit_spu(
     spu_id: int, body: SpuAuditRequest, admin: AdminDep, session: DbSession
 ) -> ApiResponse[None]:
     """通过 → 上架；驳回 → 退回草稿。``remark`` 会存进 ``audit_remark`` 给商家看。"""
+    if body.approved:
+        # ★ 通过就是**直接上架**，所以要和商家的「上架」过同一道运费检查 ——
+        #   只在商家那条路上挡，平台审核就成了绕过它的后门（商品照样卖不出去，
+        #   只是没人知道，直到买家点结算）。
+        brief = await service.get_spu_brief(session, spu_id)
+        if brief is not None:
+            target_shop, sku_ids = brief
+            await _assert_freight_ready(session, shop_id=target_shop, sku_ids=sku_ids)
     await service.audit_spu(session, spu_id, body)
     return ApiResponse.ok(None)

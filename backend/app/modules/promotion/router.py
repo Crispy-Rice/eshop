@@ -24,12 +24,16 @@ from app.modules.promotion import repository as repo
 from app.modules.promotion.models import (
     ACTIVITY_STATUS_TEXT,
     BANNER_ENABLED,
+    CALC_FIXED,
     CALC_TYPE_TEXT,
     COUPON_TPL_ONGOING,
     COUPON_TPL_STATUS_TEXT,
     COUPON_TYPE_TEXT,
     DISCOUNT_TYPE_TEXT,
+    LEVEL_ITEM,
     LEVEL_TEXT,
+    PROMO_TYPE_BY_LEVEL,
+    SCOPE_ALL,
     VALID_DAYS_AFTER,
     VALID_FIXED,
     Banner,
@@ -42,6 +46,7 @@ from app.modules.promotion.schemas import (
     AdminIssueRequest,
     AdminPromoActivityListOut,
     AdminPromoActivityOut,
+    AdminShopOptionOut,
     BannerCreateRequest,
     BannerOut,
     BannerUpdateRequest,
@@ -300,6 +305,17 @@ async def create_template(
     if body.valid_end is not None and body.valid_start is not None and body.valid_end <= body.valid_start:
         raise BizError(ErrorCode.VALIDATION_ERROR, "validEnd 必须晚于 validStart")
 
+    # ★ 选了具体适用范围却不给目标 id，等于建了一张**永远匹配不到任何商品**的券：
+    #   pricing 里是 `scope_value is not None and item.sku_id in scope_value`，
+    #   空列表恒为假。这种券在列表上和正常券长得一模一样，只有下单时才发现不生效 ——
+    #   所以宁可在建的这一步就拒掉。
+    if body.scope_type != SCOPE_ALL and not body.scope_value:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            "适用范围选了「指定商品 / 类目 / 店铺」就要给至少一个目标，"
+            "否则这张券永远匹配不到任何商品",
+        )
+
     tpl = CouponTemplate(
         id=next_id(),
         shop_id=body.shop_id,
@@ -325,6 +341,17 @@ async def create_template(
     return ApiResponse.ok(_to_tpl_out(tpl))
 
 
+@router.post(
+    "/api/admin/coupons/templates/{tpl_id}/void",
+    response_model=ApiResponse[None],
+    summary="作废券模板",
+)
+async def void_coupon_template(session: DbSession, tpl_id: int, _: AdminDep) -> ApiResponse[None]:
+    """**下线**一个券模板：作废，不删除；已发出去的券不受影响。"""
+    await service.void_coupon_template(session, tpl_id)
+    return ApiResponse.ok(None)
+
+
 @router.get(
     "/api/admin/users/lookup",
     response_model=ApiResponse[UserLookupOut],
@@ -348,6 +375,42 @@ async def lookup_user(
     user_id, nickname, phone_masked = found
     return ApiResponse.ok(
         UserLookupOut(user_id=user_id, nickname=nickname, phone_masked=phone_masked)
+    )
+
+
+@router.get(
+    "/api/admin/shops",
+    response_model=ApiResponse[list[AdminShopOptionOut]],
+    summary="店铺列表（运营，按名称搜）",
+)
+async def search_shops(
+    _: AdminDep,
+    session: DbSession,
+    keyword: str | None = Query(default=None, max_length=32),
+    ids: str | None = Query(default=None, description="逗号分隔的店铺 id，回看用"),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> ApiResponse[list[AdminShopOptionOut]]:
+    """给券 / 活动的「指定店铺」挑目标，也能**按 id 回看**。
+
+    ★ 跟上面按手机号找人是同一类问题：券里存的是 shopId，而运营手上只有**店名**，
+      店 id 他同样拿不到。所以建券前得先有个能按名字查店的接口。
+
+    ``ids`` 是反向的那一半：已经存下来的范围里只有 id，要看"这条到底限了哪几家店"
+      就得按 id 换回名字。同一个接口承载两个方向，因为它就是"运营认店铺"的入口。
+
+    刻意**不分页**：这是选择器不是列表页 —— 在选择器里翻页没有意义，
+    多打两个字收窄比翻页快。所以只给 keyword 加一个结果上限。
+
+    关掉的店也返回（带上 status 让界面标出来）：凭空少一家店，
+    运营只会以为是"搜不到"，说不出为什么。
+    """
+    if ids is not None:
+        wanted = [int(x) for x in ids.split(",") if x.strip().isdigit()]
+        shops = await account_service.list_public_shops(session, wanted)
+    else:
+        shops = await account_service.search_shops(session, keyword=keyword, limit=limit)
+    return ApiResponse.ok(
+        [AdminShopOptionOut(id=s.id, name=s.name, status=s.status) for s in shops]
     )
 
 
@@ -505,6 +568,54 @@ async def create_activity(
     if body.end_at <= body.start_at:
         raise BizError(ErrorCode.VALIDATION_ERROR, "endAt 必须晚于 startAt")
 
+    # ★ type 是**从 level 推出来的**，不能各写各的。
+    #   level 决定"在哪一层算"，type 只用来查冲突组与叠加矩阵；两者配歪了，
+    #   单品层压根不看 type（照样生效）、订单层按 type 过滤（静默不生效）——
+    #   同一种错两种表现，是最难查的那类。前端本来就是按 level 推的，
+    #   这里卡死的是直接调接口的情况。
+    expected_type = PROMO_TYPE_BY_LEVEL[body.level]
+    if body.type != expected_type:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            f"{LEVEL_TEXT[body.level]}活动的 type 必须是 {expected_type}（收到 {body.type}）",
+        )
+
+    # ★ 「特价」的语义是"把单价设成 discount_value"，只有单品级成立。
+    #   到了店铺级 / 平台级，engine 算的是"从总额里减一笔"
+    #   （``_compute_discount`` 只处理直降与折扣），于是「特价 ¥50」会被当成
+    #   「减 ¥50」—— 弹窗上写着"特价即定价"，算出来却是另一个数。
+    #   与其让它悄悄退化，不如在建的时候就拒掉。
+    if body.calc_type == CALC_FIXED and body.level != LEVEL_ITEM:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            "「特价」只适用于单品级（它改的是单价）；"
+            "店铺级 / 平台级是从总额里减一笔，请改用「直降」或「折扣」",
+        )
+
+    # ★ 单品级没有「门槛」这回事，引擎在 Level 0 里**压根不读 threshold**
+    #   （``_apply_item_level`` —— 只按 ``_per_unit_discount`` 算每件减多少），
+    #   门槛只在订单级用来过滤候选（``_apply_order_level``）。
+    #   于是"满 50 减 10"的单品活动实际是"每一件都减 10"：连 8999 的笔记本
+    #   也减 10。填的值没人看、界面上却显示着"满 ¥50.00"，是最难发现的那种坏法。
+    #   和上面「特价」同一条路数：与其悄悄忽略，不如建的时候就拒掉。
+    if body.threshold > 0 and body.level == LEVEL_ITEM:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            "「门槛」是订单级的概念（满多少才减），单品级不参与计算；"
+            "要按金额满减请建店铺级 / 平台级活动",
+        )
+
+    # ★ 选了具体适用范围却不给目标 id，等于建了一个**永远匹配不到任何商品**的
+    #   活动：pricing 里是 `item.sku_id in scope_value` / `sku_id in scope_value`，
+    #   空列表恒为假。它在列表上和正常活动长得一模一样，只有下单时才发现不生效 ——
+    #   和券那边同一个坑，同一个理由。
+    if body.scope_type != SCOPE_ALL and not body.scope_value:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            "适用范围选了「指定商品 / 类目 / 店铺」就要给至少一个目标，"
+            "否则这个活动永远匹配不到任何商品",
+        )
+
     now = datetime.now(UTC)
     activity = PromoActivity(
         id=next_id(),
@@ -527,12 +638,27 @@ async def create_activity(
     return ApiResponse.ok({"id": str(activity.id), "name": activity.name})
 
 
+@router.post(
+    "/api/admin/promotions/{activity_id}/void",
+    response_model=ApiResponse[None],
+    summary="作废促销活动",
+)
+async def void_activity(session: DbSession, activity_id: int, _: AdminDep) -> ApiResponse[None]:
+    """**下线**一个活动：作废，不删除；当场失效，历史订单不受影响。
+
+    走 service 而不是直接改 repository，是因为这里有一条真实规则要守
+    （不能重复作废），而且"为什么不删除"的理由得写在有上下文的地方。
+    """
+    await service.void_activity(session, activity_id)
+    return ApiResponse.ok(None)
+
+
 # ============================================================
 # 首页 Banner
 #
 # 买家侧只读启用中的；运营侧（admin / finance，与营销同角色）可增删改。
-# 写操作直接落在这一层 —— promotion 模块的运营 CRUD 一贯是"路由 + repository"，
-# 中间没有 service 中转，这里保持一致。
+# Banner 的写操作直接落在这一层 —— 它就是几张展示图，没有规则要守，
+# 没必要为它加一层 service。
 # ============================================================
 def _to_banner_out(banner: Banner) -> BannerOut:
     return BannerOut(

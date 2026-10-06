@@ -234,7 +234,9 @@ async def list_audit_queue(
     session: DbSession,
     _admin: AdminDep,
     status: int = Query(default=0, description="0待审核 1已发布 2已屏蔽 3审核不通过"),
-    second_audit_only: bool = Query(default=False, description="只看待抽检的"),
+    # ★ 必须显式写 alias：不写的话前端传 `secondAuditOnly` 会被 FastAPI **静默忽略**，
+    #   一直按默认 false 走"待审核"分支 —— 界面上那个抽检开关看着能点，其实从没生效过
+    second_audit_only: bool = Query(default=False, alias="secondAuditOnly", description="只看待抽检的"),
     cursor: str | None = Query(default=None, max_length=200),
     limit: int = Query(default=20, ge=1, le=50),
 ) -> ApiResponse[AuditQueueOut]:

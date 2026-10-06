@@ -47,6 +47,10 @@ TRANSITIONS: dict[ReviewStatus, dict[AuditAction, ReviewStatus]] = {
     },
     S.PUBLISHED: {
         A.BLOCK: S.BLOCKED,
+        # ★ 自己到自己：抽检队列里"确认无误"就是这个动作。状态不变，但要留下处置
+        #   记录、并清掉 ``need_second_audit``（见 ``repository.cas_status``）——
+        #   少了它，被抽检过但没问题的评价会永远赖在抽检队列里，队列只增不减。
+        A.APPROVE: S.PUBLISHED,
     },
     S.BLOCKED: {
         A.UNBLOCK: S.PUBLISHED,

@@ -468,6 +468,26 @@ async def incr_spu_review_stats(
     )
 
 
+async def add_spu_sold(session: AsyncSession, counts: dict[int, int]) -> None:
+    """累加 SPU 的**累计销量**（就是列表/详情上的「已售」）。
+
+    ``counts`` 是 ``{spu_id: 件数}`` —— 由调用方按 SPU 汇总好再传进来，
+    这样"一个订单里同一商品买了两行"只发一条 UPDATE。
+
+    逐条 UPDATE 而不是拼一条 ``VALUES`` 批量：一个订单涉及的 SPU 是个位数，
+    可读性比省那几条语句值钱。**增量**写法（``total_sold = total_sold + n``）
+    而不是读改写，避免并发下丢更新。
+    """
+    for spu_id, num in counts.items():
+        if num == 0:
+            continue
+        await session.execute(
+            update(Spu)
+            .where(Spu.id == spu_id)
+            .values(total_sold=Spu.total_sold + num, updated_at=func.now())
+        )
+
+
 # ============================================================
 # 规格
 # ============================================================

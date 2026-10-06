@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from sqlalchemy import Select, delete, func, select
+from sqlalchemy import Select, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -63,6 +63,51 @@ async def insert_template(session: AsyncSession, tpl: FreightTemplate) -> Freigh
     session.add(tpl)
     await session.flush()
     return tpl
+
+
+async def get_default_template(session: AsyncSession, shop_id: int) -> FreightTemplate | None:
+    """店铺默认模板。**不过滤状态** —— 调用方要能区分"没设默认"和"默认被停用了"，
+    这两种情况给商家的提示不一样。"""
+    return await session.scalar(
+        select(FreightTemplate).where(
+            FreightTemplate.shop_id == shop_id, FreightTemplate.is_default.is_(True)
+        )
+    )
+
+
+async def list_default_templates(
+    session: AsyncSession, shop_ids: Sequence[int]
+) -> list[FreightTemplate]:
+    """批量取各店的默认模板。一单可能跨店，按 shop_id 一次查完，不做 N+1。"""
+    if not shop_ids:
+        return []
+    return list(
+        await session.scalars(
+            select(FreightTemplate).where(
+                FreightTemplate.shop_id.in_(shop_ids), FreightTemplate.is_default.is_(True)
+            )
+        )
+    )
+
+
+async def set_default_template(
+    session: AsyncSession, *, shop_id: int, template_id: int
+) -> None:
+    """把某条模板设为该店默认。
+
+    ★ 必须**先清旧的再设新的**：``uk_freight_tpl_default`` 是部分唯一索引，
+      同一个店铺只允许一条 ``is_default``，顺序反过来会直接撞索引。
+    """
+    await session.execute(
+        update(FreightTemplate)
+        .where(FreightTemplate.shop_id == shop_id, FreightTemplate.is_default.is_(True))
+        .values(is_default=False)
+    )
+    await session.execute(
+        update(FreightTemplate)
+        .where(FreightTemplate.id == template_id, FreightTemplate.shop_id == shop_id)
+        .values(is_default=True)
+    )
 
 
 # ============================================================

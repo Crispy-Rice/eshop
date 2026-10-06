@@ -8,6 +8,11 @@ from sqlalchemy import select, text
 
 from app.core.crypto import phone_decrypt, phone_hash
 from app.modules.account.models import RefreshToken, User, UserAddress
+from app.modules.freight.models import (
+    DEFAULT_TPL_FIRST_PRICE,
+    DEFAULT_TPL_FREE_THRESHOLD,
+    DEFAULT_TPL_NAME,
+)
 from tests.conftest import (
     TEST_PASSWORD,
     TEST_PHONE,
@@ -324,6 +329,33 @@ async def test_cannot_create_second_shop(client: AsyncClient) -> None:
 
     resp = await client.post("/api/merchant/shop", json={"name": "第二个店"}, headers=headers)
     assert resp.status_code == 400
+
+
+async def test_new_shop_comes_with_a_default_freight_template(client: AsyncClient) -> None:
+    """★ 开店顺手送一条默认运费模板。
+
+    没有它，新店的商品**一件都上不了架**（上架要求每个规格都算得出运费），
+    而商家要绕到"发布 → 提交审核 → 平台点通过被判 400"才发现 —— 卡在运营那一步，
+    运营只能打回去，白跑一趟。
+    """
+    tokens = await register(client)
+    headers = auth_header(tokens["accessToken"])
+    await client.post("/api/merchant/shop", json={"name": "新店"}, headers=headers)
+
+    rows = (await client.get("/api/merchant/freight/templates", headers=headers)).json()["data"]
+    assert len(rows) == 1
+    tpl = rows[0]
+    assert tpl["name"] == DEFAULT_TPL_NAME
+    assert tpl["isDefault"] is True
+    # 参数是"起点"（首重 ¥10 / 满 ¥99 包邮），商家该按真实运费改
+    assert tpl["firstPrice"] == DEFAULT_TPL_FIRST_PRICE
+    assert tpl["freeThreshold"] == DEFAULT_TPL_FREE_THRESHOLD
+
+    # 带一条「全国默认」区域规则：商家以后想加"上海另计"时不会被校验挡住
+    rules = (
+        await client.get(f"/api/merchant/freight/templates/{tpl['id']}/regions", headers=headers)
+    ).json()["data"]
+    assert [r["regionCode"] for r in rules] == ["0"]
 
 
 async def test_public_shop_info_needs_no_login(client: AsyncClient) -> None:

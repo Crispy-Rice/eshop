@@ -445,6 +445,7 @@ Idempotency-Key: 9a8b7c6d-...
 | GET/POST/PUT | `/api/merchant/freight/templates[/{id}]` | 运费模板（实际路径带 `freight/`，早期文档写成 `freight-templates` 是错的） |
 | POST | `/api/merchant/freight/bind` | 把 SKU 绑到运费模板 |
 | GET | `/api/merchant/freight/templates/{id}/binds` | ★ 该模板绑了哪些 SKU。带商品标题/规格/仓库名（后端拼好）。**只有读，没有解绑** |
+| PUT | `/api/merchant/freight/templates/{id}/default` | 设为店铺默认模板（一店一条，设新的顶掉旧的）。未绑定模板的规格算运费时回落到它。**开店时系统已自动建了一条**，商家可改可换 |
 | GET/POST | `/api/merchant/coupon-templates` | 店铺券（未实现） |
 | GET | `/api/merchant/orders?status=&cursor=` | 商家订单列表（`idx_order_sub_shop` 索引） |
 | POST | `/api/merchant/order-subs/{subNo}/ship` | 发货（填写快递公司与单号） |
@@ -461,16 +462,19 @@ Idempotency-Key: 9a8b7c6d-...
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET/POST | `/api/admin/shops` | 店铺入驻与管理（未实现） |
+| GET | `/api/admin/shops` | 券 / 活动的「指定店铺」目标。`keyword` 按店名搜；`ids`（逗号分隔）按 id 回看 —— 存下来的范围里只有 id。两个方向同一个入口，刻意不分页 |
+| POST | `/api/admin/shops` | 店铺入驻与管理（未实现） |
 | POST | `/api/admin/spus/{spuId}/audit` | 商品审核 |
 | GET | `/api/admin/coupons/templates` | 券模板列表（`status` 过滤 + 游标分页）。★ 出参比券中心那份**多带发行量/已发量/适用范围/getType** |
 | POST | `/api/admin/coupons/templates` | 新建券模板 |
+| POST | `/api/admin/coupons/templates/{tplId}/void` | **作废券模板**（`status = 4`）。止住新的领取（`claim_template_quota` 要求 `status = 2`），**已发出去的券不受影响** |
 | POST | `/api/admin/coupons/issue` | 客服补发。**只支持单个 `userId`**，单次 ≤100 张，不占活动额度 |
 | GET | `/api/admin/promotions` | 促销活动列表（`status` 过滤 + 游标分页），带 `levelText`/`typeText`/`calcTypeText`/`statusText` |
 | POST | `/api/admin/promotions` | 新建促销活动。响应只回 `{id, name}` |
+| POST | `/api/admin/promotions/{id}/void` | **作废促销活动**（`status = 4`）。算价查询要求 `status = 2`，所以**当场失效**；历史订单读自己的快照，不受影响。重复作废 → 400 |
 | GET | `/api/admin/aftersales?status=90` | 平台介入工单（未实现） |
 | POST | `/api/admin/aftersales/{refundNo}/judge` | 平台裁决（未实现） |
-| GET | `/api/admin/reviews/audit-queue` | 评价审核队列（`secondAuditOnly=true` 看待抽检的） |
+| GET | `/api/admin/reviews/audit-queue` | 评价审核队列（**两个互不相交的视图**）：默认 = 待审核（机审命中高风险词，先审后发）；`secondAuditOnly=true` = 待抽检（机审放行、先发后审，即 `status=已发布 ∧ need_second_audit`）。**这个参数必须写 alias**，否则前端传 camelCase 会被静默忽略 |
 | POST | `/api/admin/reviews/{reviewId}/audit` | 处置评价：APPROVE / REJECT / BLOCK / UNBLOCK。**会同步更新商品评分** |
 | GET | `/api/admin/reconcile/diffs` | 对账差异（finance，未实现） |
 | GET | `/api/admin/alerts` | 告警列表（对账异常、死信等，未实现） |

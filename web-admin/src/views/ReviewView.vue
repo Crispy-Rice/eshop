@@ -42,6 +42,13 @@ const auditCursor = ref<string | null>(null)
 const auditMore = ref(false)
 const auditStatus = ref<number>(REVIEW_PENDING)
 const pendingCount = ref(0)
+const secondAuditCount = ref(0)
+
+/**
+ * 「待抽检」不是状态码，是这个视图的哨兵值 —— 它查的是
+ * **已发布 ∧ 待抽检**（机审放行、先发后审的那批），跟"已发布"列表不是一回事。
+ */
+const SECOND_AUDIT_TAB = -1
 
 const loading = ref(false)
 const loadingMore = ref(false)
@@ -64,6 +71,7 @@ const SHOP_STATUS_TABS = [
 
 const AUDIT_STATUS_TABS = [
   { label: '待审核', value: REVIEW_PENDING },
+  { label: '待抽检', value: SECOND_AUDIT_TAB },
   { label: '已发布', value: REVIEW_PUBLISHED },
   { label: '已屏蔽', value: REVIEW_BLOCKED },
 ] as const
@@ -130,8 +138,11 @@ async function loadAudit(reset = true): Promise<void> {
   if (reset) loading.value = true
   else loadingMore.value = true
   try {
+    // 「待抽检」查的是已发布 ∧ 待抽检，不是某个状态码
+    const secondAudit = auditStatus.value === SECOND_AUDIT_TAB
     const page = await fetchAuditQueue({
-      status: auditStatus.value,
+      status: secondAudit ? REVIEW_PUBLISHED : auditStatus.value,
+      secondAuditOnly: secondAudit,
       cursor: reset ? undefined : (auditCursor.value ?? undefined),
       limit: 20,
     })
@@ -139,6 +150,7 @@ async function loadAudit(reset = true): Promise<void> {
     auditCursor.value = page.nextCursor
     auditMore.value = page.hasMore
     pendingCount.value = page.pendingCount
+    secondAuditCount.value = page.secondAuditCount
   } catch (e) {
     ElMessage.error(isBizError(e) ? e.message : '加载审核队列失败')
   } finally {
@@ -327,6 +339,9 @@ onMounted(async () => {
       >
         <el-radio-button v-for="s in AUDIT_STATUS_TABS" :key="s.label" :value="s.value">
           {{ s.label }}
+          <span v-if="s.value === SECOND_AUDIT_TAB && secondAuditCount > 0" class="badge tnum">
+            {{ secondAuditCount }}
+          </span>
         </el-radio-button>
       </el-radio-group>
 
@@ -387,6 +402,17 @@ onMounted(async () => {
                 @click="openAudit(row, AUDIT_ACTIONS.REJECT)"
               >
                 驳回
+              </el-button>
+              <!-- 抽检队列里的行：状态已是「已发布」，处置就是"确认无误"（不改状态，
+                   只把这条移出抽检队列）或"屏蔽" -->
+              <el-button
+                v-if="row.review.status === REVIEW_PUBLISHED && row.review.needSecondAudit"
+                type="primary"
+                size="small"
+                :loading="acting"
+                @click="quickAudit(row, AUDIT_ACTIONS.APPROVE)"
+              >
+                抽检通过
               </el-button>
               <el-button
                 v-if="row.review.status === REVIEW_PUBLISHED"

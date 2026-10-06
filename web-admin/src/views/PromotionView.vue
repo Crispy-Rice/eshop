@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { fetchCategoryTree, type Category } from '@/api/category'
 import { isBizError } from '@/api/errors'
+import { fetchSkusByIds } from '@/api/product'
 import {
   CALC_DIRECT,
   CALC_FIXED,
@@ -23,25 +24,29 @@ import {
   PROMO_TYPE_TEXT,
   SCOPE_ALL,
   SCOPE_CATEGORY,
-  SCOPE_SKU,
   SCOPE_SHOP,
   SCOPE_TYPE_TEXT,
+  TPL_NOT_STARTED,
   TPL_ONGOING,
   VALID_DAYS_AFTER,
   VALID_FIXED,
   createCouponTemplate,
   createPromoActivity,
+  fetchShopsByIds,
   issueCoupon,
   listCouponIssues,
   listCouponTemplates,
   listPromoActivities,
   lookupUserByPhone,
+  voidCouponTemplate,
+  voidPromoActivity,
   type AdminCouponTemplate,
   type AdminPromoActivity,
   type CouponIssueRecord,
   type CouponIssueSummary,
   type UserLookup,
 } from '@/api/promotion'
+import ScopePicker from '@/components/ScopePicker.vue'
 import { useAuthStore } from '@/stores/auth'
 import { formatDateTime, formatYuan, yuanToFen } from '@/utils/money'
 
@@ -67,7 +72,6 @@ const activityStatus = ref<number | undefined>(undefined)
 const loading = ref(false)
 const loadingMore = ref(false)
 const acting = ref(false)
-const categories = ref<Category[]>([])
 
 const STATUS_TABS = [
   { label: '全部', value: undefined },
@@ -85,7 +89,6 @@ const COUPON_TYPES = [
 ]
 
 const LEVELS = [LEVEL_ITEM, LEVEL_SHOP, LEVEL_PLATFORM]
-const CALC_TYPES = [CALC_DIRECT, CALC_RATE, CALC_FIXED]
 
 // ============================================================
 // 券模板表单
@@ -108,9 +111,8 @@ const couponForm = reactive({
   validRange: [] as string[],
   validDays: 7,
   scopeType: SCOPE_ALL as number,
-  categoryIds: [] as string[],
-  /** 指定商品 / 指定店铺：运营端没有"列出全部 SPU/店铺"的接口，只能手填 ID */
-  manualScopeIds: '',
+  /** 适用范围的目标 id（雪花，**string**）。全场是 null —— 由 ScopePicker 抛回来 */
+  scopeValue: null as string[] | null,
 })
 
 const isDiscount = computed(() => couponForm.type === COUPON_TYPE_DISCOUNT)
@@ -133,8 +135,7 @@ function openCouponDialog(): void {
   couponForm.validRange = []
   couponForm.validDays = 7
   couponForm.scopeType = SCOPE_ALL
-  couponForm.categoryIds = []
-  couponForm.manualScopeIds = ''
+  couponForm.scopeValue = null
   couponVisible.value = true
 }
 
@@ -162,6 +163,16 @@ async function submitCoupon(): Promise<void> {
     return
   }
 
+  // ★ 选了适用范围却没挑到任何目标，会建出一张**永远匹配不到商品**的券 ——
+  //   它在列表上和正常券一模一样，只有下单时才发现不生效。后端也会拒，
+  //   但在这里拦住能给出一句更贴事的话。
+  const scopeValue = couponForm.scopeValue
+  if (couponForm.scopeType !== SCOPE_ALL && (scopeValue === null || scopeValue.length === 0)) {
+    const what = SCOPE_TYPE_TEXT[couponForm.scopeType] ?? '目标'
+    ElMessage.warning(`适用范围选了「${what}」，就要挑至少一个目标`)
+    return
+  }
+
   acting.value = true
   try {
     await createCouponTemplate({
@@ -177,7 +188,7 @@ async function submitCoupon(): Promise<void> {
       validEnd: couponForm.validType === VALID_FIXED ? couponForm.validRange[1] : null,
       validDays: couponForm.validType === VALID_DAYS_AFTER ? couponForm.validDays : null,
       scopeType: couponForm.scopeType,
-      scopeValue: scopeValuePayload(),
+      scopeValue,
     })
     ElMessage.success('券模板已创建')
     couponVisible.value = false
@@ -189,16 +200,13 @@ async function submitCoupon(): Promise<void> {
   }
 }
 
-function scopeValuePayload(): number[] | null {
-  if (couponForm.scopeType === SCOPE_ALL) return null
-  if (couponForm.scopeType === SCOPE_CATEGORY) {
-    return couponForm.categoryIds.map((v) => Number(v)).filter((v) => Number.isFinite(v))
-  }
-  return couponForm.manualScopeIds
-    .split(/[,，\s]+/)
-    .map((v) => Number(v.trim()))
-    .filter((v) => Number.isFinite(v) && v > 0)
-}
+// ============================================================
+// 适用范围
+//
+// 选择器（全场 / 指定商品 / 指定类目 / 指定店铺）抽到了
+// ``components/ScopePicker.vue`` —— 券与活动用的是同一套后端契约，
+// 复制一份等于给自己留两份要同步的代码。
+// ============================================================
 
 // ============================================================
 // 活动表单
@@ -214,11 +222,35 @@ const activityForm = reactive({
   thresholdYuan: 0,
   range: [] as string[],
   priority: 0,
+  /** 适用范围。与券同一套语义（全场 / 商品 / 类目 / 店铺） */
+  scopeType: SCOPE_ALL as number,
+  scopeValue: null as string[] | null,
 })
 
 /** 层级决定参与哪一层算价，也决定 type 这个字符串键 */
 const activityType = computed(() => PROMO_TYPE_BY_LEVEL[activityForm.level] ?? 'PROMO_ITEM')
 const activityIsDiscount = computed(() => activityForm.calcType === CALC_RATE)
+
+/**
+ * 「特价」只对单品级有意义 —— 它改的是**单价**。
+ *
+ * 店铺级 / 平台级算的是"从总额里减一笔"，特价在那一层没有对应物：
+ * 后端只会把它当成直降（所以接口现在直接拒），界面上写着"特价即定价"、
+ * 算出来却是另一个数，是最难发现的那种坏法。那一档干脆不列出来。
+ */
+const activityCalcTypes = computed(() =>
+  activityForm.level === LEVEL_ITEM ? [CALC_DIRECT, CALC_RATE, CALC_FIXED] : [CALC_DIRECT, CALC_RATE],
+)
+
+// 从单品级切到店铺级 / 平台级时，把已经选中的「特价」退回直降
+watch(
+  () => activityForm.level,
+  (level) => {
+    if (level !== LEVEL_ITEM && activityForm.calcType === CALC_FIXED) {
+      activityForm.calcType = CALC_DIRECT
+    }
+  },
+)
 
 function openActivityDialog(): void {
   activityForm.name = ''
@@ -230,6 +262,8 @@ function openActivityDialog(): void {
   activityForm.thresholdYuan = 0
   activityForm.range = []
   activityForm.priority = 0
+  activityForm.scopeType = SCOPE_ALL
+  activityForm.scopeValue = null
   activityVisible.value = true
 }
 
@@ -243,6 +277,14 @@ async function submitActivity(): Promise<void> {
   const [startAt, endAt] = activityForm.range
   if (!startAt || !endAt) {
     ElMessage.warning('要选活动开始与结束时间')
+    return
+  }
+  // 与券同一条：选了范围却没挑到目标，活动会**永远匹配不到任何商品**，
+  // 而列表上它看起来和正常活动一模一样
+  const scopeValue = activityForm.scopeValue
+  if (activityForm.scopeType !== SCOPE_ALL && (scopeValue === null || scopeValue.length === 0)) {
+    const what = SCOPE_TYPE_TEXT[activityForm.scopeType] ?? '目标'
+    ElMessage.warning(`适用范围选了「${what}」，就要挑至少一个目标`)
     return
   }
 
@@ -263,6 +305,8 @@ async function submitActivity(): Promise<void> {
       startAt,
       endAt,
       priority: activityForm.priority,
+      scopeType: activityForm.scopeType,
+      scopeValue,
     })
     ElMessage.success('活动已创建')
     activityVisible.value = false
@@ -384,6 +428,192 @@ async function loadIssueRecords(reset = false): Promise<void> {
 }
 
 // ============================================================
+// 下线（作废）
+//
+// ★ 用"作废"而不是"删除"：活动一旦产生过订单，订单里的优惠快照就指着它 ——
+//   删行会让那些快照变成查不到来源的孤儿。作废只是改状态，**算价当场不再带它**
+//   （后端算价查询要求 status = 2），已产生的订单不受影响。
+//   后半句必须写在确认框里：运营一听"下线"就怕已经卖出去的单子跟着变，不说明白不敢点。
+// ============================================================
+/** 未开始 / 进行中的才需要作废：已结束的没什么可停，已作废的不必再点。 */
+function canVoid(status: number): boolean {
+  return status === TPL_NOT_STARTED || status === TPL_ONGOING
+}
+
+async function voidActivity(row: AdminPromoActivity): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确定作废「${row.name}」吗？作废后立即不再参与算价，已产生的订单不受影响。`,
+      '作废促销活动',
+      { type: 'warning', confirmButtonText: '作废', confirmButtonClass: 'el-button--danger' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await voidPromoActivity(row.id)
+    ElMessage.success('活动已作废')
+    await loadActivities(true)
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '作废失败')
+  }
+}
+
+async function voidCoupon(row: AdminCouponTemplate): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确定作废「${row.name}」吗？作废后不能再被领取，已经领到券的用户不受影响。`,
+      '作废券模板',
+      { type: 'warning', confirmButtonText: '作废', confirmButtonClass: 'el-button--danger' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await voidCouponTemplate(row.id)
+    ElMessage.success('券模板已作废')
+    await loadCoupons(true)
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '作废失败')
+  }
+}
+
+// ============================================================
+// 详情
+//
+// ★ 列表只放得下"最该看的那几列"，而关键的东西恰恰不在列上：适用范围存的是 id、
+//   折扣封顶和优先级根本没地方显示。运营问"这条到底管了谁"时只能猜。
+// ============================================================
+const detailVisible = ref(false)
+const detailTitle = ref('')
+const detailRows = ref<{ label: string; value: string }[]>([])
+const detailLoading = ref(false)
+
+/** 类目 id → 名字。一次拉全树在内存里查，别逐个查库 */
+async function categoryNames(ids: string[]): Promise<string[]> {
+  const flat = new Map<string, string>()
+  const walk = (nodes: Category[]): void => {
+    for (const n of nodes) {
+      flat.set(n.id, n.name)
+      if (n.children?.length) walk(n.children)
+    }
+  }
+  walk(await fetchCategoryTree())
+  return ids.map((id) => flat.get(id) ?? id)
+}
+
+/**
+ * 把适用范围讲成人话。
+ *
+ * 三类目标分别反查：类目走类目树、规格走 `/skus/batch`、店铺走按 id 回看
+ * （`fetchShopsByIds`）。
+ *
+ * ★ **解析不出来的不吞掉** —— 那通常意味着目标已经下架或删除，而"这条活动
+ *   还指着一个不存在的商品"正是运营最该看到的事。
+ */
+async function scopeText(scopeType: number, scopeValue: string[] | null): Promise<string> {
+  const what = SCOPE_TYPE_TEXT[scopeType] ?? '范围'
+  if (scopeType === SCOPE_ALL) return '全场'
+  const ids = scopeValue ?? []
+  if (ids.length === 0) return `${what}：（没有目标，这条不会生效）`
+
+  if (scopeType === SCOPE_CATEGORY) {
+    return `${what}：${(await categoryNames(ids)).join('、')}（含全部子类目）`
+  }
+  if (scopeType === SCOPE_SHOP) {
+    const names = new Map((await fetchShopsByIds(ids)).map((s) => [s.id, s.name]))
+    return `${what}：${ids.map((id) => names.get(id) ?? `${id}（已不存在）`).join('、')}`
+  }
+  // 剩下的一档就是「指定商品」：存的是 **SKU id**（算价按 SKU 匹配）
+  const named = new Map(
+    (await fetchSkusByIds(ids)).map((s) => [s.id, `${s.title}（${s.specText || '默认规格'}）`]),
+  )
+  return `${what}：${ids.map((id) => named.get(id) ?? `${id}（已下架或删除）`).join('、')}`
+}
+
+async function openActivityDetail(row: AdminPromoActivity): Promise<void> {
+  detailTitle.value = row.name
+  detailRows.value = []
+  detailVisible.value = true
+  detailLoading.value = true
+  try {
+    const scope = await scopeText(row.scopeType, row.scopeValue)
+    detailRows.value = [
+      { label: '活动名称', value: row.name },
+      { label: '优惠层级', value: `${row.levelText}（${row.typeText}）` },
+      { label: '优惠方式', value: activityValueText(row) },
+      {
+        label: '订单门槛',
+        // 单品级的门槛是订单级的概念、引擎不读它，接口现在也不再放行 ——
+        // 只有历史数据里还挂着值，这里直说它没生效
+        value:
+          row.level === LEVEL_ITEM
+            ? '不适用（门槛是订单级的概念，单品级不参与计算）'
+            : row.threshold > 0
+              ? `满 ¥${formatYuan(row.threshold)}`
+              : '无门槛',
+      },
+      { label: '适用范围', value: scope },
+      {
+        label: '活动时间',
+        value: `${formatDateTime(row.startAt)} 至 ${formatDateTime(row.endAt)}`,
+      },
+      { label: '优先级', value: String(row.priority) },
+      { label: '状态', value: row.statusText },
+      { label: '创建时间', value: formatDateTime(row.createdAt) },
+    ]
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '读取详情失败')
+  } finally {
+    detailLoading.value = false
+  }
+}
+
+async function openCouponDetail(row: AdminCouponTemplate): Promise<void> {
+  detailTitle.value = row.name
+  detailRows.value = []
+  detailVisible.value = true
+  detailLoading.value = true
+  try {
+    const scope = await scopeText(row.scopeType, row.scopeValue)
+    const rows = [
+      { label: '券名称', value: row.name },
+      { label: '券类型', value: row.typeText },
+      { label: '面额', value: couponValueText(row) },
+      {
+        label: '使用门槛',
+        value: row.threshold > 0 ? `满 ¥${formatYuan(row.threshold)}` : '无门槛',
+      },
+    ]
+    if (row.maxDiscount > 0) {
+      rows.push({ label: '折扣封顶', value: `¥${formatYuan(row.maxDiscount)}` })
+    }
+    rows.push(
+      {
+        label: '发行 / 已发 / 已核销',
+        value: `${row.totalCount} / ${row.issuedCount} / ${row.usedCount}`,
+      },
+      { label: '每人限领', value: `${row.perUserLimit} 张` },
+      {
+        label: '有效期',
+        value:
+          row.validType === VALID_DAYS_AFTER
+            ? `领取后 ${row.validDays} 天`
+            : `${formatDateTime(row.validStart ?? '')} 至 ${formatDateTime(row.validEnd ?? '')}`,
+      },
+      { label: '适用范围', value: scope },
+      { label: '状态', value: row.statusText },
+      { label: '创建时间', value: formatDateTime(row.createdAt) },
+    )
+    detailRows.value = rows
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '读取详情失败')
+  } finally {
+    detailLoading.value = false
+  }
+}
+
+// ============================================================
 // 加载
 // ============================================================
 async function loadCoupons(reset = true): Promise<void> {
@@ -461,11 +691,6 @@ function activityValueText(row: AdminPromoActivity): string {
 
 onMounted(async () => {
   if (auth.user === null) await auth.restore()
-  try {
-    categories.value = await fetchCategoryTree()
-  } catch {
-    // 类目只是"指定类目"那种券的可选项，拉不到不 blocking
-  }
   await loadCoupons(true)
 })
 </script>
@@ -575,9 +800,19 @@ onMounted(async () => {
             </template>
           </el-table-column>
 
-          <el-table-column label="操作" width="100" align="right" fixed="right">
+          <el-table-column label="操作" width="220" align="right" fixed="right">
             <template #default="{ row }">
+              <el-button size="small" @click="openCouponDetail(row)">详情</el-button>
               <el-button size="small" @click="openIssue(row)">发券</el-button>
+              <el-button
+                v-if="canVoid(row.status)"
+                size="small"
+                type="danger"
+                plain
+                @click="voidCoupon(row)"
+              >
+                作废
+              </el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -599,6 +834,11 @@ onMounted(async () => {
               <div class="cell-title">{{ row.name }}</div>
               <div class="cell-sub">
                 {{ row.levelText }} · {{ row.typeText }}
+                <!-- 限了范围就必须显示出来：列表上看着和全场活动一样，
+                     运营没法判断这条到底管谁 -->
+                <span v-if="row.scopeType !== SCOPE_ALL">
+                  · {{ SCOPE_TYPE_TEXT[row.scopeType] ?? '—' }}
+                </span>
                 <span v-if="row.priority !== 0"> · 优先级 {{ row.priority }}</span>
               </div>
             </template>
@@ -630,6 +870,21 @@ onMounted(async () => {
               >
                 {{ row.statusText }}
               </el-tag>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="操作" width="160" align="right" fixed="right">
+            <template #default="{ row }">
+              <el-button size="small" @click="openActivityDetail(row)">详情</el-button>
+              <el-button
+                v-if="canVoid(row.status)"
+                size="small"
+                type="danger"
+                plain
+                @click="voidActivity(row)"
+              >
+                作废
+              </el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -726,33 +981,10 @@ onMounted(async () => {
           <span class="inline-hint">天</span>
         </el-form-item>
 
-        <el-form-item label="适用范围">
-          <el-select v-model="couponForm.scopeType" style="width: 100%">
-            <el-option
-              v-for="(text, value) in SCOPE_TYPE_TEXT"
-              :key="value"
-              :label="text"
-              :value="Number(value)"
-            />
-          </el-select>
-        </el-form-item>
-        <el-form-item v-if="couponForm.scopeType === SCOPE_CATEGORY" label="指定类目">
-          <el-select v-model="couponForm.categoryIds" multiple filterable style="width: 100%">
-            <el-option v-for="c in categories" :key="c.id" :label="c.name" :value="c.id" />
-          </el-select>
-        </el-form-item>
-        <el-form-item
-          v-else-if="couponForm.scopeType === SCOPE_SKU || couponForm.scopeType === SCOPE_SHOP"
-          label="目标 ID"
-        >
-          <el-input
-            v-model="couponForm.manualScopeIds"
-            placeholder="填 ID，多个用逗号分隔"
-          />
-          <div class="form-hint">
-            运营端没有"列出全部商品 / 店铺"的接口，这里只能手填 ID
-          </div>
-        </el-form-item>
+        <ScopePicker
+          v-model:type="couponForm.scopeType"
+          @change="couponForm.scopeValue = $event"
+        />
 
         <el-alert
           v-if="isExchange"
@@ -789,10 +1021,13 @@ onMounted(async () => {
 
         <el-form-item label="优惠方式">
           <el-radio-group v-model="activityForm.calcType">
-            <el-radio-button v-for="c in CALC_TYPES" :key="c" :value="c">
+            <el-radio-button v-for="c in activityCalcTypes" :key="c" :value="c">
               {{ CALC_TYPE_TEXT[c] }}
             </el-radio-button>
           </el-radio-group>
+          <div v-if="activityForm.level !== LEVEL_ITEM" class="form-hint">
+            「特价」只对单品级有意义（它改的是单价）；订单级是从总额里减一笔
+          </div>
         </el-form-item>
 
         <el-form-item v-if="activityIsDiscount" label="折扣">
@@ -818,7 +1053,19 @@ onMounted(async () => {
           <span class="inline-hint">元，0 表示不限</span>
         </el-form-item>
 
-        <el-form-item label="订单门槛">
+        <!-- 适用范围放在门槛前面：两者是同一类东西（"这笔优惠管谁、什么时候成立"），
+             挨着看才读得通 -->
+        <ScopePicker
+          v-model:type="activityForm.scopeType"
+          @change="activityForm.scopeValue = $event"
+        />
+
+        <!-- ★ 单品级不给「订单门槛」：门槛是**订单级**的概念，引擎只在 Level 1/2
+             用它过滤候选（_apply_order_level），单品级压根不读它
+             （_apply_item_level）。以前这一栏三档都显示，运营填了"满 50 减 10"，
+             实际是"每一件都减 10" —— 连 8999 的笔记本也减。后端同样会拒。
+             要表达"满 X 减 Y"就建店铺级 / 平台级活动。 -->
+        <el-form-item v-if="activityForm.level !== LEVEL_ITEM" label="订单门槛">
           <el-input-number v-model="activityForm.thresholdYuan" :min="0" :controls="false" />
           <span class="inline-hint">元，0 表示不限</span>
         </el-form-item>
@@ -843,6 +1090,19 @@ onMounted(async () => {
       <template #footer>
         <el-button @click="activityVisible = false">取消</el-button>
         <el-button type="primary" :loading="acting" @click="submitActivity">创建</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ============ 详情 ============ -->
+    <el-dialog v-model="detailVisible" :title="detailTitle" width="560px">
+      <div v-loading="detailLoading" class="detail">
+        <div v-for="r in detailRows" :key="r.label" class="detail-row">
+          <div class="detail-label">{{ r.label }}</div>
+          <div class="detail-value">{{ r.value }}</div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="detailVisible = false">关闭</el-button>
       </template>
     </el-dialog>
 
@@ -1010,6 +1270,30 @@ onMounted(async () => {
   background: var(--color-bg-subtle);
   font-size: var(--text-sm);
   color: var(--color-text-secondary);
+}
+
+/* 详情：左标签右值。用 grid 而不是 flex —— 范围那一行的值可能挂着一串目标，
+   flex 里长值会把标签挤扁 */
+.detail-row {
+  display: grid;
+  grid-template-columns: 88px 1fr;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  font-size: var(--text-sm);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.detail-row:last-child {
+  border-bottom: none;
+}
+
+.detail-label {
+  color: var(--color-text-tertiary);
+}
+
+.detail-value {
+  color: var(--color-text);
+  word-break: break-all;
 }
 
 /* 手机号 + 查询按钮横排 */

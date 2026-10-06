@@ -111,6 +111,10 @@ async def insert_template(session: AsyncSession, tpl: CouponTemplate) -> CouponT
     return tpl
 
 
+async def get_activity(session: AsyncSession, activity_id: int) -> PromoActivity | None:
+    return await session.get(PromoActivity, activity_id)
+
+
 async def claim_template_quota(session: AsyncSession, tpl_id: int) -> bool:
     """模板总量 +1。**条件是超发的第一道 DB 防线**。
 
@@ -464,6 +468,71 @@ async def list_active_activities(
         stmt = stmt.where(PromoActivity.level.in_(levels))
     stmt = stmt.order_by(PromoActivity.level, PromoActivity.priority.desc(), PromoActivity.id)
     return list(await session.scalars(stmt))
+
+
+async def refresh_activity_status(session: AsyncSession) -> int:
+    """按时间窗把活动推进到"进行中 / 已结束"。返回**真正发生变化**的行数。
+
+    ★ 为什么必须有这一步：``status`` 是建活动那一刻按当时的窗口**算一次就写死**的
+      （``router.create_activity``），之后没有任何地方改它。而算价查询硬性要求
+      ``status = 2``（``list_active_activities``）—— 于是**建一个"未开始"的活动，
+      它永远不会开始**：过了 ``start_at`` 列表还显示"未开始"，下单也不生效。
+      这个任务补上 1 → 2 → 3 的推进。
+
+    ``status = 4``（已作废）不在 ``WHERE`` 里，所以作废过的活动不会被这里复活 ——
+    这是"作废"能压过时间窗的原因。
+
+    ★ ``AND a.status <> target.want`` 不是多余的：这条 SQL 每分钟跑一次，
+      没有它就会把每个在跑的活动每分钟重写一遍，``updated_at`` 于是变成
+      "最后一次跑 cron 的时间"，而不是"最后一次改配置的时间"。
+    """
+    result = await session.execute(
+        text(
+            "WITH target AS ("
+            "  SELECT id, CASE WHEN end_at <= now() THEN 3 ELSE 2 END AS want"
+            "    FROM promotion.promo_activity"
+            "   WHERE status IN (1, 2) AND start_at <= now()"
+            ") "
+            "UPDATE promotion.promo_activity a "
+            "   SET status = target.want, updated_at = now() "
+            "  FROM target "
+            " WHERE a.id = target.id AND a.status <> target.want"
+        )
+    )
+    return result.rowcount
+
+
+async def refresh_coupon_template_status(session: AsyncSession) -> int:
+    """按有效期把券模板推进到"未开始 / 进行中 / 已结束"。返回**真正变化**的行数。
+
+    ★ 和活动同一个毛病：``status`` 只在建模板那一刻写一次（而且写死成"进行中"，
+      见 ``router.create_template``），之后没人改 —— 于是**过期的券在运营列表里
+      永远显示"进行中"**，运营分不清"这张券还能不能领"。状态列不准不致命
+      （能不能领由 ``valid_end > now()`` 和 ``claim_template_quota`` 管），
+      但运营就是照着这一列判断的。
+
+    ``status = 4``（已作废）同样不在 ``WHERE`` 里，作废的不会被复活。
+    ``valid_start`` / ``valid_end`` 为 ``NULL`` 的（「领取后 N 天」型）落在
+    ``ELSE`` 分支，恒为进行中 —— 它们没有统一的时间窗。
+    """
+    result = await session.execute(
+        text(
+            "WITH target AS ("
+            "  SELECT id, CASE"
+            "           WHEN valid_end IS NOT NULL AND valid_end <= now() THEN 3"
+            "           WHEN valid_start IS NOT NULL AND valid_start > now() THEN 1"
+            "           ELSE 2"
+            "         END AS want"
+            "    FROM promotion.coupon_template"
+            "   WHERE status IN (1, 2)"
+            ") "
+            "UPDATE promotion.coupon_template t "
+            "   SET status = target.want, updated_at = now() "
+            "  FROM target "
+            " WHERE t.id = target.id AND t.status <> target.want"
+        )
+    )
+    return result.rowcount
 
 
 async def insert_activity(session: AsyncSession, activity: PromoActivity) -> PromoActivity:

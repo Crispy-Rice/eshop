@@ -644,9 +644,9 @@ async def list_audit_queue(
         next_cursor=_time_cursor(page[-1]) if has_more and page else None,
         has_more=has_more,
         pending_count=counts.get(int(ReviewStatus.PENDING_AUDIT), 0),
-        second_audit_count=sum(
-            1 for r in page if r.need_second_audit and r.status == int(ReviewStatus.PUBLISHED)
-        ),
+        # ★ 全表 COUNT，不是数当前页 —— 当前页是"待审核"那批，里面不可能有
+        #   已发布的待抽检行，数出来恒为 0（角标于是永远是 0）
+        second_audit_count=await repo.count_second_audit(session),
     )
 
 

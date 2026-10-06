@@ -66,6 +66,7 @@ async def _to_template_out(
         free_num=tpl.free_num,
         merge_type=tpl.merge_type,
         status=tpl.status,
+        is_default=tpl.is_default,
         bound_sku_count=bound,
     )
 
@@ -144,6 +145,25 @@ async def update_template(
             ),
         )
     )
+
+
+@router.put(
+    "/api/merchant/freight/templates/{template_id}/default",
+    response_model=ApiResponse[FreightTemplateOut],
+    summary="设为店铺默认模板",
+)
+async def set_default_template(
+    session: DbSession, template_id: int, shop_id: CurrentShopIdDep
+) -> ApiResponse[FreightTemplateOut]:
+    """把这条模板设为店铺默认。
+
+    ★ 默认模板是"没绑定运费模板的 SKU 的兜底"：绑定是逐条 SKU 的（``sku_freight_bind``），
+      新发布的商品天然在模板之外 —— 没有兜底的话，漏配这件事只有**买家在结算页**
+      才会撞上「还没有绑定运费模板」，商家那边毫无感知。一个店只有一条，设新的顶掉旧的。
+    """
+    tpl = await service.set_default_template(session, shop_id, template_id)
+    deleted = await product_service.list_deleted_sku_ids(session, shop_id)
+    return ApiResponse.ok(await _to_template_out(session, tpl, deleted_sku_ids=deleted))
 
 
 # ============================================================

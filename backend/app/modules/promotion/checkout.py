@@ -28,6 +28,7 @@ from app.modules.promotion.models import (
     LEVEL_ITEM,
     LEVEL_PLATFORM,
     LEVEL_SHOP,
+    SCOPE_CATEGORY,
 )
 from app.modules.promotion.pricing import (
     ActivityInput,
@@ -106,6 +107,9 @@ async def calc_price(session: AsyncSession, user_id: int, req: CalcPriceRequest)
     ]
 
     # ---------- ⑥ 纯内存计算（商品侧的四级优惠）----------
+    # ★ 类目范围先展开成"含全部子类目"，再进引擎
+    await _expand_category_scopes(session, activities=activities, coupons=loaded.goods)
+
     result = PriceCalculator(
         items, coupons=loaded.goods, activities=activities, stack_rules=rules
     ).run()
@@ -416,3 +420,42 @@ async def _load_activities(session: AsyncSession, now: datetime) -> list[Activit
         )
         for a in rows
     ]
+
+
+async def _expand_category_scopes(
+    session: AsyncSession,
+    *,
+    activities: list[ActivityInput],
+    coupons: list[CouponInput],
+) -> None:
+    """把「指定类目」的 ``scope_value`` 就地展开成**含全部子类目**。
+
+    ★ 为什么必须有这一步：选「图书」就该覆盖小说 / 童书 / 教育考试。
+      引擎只是 ``item.category_id in scope_value`` 的精确比对，不展开的话
+      父类目下的活动**一件商品都匹配不到** —— 而它在列表上和正常活动长得
+      一模一样，只有运营去下单才会发现。以后新增的子类目也自动覆盖。
+
+    ★ 为什么在这里展开而不是在引擎里：展开要读类目树，而引擎（``pricing.py``）
+      是纯函数、不许有 IO。在这里展开一次，后面三处用到作用域的地方
+      （单品级取候选、订单级算参与金额、优惠分摊）自动一致。
+
+    存进 DB 的仍然是运营勾的那几个 id，语义留在数据里；展开只影响这一次计算。
+
+    ``exclude_value``（排除范围）没跟着展开 —— 目前**没有任何入口能设置它**，
+    等真加了排除功能时再一起处理，免得现在写一段没人走的代码。
+    """
+    wanted: set[int] = set()
+    for entry in (*activities, *coupons):
+        if entry.scope_type == SCOPE_CATEGORY and entry.scope_value:
+            wanted.update(int(v) for v in entry.scope_value)
+    if not wanted:
+        return
+
+    subtrees = await product_service.category_subtree_ids(session, sorted(wanted))
+    for entry in (*activities, *coupons):
+        if entry.scope_type != SCOPE_CATEGORY or not entry.scope_value:
+            continue
+        merged: set[int] = set()
+        for v in entry.scope_value:
+            merged |= subtrees.get(int(v), {int(v)})
+        entry.scope_value = sorted(merged)

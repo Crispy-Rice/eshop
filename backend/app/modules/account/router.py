@@ -25,6 +25,7 @@ from app.modules.account.schemas import (
     UpdateProfileRequest,
     UserOut,
 )
+from app.modules.freight import service as freight_service
 
 router = APIRouter()
 
@@ -165,7 +166,19 @@ async def get_shop(shop_id: int, session: DbSession) -> ApiResponse[ShopOut]:
 async def create_shop(
     body: ShopCreateRequest, user: CurrentUserDep, session: DbSession
 ) -> ApiResponse[ShopOut]:
-    return ApiResponse.ok(await service.create_shop(session, user.id, body))
+    """开店，并**顺手送一条默认运费模板**。
+
+    ★ 没有那条模板，新店的商品一件都上不了架（上架要求每个规格都算得出运费），
+      而商家要绕到"发布 → 提交审核 → 平台点通过被判 400"才会发现 —— 卡在运营
+      那一步，运营只能打回去，白跑一趟。
+    ★ 模板参数只是**起点**（首重 ¥10 / 续重 ¥3 / 满 ¥99 包邮），商家该按真实
+      运费改；它名字叫「默认快递模板」、列表里也标着「默认」，一眼看得出是系统给的。
+    ★ 跨模块调用放路由层：freight 那边调 account 也是同一个套路
+      （见 ``freight/router.py``）。
+    """
+    shop = await service.create_shop(session, user.id, body)
+    await freight_service.ensure_default_template(session, int(shop.id))
+    return ApiResponse.ok(shop)
 
 
 @router.get("/api/merchant/shop", response_model=ApiResponse[ShopOut], summary="我的店铺")

@@ -387,6 +387,19 @@ def _to_shop_out(shop: Shop) -> ShopOut:
     )
 
 
+async def search_shops(
+    session: AsyncSession, *, keyword: str | None, limit: int
+) -> list[ShopOut]:
+    """按名称搜店铺。给运营侧的选择器用（券的"指定店铺"）。
+
+    返回公开的 ``ShopOut``：id / 名称 / logo / 简介 / 状态，本来就是对外的字段。
+    调用方（promotion）需要的是"认出是哪家店 + 看出它已关闭"，够用。
+    """
+    return [
+        _to_shop_out(s) for s in await repo.search_shops(session, keyword=keyword, limit=limit)
+    ]
+
+
 async def list_shop_names(session: AsyncSession, shop_ids: Sequence[int]) -> dict[int, str]:
     """批量取店铺名。购物车按店铺分组展示时用，避免逐个查询。"""
     shops = await repo.list_shops_by_ids(session, list(shop_ids))

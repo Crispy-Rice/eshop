@@ -156,6 +156,22 @@ async def open_shop(client: AsyncClient, access_token: str, name: str = "测试�
     return resp.json()["data"]["id"]
 
 
+async def ensure_freight_template(client: AsyncClient, access_token: str) -> str:
+    """给店铺**再加**一条运费模板并返回 id。
+
+    ★ 新店开出来就自带一条默认模板（``account.create_shop`` 会调
+      ``freight.ensure_default_template``），所以这个函数只用在"需要第二条模板"
+      的用例上 —— 比如验证设为默认会顶掉旧的、或者默认被摘掉后重新配一条。
+    """
+    resp = await client.post(
+        "/api/merchant/freight/templates",
+        json={"name": "测试快递模板", "firstPrice": 800, "addPrice": 300},
+        headers=auth_header(access_token),
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["data"]["id"]
+
+
 async def make_admin(client: AsyncClient, session, phone: str = "13900139001") -> dict:
     """造一个平台管理员。
 

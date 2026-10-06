@@ -12,6 +12,7 @@ import {
   listTemplates,
   replaceExcludeRegions,
   replaceRegionRules,
+  setDefaultTemplate,
   updateTemplate,
   type ExcludeRegion,
   type FreightRegionRule,
@@ -126,6 +127,22 @@ async function load(): Promise<void> {
     ElMessage.error(isBizError(e) ? e.message : '加载运费模板失败')
   } finally {
     loading.value = false
+  }
+}
+
+/** 正在设为默认的那条模板 id —— 只用来让按钮转个圈 */
+const defaulting = ref('')
+
+async function makeDefault(row: FreightTemplate): Promise<void> {
+  defaulting.value = row.id
+  try {
+    await setDefaultTemplate(row.id)
+    ElMessage.success(`已把「${row.name}」设为默认模板`)
+    await load()
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '设置默认模板失败')
+  } finally {
+    defaulting.value = ''
   }
 }
 
@@ -326,6 +343,7 @@ onMounted(load)
     <div class="toolbar">
       <h2 class="title">运费模板</h2>
       <span class="hint">同一仓库发出只收一次首重；不同仓库分别计费</span>
+      <span class="hint">开店铺时会自动建一条「默认」模板（首重 ¥10 / 满 ¥99 包邮），按真实运费改</span>
       <div class="spacer" />
       <el-button size="small" :loading="loading" @click="load">刷新</el-button>
       <el-button size="small" type="primary" @click="openCreate">新建模板</el-button>
@@ -333,13 +351,19 @@ onMounted(load)
 
     <div class="panel">
       <el-empty v-if="!loading && templates.length === 0" description="还没有运费模板">
-        <p class="empty-hint">商品上架前必须绑定运费模板，否则无法下单</p>
+        <p class="empty-hint">商品上架前要有可用的运费模板：绑定到商品，或把一条设为默认模板</p>
       </el-empty>
 
       <el-table v-else v-loading="loading" :data="templates">
         <el-table-column label="模板" min-width="200">
           <template #default="{ row }">
-            <div class="cell-title">{{ row.name }}</div>
+            <div class="cell-title">
+              {{ row.name }}
+              <!-- 默认模板是"没绑定规格的兜底"，值得一眼看见 -->
+              <el-tag v-if="row.isDefault" size="small" effect="plain" disable-transitions>
+                默认
+              </el-tag>
+            </div>
             <div class="cell-sub">已绑定 {{ row.boundSkuCount }} 个 SKU</div>
           </template>
         </el-table-column>
@@ -389,12 +413,22 @@ onMounted(load)
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="170" align="right">
+        <el-table-column label="操作" width="240" align="right">
           <template #default="{ row }">
             <!-- 绑定入口放在操作列："已绑定 N 个 SKU" 那行是状态，不是按钮。
                  之前把它做成可点的副标题，商家根本找不到绑定的地方。 -->
             <el-button link type="primary" @click="openBinds(row)">绑定商品</el-button>
             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+            <!-- 「设为默认」只给启用中的模板：停用的模板不能当兜底，后端也会拒 -->
+            <el-button
+              v-if="!row.isDefault && row.status === 1"
+              link
+              type="primary"
+              :loading="defaulting === row.id"
+              @click="makeDefault(row)"
+            >
+              设为默认
+            </el-button>
           </template>
         </el-table-column>
       </el-table>

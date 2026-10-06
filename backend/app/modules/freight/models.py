@@ -58,6 +58,18 @@ FALLBACK_WEIGHT_G = 500
 # 超过这个重量就提示联系客服，避免算出离谱的运费（docs/06 §10）
 HUGE_WEIGHT_G = 100_000
 
+# ---------------- 新店铺的"开箱即用"默认模板 ----------------
+# ★ 开店时自动建一条，否则新店**一件商品都上不了架**（上架要求每个规格都
+#   算得出运费），而商家要绕到"提交 → 审核被拒"才会发现。
+# ★ 这里的参数是**起点不是真理**：首重 / 续重 / 包邮门槛都得商家按真实成本改。
+#   所以名字就叫「默认快递模板」，列表里也标着「默认」，商家一眼能看出是系统给的。
+DEFAULT_TPL_NAME = "默认快递模板"
+DEFAULT_TPL_FIRST_UNIT_G = 1000
+DEFAULT_TPL_FIRST_PRICE = 1000  # ¥10
+DEFAULT_TPL_ADD_UNIT_G = 500
+DEFAULT_TPL_ADD_PRICE = 300  # ¥3
+DEFAULT_TPL_FREE_THRESHOLD = 9900  # ¥99
+
 
 class FreightTemplate(Base):
     """运费模板。首重/续重参数 + 三种包邮选项。"""
@@ -65,6 +77,16 @@ class FreightTemplate(Base):
     __tablename__ = "freight_template"
     __table_args__ = (
         Index("idx_freight_tpl_shop", "shop_id", "status"),
+        # ★ 店铺默认模板：未绑定模板的 SKU 回落到它（docs/06 §404）。
+        #   用**部分**唯一索引表达"一店只能有一条" —— 换成 (shop_id, is_default)
+        #   的普通唯一约束，会把每条模板的 is_default=false 也算成重复，
+        #   于是一个店只能有一条非默认模板。先例：inventory 的 uk_warehouse_default。
+        Index(
+            "uk_freight_tpl_default",
+            "shop_id",
+            unique=True,
+            postgresql_where=text("is_default"),
+        ),
         CheckConstraint("first_price >= 0", name="first_price_non_negative"),
         CheckConstraint("add_price >= 0", name="add_price_non_negative"),
         CheckConstraint("add_unit > 0", name="add_unit_positive"),
@@ -105,6 +127,11 @@ class FreightTemplate(Base):
     )
     status: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, server_default=text("1"), comment="1启用 2停用"
+    )
+    # 店铺默认模板。★ 没绑定模板的 SKU 算运费时回落到它 —— 绑定是逐条 SKU 的，
+    # 新发布的商品天然在模板之外，没有这条回落就会在**买家结算时**才报错。
+    is_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false"), comment="店铺默认模板"
     )
     created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())

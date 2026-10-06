@@ -40,6 +40,8 @@ class FreightTemplateOut(CamelModel):
     free_num: int
     merge_type: int
     status: int
+    # 店铺默认模板：未绑定模板的 SKU 算运费时回落到它（一店只有一条）
+    is_default: bool = False
     # 影响面：改这个模板会影响多少个 SKU
     bound_sku_count: int = 0
 

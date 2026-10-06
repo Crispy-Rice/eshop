@@ -30,6 +30,12 @@ from app.modules.freight.calculator import (
 )
 from app.modules.freight.models import (
     CHARGE_BY_WEIGHT,
+    DEFAULT_TPL_ADD_PRICE,
+    DEFAULT_TPL_ADD_UNIT_G,
+    DEFAULT_TPL_FIRST_PRICE,
+    DEFAULT_TPL_FIRST_UNIT_G,
+    DEFAULT_TPL_FREE_THRESHOLD,
+    DEFAULT_TPL_NAME,
     REGION_ALL,
     FreightExcludeRegion,
     FreightRegionRule,
@@ -133,6 +139,10 @@ async def create_template(
     session: AsyncSession, shop_id: int, req: FreightTemplateCreateRequest
 ) -> FreightTemplate:
     validate_template(req)
+    # 店铺的第一条模板自动成为默认。否则"未绑定的 SKU 回落到默认模板"这件事
+    # 要等商家主动去点一下才生效，而在此之前新发布的商品照样是坏的 ——
+    # 一个只有一条模板的店，那条模板显然就是它的默认。
+    is_default = await repo.get_default_template(session, shop_id) is None
     tpl = FreightTemplate(
         id=next_id(),
         shop_id=shop_id,
@@ -147,8 +157,74 @@ async def create_template(
         free_num=req.free_num,
         merge_type=req.merge_type,
         status=1,
+        is_default=is_default,
     )
     return await repo.insert_template(session, tpl)
+
+
+async def ensure_default_template(session: AsyncSession, shop_id: int) -> FreightTemplate:
+    """给店铺建一条"开箱即用"的默认模板 —— **开店时**由 account 调用。
+
+    ★ 没有它，新店的商品**一件都上不了架**（上架要求每个规格都算得出运费），
+      而商家要绕到"提交审核 → 平台点通过被判 400"才会发现。
+    ★ 参数是**起点不是真理**：首重 / 续重 / 包邮门槛都该由商家按真实运费改，
+      所以名字就叫「默认快递模板」，列表里也标着「默认」，一眼看得出是系统给的。
+    ★ 幂等：店里已经有模板就不动 —— 重试、重复调用都不会多建。
+    """
+    existing = await repo.list_templates(session, shop_id)
+    if existing:
+        return existing[0]
+
+    tpl = await create_template(
+        session,
+        shop_id,
+        FreightTemplateCreateRequest(
+            name=DEFAULT_TPL_NAME,
+            first_unit=DEFAULT_TPL_FIRST_UNIT_G,
+            first_price=DEFAULT_TPL_FIRST_PRICE,
+            add_unit=DEFAULT_TPL_ADD_UNIT_G,
+            add_price=DEFAULT_TPL_ADD_PRICE,
+            free_threshold=DEFAULT_TPL_FREE_THRESHOLD,
+        ),
+    )
+    # 顺手配一条「全国默认」区域规则：不配也能算（全国按模板本身计费），
+    # 但商家以后想加"上海另计"时，校验会要求规则里必须有一条全国默认 ——
+    # 给一个形状正确的起点，让他少踩一次。
+    await replace_region_rules(
+        session,
+        shop_id,
+        int(tpl.id),
+        [
+            RegionRuleIn(
+                region_code=REGION_ALL,
+                first_unit=DEFAULT_TPL_FIRST_UNIT_G,
+                first_price=DEFAULT_TPL_FIRST_PRICE,
+                add_unit=DEFAULT_TPL_ADD_UNIT_G,
+                add_price=DEFAULT_TPL_ADD_PRICE,
+            )
+        ],
+    )
+    return tpl
+
+
+async def set_default_template(
+    session: AsyncSession, shop_id: int, template_id: int
+) -> FreightTemplate:
+    """把某条模板设为店铺默认。
+
+    ★ 停用的模板不能当默认：默认是"没绑定时的兜底"，一条停用的兜底等于没有兜底，
+      却会让商家以为已经配好了（比没设更坏，因为它看起来是配好的）。
+    """
+    tpl = await repo.get_shop_template(session, shop_id, template_id)
+    if tpl is None:
+        raise BizError(ErrorCode.NOT_FOUND, "运费模板不存在")
+    if tpl.status != 1:
+        raise BizError(ErrorCode.VALIDATION_ERROR, "停用的模板不能设为默认")
+
+    await repo.set_default_template(session, shop_id=shop_id, template_id=template_id)
+    # 上面走的是批量 UPDATE，identity map 里的对象要显式刷一下才拿到新值
+    await session.refresh(tpl)
+    return tpl
 
 
 async def update_template(
@@ -321,6 +397,43 @@ async def list_exclude_regions(session: AsyncSession, shop_id: int, template_id:
 
 
 # ============================================================
+# 给其它模块的只读查询
+# ============================================================
+async def skus_without_freight(
+    session: AsyncSession, *, shop_id: int, sku_ids: Sequence[int]
+) -> list[int]:
+    """这些 SKU 里**既没绑定模板、也没有店铺默认模板可回落**的那些。
+
+    ★ 给 product 的「上架 / 审核通过」做前置校验用。这个漏检原先只在**买家结算**
+      才暴露（``estimate`` 里报错），那时商品已经挂在架上了 —— 上架是最后一道
+      能拦住"卖不出去的商品"的关口。
+
+    判定必须与 ``estimate`` 的报错条件**逐个对齐**，否则会出现"上架放行、结算报错"：
+    绑到启用中的模板 → 通过；没绑定但店铺有启用中的默认模板 → 通过；
+    绑到**停用**的模板 → **不通过**（estimate 对它报"模板已停用"，不会回落）。
+    """
+    if not sku_ids:
+        return []
+
+    bind_tpl_of = {b.sku_id: b.template_id for b in await repo.list_binds_by_skus(session, sku_ids)}
+    tpls = {
+        t.id: t for t in await repo.list_templates_by_ids(session, list(set(bind_tpl_of.values())))
+    }
+    default = await repo.get_default_template(session, shop_id)
+    usable_default = default is not None and default.status == 1
+
+    missing: list[int] = []
+    for sku_id in sku_ids:
+        bound_tpl = tpls.get(bind_tpl_of[sku_id]) if sku_id in bind_tpl_of else None
+        if bound_tpl is not None and bound_tpl.status == 1:
+            continue
+        if sku_id not in bind_tpl_of and usable_default:
+            continue
+        missing.append(sku_id)
+    return missing
+
+
+# ============================================================
 # 计算入口
 # ============================================================
 def _to_rule(tpl: FreightTemplate, region) -> FreightRule:
@@ -369,17 +482,26 @@ async def estimate(
     for b in binds:
         bind_of.setdefault(b.sku_id, b)
 
-    tpl_ids = {b.template_id for b in bind_of.values()}
-    if not tpl_ids:
-        first = lines[0]
-        raise BizError(
-            ErrorCode.SKU_NOT_SUPPORTED,
-            f"「{first.title or first.sku_id}」还没有绑定运费模板，无法计算运费",
-        )
+    # ★ 没绑定的 SKU 回落到**本店默认模板**（docs/06 §404 写的那半句）。
+    #   绑定是逐条 SKU 的，新发布的商品天然在模板之外 —— 没有这条回落，
+    #   商家只有等买家在结算页撞上"还没绑定运费模板"时才知道自己漏配了。
+    defaults = {
+        t.shop_id: t
+        for t in await repo.list_default_templates(session, list({ln.shop_id for ln in lines}))
+    }
 
-    templates = {t.id: t for t in await repo.list_templates_by_ids(session, list(tpl_ids))}
-    region_rules = await repo.list_region_rules_by_templates(session, list(tpl_ids))
-    excludes = await repo.list_exclude_by_templates(session, list(tpl_ids))
+    # 真正会用到的模板 = 命中绑定的 + 回落用到的默认模板。
+    # 默认模板的区域规则与不发货区域**一样要生效**，所以它的 id 也要收进来。
+    used_ids = {b.template_id for b in bind_of.values()}
+    for ln in lines:
+        if ln.sku_id not in bind_of:
+            fallback = defaults.get(ln.shop_id)
+            if fallback is not None:
+                used_ids.add(fallback.id)
+
+    templates = {t.id: t for t in await repo.list_templates_by_ids(session, list(used_ids))}
+    region_rules = await repo.list_region_rules_by_templates(session, list(used_ids))
+    excludes = await repo.list_exclude_by_templates(session, list(used_ids))
 
     # 按模板分组，避免每条 SKU 都重新筛一遍
     rules_of: dict[int, list[FreightRegionRule]] = {}
@@ -392,14 +514,24 @@ async def estimate(
     items: list[FreightItem] = []
     for ln in lines:
         bind = bind_of.get(ln.sku_id)
-        if bind is None:
-            raise BizError(
-                ErrorCode.SKU_NOT_SUPPORTED,
-                f"「{ln.title or ln.sku_id}」还没有绑定运费模板，无法计算运费",
-            )
-        tpl = templates.get(bind.template_id)
-        if tpl is None or tpl.status != 1:
-            raise BizError(ErrorCode.SKU_NOT_SUPPORTED, f"「{ln.title}」的运费模板已停用")
+        if bind is not None:
+            tpl = templates.get(bind.template_id)
+            if tpl is None or tpl.status != 1:
+                raise BizError(ErrorCode.SKU_NOT_SUPPORTED, f"「{ln.title}」的运费模板已停用")
+        else:
+            # 没绑定 → 用本店默认模板兜底；连默认都没有才是真算不出来
+            tpl = defaults.get(ln.shop_id)
+            if tpl is None:
+                raise BizError(
+                    ErrorCode.SKU_NOT_SUPPORTED,
+                    f"「{ln.title or ln.sku_id}」还没有运费模板：既没绑定模板，"
+                    "店铺也没有设默认模板",
+                )
+            if tpl.status != 1:
+                raise BizError(
+                    ErrorCode.SKU_NOT_SUPPORTED,
+                    f"「{ln.title}」的店铺默认运费模板已停用",
+                )
 
         # ① 不发货区域：直接拦住，不进计算
         if _region_excluded(exclude_of.get(tpl.id, set()), region_code):

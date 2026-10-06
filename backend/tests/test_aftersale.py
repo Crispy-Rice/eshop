@@ -1037,3 +1037,49 @@ async def test_reconcile_catches_drift(client: AsyncClient, session) -> None:
             text("SELECT max(level) FROM ops.alert WHERE source = 'aftersale.reconcile'")
         )
     assert level == 1, "资金对账异常必须是 P0"
+
+
+async def test_whole_sub_refund_of_split_order_is_not_blocked(
+    client: AsyncClient, session
+) -> None:
+    """★ 拆单后的子单也要能**整单退**。
+
+    这是"子单应付 = 各行实付之和 + 子单运费"的下游：平台优惠按行摊、子单层只聚合。
+    如果子单层再摊一遍，`各行实付 + 运费` 会比子单应付多几分，而退款校验
+    （docs/08 §10）拿子单应付当上限 —— 于是**整单退也会被 422 拦掉**，
+    报"退款金额超限"，怎么查都指不到拆单那一步。
+    """
+    from tests.test_trade import _create_multi_order, _prepare_two_shops, _sub_amounts
+
+    ctx = await _prepare_two_shops(client, session)
+    tpl_id = await _make_coupon(threshold=100, value=200)
+    coupon_id = await _receive_coupon(tpl_id, ctx["buyer_id"], "as-two-shop-coupon")
+    order = await _create_multi_order(client, ctx, coupon_ids=[coupon_id], idem="as-two-shop")
+    await _pay(client, ctx, order["orderMainNo"])
+
+    # 退**第二家店**那个子单 —— 拆单那几个"差的几分"正好落在它身上
+    sub_no = order["subs"][1]["orderSubNo"]
+    async with get_session_factory()() as s:
+        item_id = str(
+            await s.scalar(
+                text("SELECT id FROM trade.order_item WHERE order_sub_no = :n"), {"n": sub_no}
+            )
+        )
+
+    resp = await client.post(
+        "/api/aftersales",
+        json={
+            "orderSubNo": sub_no,
+            "items": [{"orderItemId": item_id, "num": 1}],
+            "reasonType": REASON_NO_LONGER_WANT,
+        },
+        headers={**ctx["buyer_headers"], "Idempotency-Key": "as-two-shop-refund"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+
+    # 退的正好是"该子单各行实付 + 运费"，与上限一致
+    row = next(r for r in await _sub_amounts(order["orderMainNo"]) if r[0] == sub_no)
+    assert data["totalRefund"] == data["refundAmount"] + data["refundFreight"]
+    assert data["refundFreight"] == row[1], "整单退要退该子单的全部运费"
+    assert data["totalRefund"] == row[2], "整单退正好退到子单应付（不多不少）"

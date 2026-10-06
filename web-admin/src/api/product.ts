@@ -211,3 +211,22 @@ export const fetchPublicSpu = (spuId: string) => get<SpuDetail>(`/spus/${spuId}`
  *   而审核队列里全是**待审核**的。
  */
 export const fetchAdminSpu = (spuId: string) => get<SpuDetail>(`/admin/spus/${spuId}`)
+
+/** `/skus/batch` 的行。详情里只用到"认出是哪件商品"这几个字段 */
+export interface SkuBrief {
+  id: string
+  title: string
+  specText: string
+}
+
+/**
+ * 批量按 id 查 SKU。
+ *
+ * 运营看券 / 活动的「适用范围」时用：那里存的是 **SKU id**（算价就是按 SKU 匹配的），
+ * 要显示成人看得懂的名字就得反查回来。
+ *
+ * ★ 只返回**在售**的：已经下架或删除的目标不会出现在结果里 —— 调用方要据此
+ *   提示"这个目标已经不在了"，而不是静默少一行。
+ */
+export const fetchSkusByIds = (skuIds: string[]) =>
+  post<SkuBrief[]>('/skus/batch', { skuIds })
