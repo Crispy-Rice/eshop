@@ -61,12 +61,23 @@ const loading = ref(false)
 /**
  * 发完消息后的那段等待里显示「等待客服回复 ···」。
  *
- * ★ 只在 `watchForReply` 那个窗口内置真（20 秒）。不做后端状态：
+ * ★ 只在 `watchForReply` 那个窗口内置真（见 `REPLY_WATCH_MS`）。不做后端状态：
  *   "我刚发完消息"这件事买家自己的浏览器就知道（与不做 `aiReplying` 同一个理由）。
  * ★ 措辞用「等待客服回复」而不是「对方正在输入」：我们**不知道**是店小蜜还是
  *   商家本人来接，写成"正在输入"就是在替谁撒谎。
  */
 const waitingReply = ref(false)
+/** 等待窗口的序号：并列开出多个时，只有最新的那个有权撤掉等待条（见 `watchForReply`） */
+let replyWatchId = 0
+/**
+ * 发完消息后密集轮询的窗口。这段时间里线程末尾一直挂着「等待客服回复 ···」，
+ * **对方一开口就撤**（不是等窗口走完）。
+ *
+ * ★ 取 60 秒而不是 10 秒：窗口一过等待条就撤了，之后只剩页面那个 15 秒的轮询 ——
+ *   模型偶尔要二三十秒才答完，窗口太短就变成"等待条先消失、答案过一会儿才蹦出来"，
+ *   正是用户报的那个观感。
+ */
+const REPLY_WATCH_MS = 60_000
 const loadingOlder = ref(false)
 const sending = ref(false)
 const uploading = ref(false)
@@ -76,7 +87,7 @@ const draft = ref('')
 const picked = ref<{ path: string; url: string }[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
 
-/** 组件卸载后短轮询要停 —— 否则它会在后台空转 20 秒，还往已卸载的组件里写值 */
+/** 组件卸载后短轮询要停 —— 否则它会在后台空转，还往已卸载的组件里写值 */
 let unmounted = false
 onBeforeUnmount(() => {
   unmounted = true
@@ -143,7 +154,6 @@ async function onPick(event: Event): Promise<void> {
 async function onSend(): Promise<void> {
   const body = draft.value.trim()
   if ((!body && picked.value.length === 0) || sending.value) return
-  const before = ticket.value?.messages.length ?? 0
   sending.value = true
   try {
     // 正文是必填的（后端 min_length=1），只发图时给一个占位文字
@@ -160,30 +170,48 @@ async function onSend(): Promise<void> {
   } finally {
     sending.value = false
   }
-  void watchForReply(before)
+  void watchForReply()
 }
 
 /**
- * 发完消息后密集看几眼（最多 20 秒），看到新消息就停。
+ * 线程末尾那条是不是**对方**发的（不是买家自己）。
+ *
+ * ★ 只看最后一条就够：买家连着发两条、机器再答，末条仍是对方的。
+ *   拿不到就按"还没回"处理 —— 保守一点，宁可多等一会儿，也别把等待条提前撤掉。
+ */
+function hasReply(): boolean {
+  const last = ticket.value?.messages.at(-1)
+  return last !== undefined && last.senderType !== SENDER_USER
+}
+
+/**
+ * 发完消息后密集看几眼（`REPLY_WATCH_MS` 之内，每 1.5 秒一次），**看到对方的回话就停**。
  *
  * ★ 页面本身的轮询是 15 秒一档，而智能客服通常几秒内就答完 —— 不密集看的话，
  *   用户会觉得"问完没人理"。
+ * ★ 判据是"最后一条不是我自己发的"，**不是"消息条数变多"**：条数在消息发出去的
+ *   那一刻就已经 +1 了，拿它当基线，等待条会在第一次轮询（1.5 秒）就自己撤掉 ——
+ *   这个坑踩过，线上表现为"加载中只闪一下就没了"。
  * ★ **不复用 usePoll**：它是固定周期的，start/stop 在闭包私有、任务内部无法自停，
  *   而这里要的正是"拿到就停"（与 web-admin 的 useAnswerPoll 同一个理由）。
  */
-async function watchForReply(baseline: number): Promise<void> {
-  const deadline = Date.now() + 20_000
-  // 这 20 秒里线程末尾挂一条「等待客服回复 ···」，让用户知道有人在处理
+async function watchForReply(): Promise<void> {
+  // 对方已经回了（商家正好在线，或者答得极快）就不摆这条等待
+  if (hasReply()) return
+  const deadline = Date.now() + REPLY_WATCH_MS
+  // 窗口里线程末尾挂一条「等待客服回复 ···」，让用户知道有人在处理
   waitingReply.value = true
+  // 窗口里又发了一条时会开出第二个 watcher，只有**最新**那个有权把等待条撤掉
+  const id = ++replyWatchId
   try {
     while (!unmounted && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 1500))
       if (unmounted) return
       await load(true)
-      if ((ticket.value?.messages.length ?? 0) > baseline) return
+      if (hasReply()) return
     }
   } finally {
-    waitingReply.value = false
+    if (id === replyWatchId) waitingReply.value = false
   }
 }
 
