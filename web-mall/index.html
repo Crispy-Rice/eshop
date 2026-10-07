@@ -13,11 +13,11 @@
        * 必须内联、必须早于样式生效：否则刷新时会先按默认主题渲染一帧，
        * 再被 JS 改成上次选的皮肤，肉眼看就是"闪一下"。
        *
-       * key 要和 src/composables/useTheme.ts 里的 STORAGE_KEY 一致。
+       * key 要和 src/utils/storageKeys.ts 里的 THEME_KEY 一致（内联脚本够不到那个模块）。
        */
       ;(function () {
         try {
-          var theme = localStorage.getItem('eshop.theme')
+          var theme = localStorage.getItem('eshop.mall.theme')
           if (theme) {
             document.documentElement.setAttribute('data-theme', theme)
           }

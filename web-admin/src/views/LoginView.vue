@@ -6,6 +6,7 @@ import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { isBizError } from '@/api/errors'
 import { useAuthStore } from '@/stores/auth'
 import { rememberPasswordInBrowser } from '@/utils/credential'
+import { REMEMBERED_PHONE_KEY } from '@/utils/storageKeys'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -30,10 +31,10 @@ const form = reactive({
  *   交给浏览器自带的密码管理器 —— 下面输入框上的 autocomplete 属性就是为它准备的，
  *   由系统钥匙串保管。商城那边是同一套做法。
  *
- * 和商城**共用同一个 key**：生产环境两个前端同源（`/` 与 `/admin/`），本来就是一套
- * 账号，手机号在任一边填过一次就够 —— 和 token 的共享是同一个道理。
+ * 和商城**各存各的**：两个前端同源，但演示时要能一边演商家、一边演买家，
+ *   所以连手机号也不共用（键名带命名空间，见 `utils/storageKeys.ts`）——
+ *   在商城填过买家 B 的手机号，不该把后台的登录框也预填成 B。
  */
-const REMEMBERED_PHONE_KEY = 'eshop.rememberedPhone'
 const rememberPhone = ref(false)
 
 onMounted(() => {

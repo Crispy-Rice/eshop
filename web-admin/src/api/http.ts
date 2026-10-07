@@ -1,5 +1,7 @@
 import axios, { AxiosError, type AxiosRequestConfig } from 'axios'
 
+import { ACCESS_TOKEN_KEY, REFRESH_TOKEN_KEY } from '@/utils/storageKeys'
+
 import { BizError, ErrorCode, type ApiResponse } from './errors'
 
 /**
@@ -8,9 +10,9 @@ import { BizError, ErrorCode, type ApiResponse } from './errors'
  * 第一期 access token 与 refresh token 都放 localStorage（简单、够用）。
  * ★ 开启 HTTPS 后应把 refresh token 改存 HttpOnly Cookie
  *   （docs/15-api-and-errors.md §1.1）。
+ * ★ 键名带本应用的命名空间 —— 商城与后台同源，共用键就等于共用一个登录态
+ *   （见 `utils/storageKeys.ts`）。
  */
-const ACCESS_TOKEN_KEY = 'eshop.accessToken'
-const REFRESH_TOKEN_KEY = 'eshop.refreshToken'
 
 export function getAccessToken(): string | null {
   return localStorage.getItem(ACCESS_TOKEN_KEY)

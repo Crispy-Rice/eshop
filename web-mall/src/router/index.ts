@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 
 import { useAuthStore } from '@/stores/auth'
+import { CHUNK_RELOAD_KEY } from '@/utils/storageKeys'
 
 const routes: RouteRecordRaw[] = [
   {
@@ -168,7 +169,6 @@ router.beforeEach(async (to) => {
  * 3. 带着用户原本要去的地址刷（`router.resolve(to).href` —— 那个 `href` 才是
  *    **带 base 的完整地址**，`to.href` 并不存在，`fullPath` 又会丢掉 base）。
  */
-const CHUNK_RELOAD_KEY = 'eshop.chunkReloadAt'
 const CHUNK_RELOAD_COOLDOWN_MS = 60_000
 // Chrome / Edge 是前两句；Firefox 与部分浏览器是后两句
 const CHUNK_LOAD_ERROR =

@@ -7,6 +7,7 @@ import { ErrorCode, accountBlockOf, isBizError } from '@/api/errors'
 import { fetchSiteContact, type SiteContact } from '@/api/site'
 import { useAuthStore } from '@/stores/auth'
 import { rememberPasswordInBrowser } from '@/utils/credential'
+import { REMEMBERED_PHONE_KEY } from '@/utils/storageKeys'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -36,7 +37,6 @@ const form = reactive({
  *   `autocomplete` 属性就是为它准备的，浏览器会询问是否保存，并由系统钥匙串
  *   保管。那是零风险的那一半功能，我们不用自己实现。
  */
-const REMEMBERED_PHONE_KEY = 'eshop.rememberedPhone'
 const rememberPhone = ref(false)
 
 onMounted(() => {

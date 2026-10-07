@@ -1,17 +1,16 @@
 import { ref, watch } from 'vue'
 
 import { DEFAULT_THEME, THEMES, isThemeId, type ThemeId } from '@/theme/themes'
+import { THEME_KEY as STORAGE_KEY } from '@/utils/storageKeys'
 
 /**
- * ★ 这个 key 必须和 `index.html` 里那段内联脚本用的字符串一致。
- *   内联脚本负责首屏前设好 data-theme（避免刷新时闪一下默认主题），
- *   改这里就要同步改那边。
- *
- * ★ 它的角色是**缓存**，不是用户偏好：存的是"上次从后端读到的站点皮肤"。
+ * 这个 key 的角色是**缓存**，不是用户偏好：存的是"上次从后端读到的站点皮肤"。
  *   皮肤由**运营**在后台启用、全站生效（docs/17 §3），买家端没有切换器，
  *   所以这里没有任何用户写入的入口 —— 只有 `applyServerSkin`。
+ *
+ * ★ 它还必须在 `index.html` 那段内联脚本里出现一次（内联脚本够不到这个模块）：
+ *   首屏前设好 data-theme，否则刷新时会闪一下默认主题。改了要同步改那边。
  */
-const STORAGE_KEY = 'eshop.theme'
 
 /** 切主题时挂到 <html> 上的过渡类，样式在 base.css */
 const SWITCH_CLASS = 'theme-switching'
