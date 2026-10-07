@@ -445,6 +445,8 @@ function bubbleClass(status: string): string {
 .ai-thinking {
   margin-left: var(--space-1);
   color: var(--color-text-secondary);
+  /* 不参与收缩：一缩就会把「正在查询…」从中间折成两行 */
+  flex: 0 0 auto;
 }
 
 .ai-bubble {
@@ -469,10 +471,21 @@ function bubbleClass(status: string): string {
   color: var(--color-text-secondary);
 }
 
+/*
+ * 还在飞的那一条：三点 + 「正在查询…」。
+ *
+ * ★ 这一条**不是正文气泡**，两处要压掉 `.ai-bubble` 上的通用样式：
+ *   - `white-space: pre-wrap` + `word-break: break-word` 会把「正在查询…」断成两行；
+ *   - `max-width: 86%` 会落进**循环依赖**（百分比按列宽算，而列宽又按内容算），
+ *     实测列宽被压到 112px、气泡 96px —— 行里明明有 344px。
+ *   取消上限 + 不折行之后，气泡按内容撑到 111.8px，右侧留白也正常。
+ */
 .ai-bubble.pending {
   display: flex;
   gap: 4px;
   align-items: center;
+  max-width: none;
+  white-space: nowrap;
 }
 
 .ai-dot {
