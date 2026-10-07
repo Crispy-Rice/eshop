@@ -715,15 +715,21 @@ async def handoff_to_human(
             subject=subject[:120],
         ),
     )
-    # 已有进行中的会话就直接复用，不再重复贴一遍摘要（那会变成刷屏）
+    # 已有进行中的工单就复用它（``open_ticket`` 的语义），但**这一轮的诉求照样要送过去**：
+    # 那条工单可能已经躺了几天，而这次点转人工问的是另一件事。
+    # ★ 唯一的例外是"内容和工单最后一条一模一样"—— 那说明这次点击没带来任何新信息
+    #   （连点两次、说明照抄），再贴一遍才是刷屏。
+    # ★ 旧实现是**复用就一个字都不写**，于是"已有对话 + 不填说明"再转一次，平台那边
+    #   什么也收不到，而用户看到的是"已把问题交给客服"—— 静默丢内容，最坏的一种。
     reused = bool(detail.messages)
-    if not reused:
+    body = _handoff_summary(rows, note)
+    if not detail.messages or detail.messages[-1].body != body:
         await support_service.reply_as_user(
             session,
             redis,
             user_id=caller.user_id,
             ticket_no=detail.ticket_no,
-            body=_handoff_summary(rows, note),
+            body=body,
             images=(),
         )
     return detail.ticket_no, reused

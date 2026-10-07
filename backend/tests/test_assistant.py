@@ -709,3 +709,59 @@ async def test_handoff_rejects_someone_elses_conversation(client: AsyncClient, s
         headers=ctx["headers"],
     )
     assert resp.status_code == 404
+
+
+async def test_handoff_again_still_delivers_this_round(client: AsyncClient, session) -> None:
+    """★ 已有对话、这次又**不留说明**地再点一次「转人工」：这一轮问的必须送到平台。
+
+    坑：同一用户同一店铺已有进行中的工单时 ``open_ticket`` 会**复用**那条，而复用
+    那一支原来**一个字都不写** —— 平台上只看得见上一轮那条旧摘要，这一轮等于没发生，
+    而用户那边收到的是"已把问题交给客服"的成功提示（最坏的一种：静默丢内容）。
+    """
+    ctx = await _prepare(client, session)
+    first_id = await _ask(client, ctx["headers"], "第一个问题：运费模板怎么配？")
+    await _run(first_id, FakeLlm(replies=[answer("按模板配就行")]))
+
+    r1 = await client.post("/api/assistant/handoff", json={}, headers=ctx["headers"])
+    assert r1.status_code == 200, r1.text
+    ticket_no = r1.json()["data"]["ticketNo"]
+    assert r1.json()["data"]["reused"] is False
+
+    second_id = await _ask(client, ctx["headers"], "第二个问题：这单为什么发不出去？")
+    await _run(second_id, FakeLlm(replies=[answer("建议转人工")]))
+
+    r2 = await client.post("/api/assistant/handoff", json={}, headers=ctx["headers"])
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["data"]["ticketNo"] == ticket_no, "应复用同一条工单"
+    assert r2.json()["data"]["reused"] is True
+
+    async with get_session_factory()() as s:
+        bodies = [
+            str(b)
+            for b in await s.scalars(
+                text(
+                    "SELECT body FROM support.ticket_message"
+                    " WHERE ticket_no = :no ORDER BY id"
+                ),
+                {"no": ticket_no},
+            )
+        ]
+    assert any("第二个问题：这单为什么发不出去" in b for b in bodies), (
+        "第二次转人工的内容没送到平台：客服只看得见上一轮那条旧摘要"
+    )
+
+    # 再点一次（内容没变）不该又贴一条 —— 那是原来这个分支要防的刷屏
+    r3 = await client.post("/api/assistant/handoff", json={}, headers=ctx["headers"])
+    assert r3.status_code == 200, r3.text
+    async with get_session_factory()() as s:
+        same = [
+            str(b)
+            for b in await s.scalars(
+                text(
+                    "SELECT body FROM support.ticket_message"
+                    " WHERE ticket_no = :no ORDER BY id"
+                ),
+                {"no": ticket_no},
+            )
+        ]
+    assert same == bodies, "内容没变却又贴了一条（刷屏）"
