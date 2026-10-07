@@ -17,12 +17,14 @@ from app.core.snowflake import next_id
 from app.modules.files import storage
 from app.modules.product import repository as repo
 from app.modules.product.models import (
+    SPU_BANNED,
     SPU_DRAFT,
     SPU_NOT_APPROVED,
     SPU_OFF_SHELF,
     SPU_ON_SHELF,
     SPU_PENDING_AUDIT,
     SPU_REJECTED,
+    SPU_STATUS_TEXT,
     SPU_SUBMITTABLE,
     Category,
     Sku,
@@ -721,6 +723,18 @@ async def _get_owned_spu(session: AsyncSession, shop_id: int, spu_id: int) -> Sp
 # ============================================================
 # 买家：浏览与搜索
 # ============================================================
+def status_text_of(status: int) -> str:
+    """SPU 状态 → 文案（与「商品管理」页同一套词）。
+
+    ★ **文案只此一处**：以前 web-admin 自己维护了一份 `SPU_STATUS_TEXT`，后端再来一份
+      就成了两个来源 —— 加了状态忘了改一边，页面上和接口里说的就不是一回事。
+      现在由这里给，前端直接渲染 `statusText`。
+    ★ 未知状态返回「未知」而不是抛错：多一个状态时宁可页面上显示"未知"，
+      也不要让整个列表 500。
+    """
+    return SPU_STATUS_TEXT.get(status, "未知")
+
+
 def _to_card(spu: Spu) -> SpuCardOut:
     return SpuCardOut(
         id=spu.id,
@@ -738,6 +752,7 @@ def _to_card(spu: Spu) -> SpuCardOut:
         avg_score=float(spu.avg_score) if spu.avg_score is not None else None,
         review_count=spu.review_count,
         status=spu.status,
+        status_text=status_text_of(spu.status),
     )
 
 
@@ -876,6 +891,32 @@ async def count_pending_audit(session: AsyncSession) -> int:
     return int(out.total or 0)
 
 
+# 本店商品按状态计数：key 用**可读的英文标识**，不让 assistant 去认整数状态码
+# （状态码是 product 的概念，解释权归它）。零也照给 —— "已驳回 0 件"是有效信息，
+# 而且形状固定，模型不会因为某个 key 缺失就说"查不到"。
+_SPU_STATUS_KEY: dict[int, str] = {
+    SPU_ON_SHELF: "on_shelf",
+    SPU_DRAFT: "draft",
+    SPU_PENDING_AUDIT: "pending_audit",
+    SPU_OFF_SHELF: "off_shelf",
+    SPU_BANNED: "banned",
+    SPU_REJECTED: "rejected",
+}
+
+
+async def count_spu_by_status_for_shop(
+    session: AsyncSession, shop_id: int
+) -> dict[str, int]:
+    """本店商品按状态计数。给商家的 AI 助手回答"我有多少商品上架了"。
+
+    ★ 只读。状态码翻成 ``on_shelf`` 这类名字在**这里**做（概念的拥有者），
+      助手不必知道「2 就是在售」。
+    ★ 只有 ``on_shelf`` 是买家在商城里看得到的数量；其余几个仅商家自己可见。
+    """
+    raw = await repo.count_spus_by_status(session, shop_id=shop_id)
+    return {key: raw.get(status, 0) for status, key in _SPU_STATUS_KEY.items()}
+
+
 async def list_pending_audit(session: AsyncSession, *, limit: int = 20) -> SpuListOut:
     """待审核商品列表（跨店铺）。给平台 AI 助手用。
 
@@ -947,6 +988,7 @@ async def get_spu_detail(
         price_max=spu.price_max,
         total_sold=spu.total_sold,
         status=spu.status,
+        status_text=status_text_of(spu.status),
         # ★ 只给店主和平台看。买家视角下"图片太模糊，驳回"这种内部流程说明毫无意义
         audit_remark=spu.audit_remark if (owner_shop_id is not None or as_platform) else None,
         spec_groups=[

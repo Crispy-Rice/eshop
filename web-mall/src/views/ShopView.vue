@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
 import { fetchShop, type ShopInfo } from '@/api/auth'
 import { isBizError } from '@/api/errors'
 import { searchProducts, type SearchSort, type SpuCard } from '@/api/product'
+import { TICKET_SOURCE } from '@/api/support'
 import ProductGrid from '@/components/ProductGrid.vue'
 import { useShelf } from '@/composables/useShelf'
 import { onImageError } from '@/utils/placeholder'
@@ -20,6 +21,7 @@ import { onImageError } from '@/utils/placeholder'
  *   多半点出空结果。排序 + 翻页够了；接口本来就支持 `categoryId`，将来要加不难。
  */
 const route = useRoute()
+const router = useRouter()
 const shopId = computed(() => String(route.params.shopId))
 
 const shop = ref<ShopInfo | null>(null)
@@ -87,6 +89,26 @@ function onSortChange(): void {
 }
 
 /**
+ * 联系客服：深链到客服页，带上 shopId 与一个带店名的标题。
+ *
+ * ★ 与商品详情页那个入口同一条路（`docs/19 §5.1`：开会话的逻辑只有一处，
+ *   各入口只负责"把上下文放进 URL"）。这里没有商品上下文，所以**不带 spuId** ——
+ *   店小蜜据此知道买家问的是"这家店"而不是某件商品。
+ * ★ 没登录时会被路由守卫带去登录页，回来接着开会话；与商品页那个按钮一致。
+ */
+function contactShop(): void {
+  if (!shop.value) return
+  void router.push({
+    name: 'support',
+    query: {
+      shopId: shop.value.id,
+      source: TICKET_SOURCE.OTHER,
+      subject: `关于「${shop.value.name}」`,
+    },
+  })
+}
+
+/**
  * 拉店铺信息。
  *
  * ★ 拉不到（店铺不存在 / 已删）就整页走空状态，**不弹错误提示** ——
@@ -133,6 +155,8 @@ onMounted(async () => {
             <h1 class="shop-name">{{ shop.name }}</h1>
             <p v-if="shop.description" class="shop-desc">{{ shop.description }}</p>
           </div>
+          <!-- 店招上唯一的动作。库存/客服这类"要问人"的事，进店的人第一眼就该找得到 -->
+          <button type="button" class="shop-service" @click="contactShop">联系客服</button>
         </section>
       </div>
 
@@ -178,6 +202,29 @@ onMounted(async () => {
   height: 64px;
   flex: 0 0 auto;
   border-radius: var(--radius-md);
+}
+
+/* 「联系客服」：描边小胶囊，靠 `margin-left:auto` 推到店招最右边。
+   与商品详情页那个同名按钮同一套语言 —— 它跳出当前页去客服会话，
+   和「进店逛逛」这类站内跳转不是一回事 */
+.shop-service {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-surface);
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+
+.shop-service:hover {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
 }
 
 img.shop-logo {

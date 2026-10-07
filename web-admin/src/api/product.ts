@@ -14,6 +14,8 @@ export interface SpuCard {
   avgScore: number
   reviewCount: number
   status: number
+  /** 状态文案。**由后端给**（product service 那一份），前端没有再维护映射表 */
+  statusText: string
 }
 
 export interface SpecValue {
@@ -50,6 +52,8 @@ export interface SpuDetail {
   priceMax: number
   totalSold: number
   status: number
+  /** 状态文案。**由后端给**（与商家在「商品管理」页看到的是同一处来源） */
+  statusText: string
   /** 最近一次审核意见。**只有店主看得到**，买家视角恒为 null */
   auditRemark: string | null
   specGroups: SpecGroup[]
@@ -103,16 +107,14 @@ export interface SpuCreateInput {
   skus: SkuIn[]
 }
 
-/** SPU 状态：1草稿 2上架 3下架 4违规下架 5待审核 6已驳回 */
-export const SPU_STATUS_TEXT: Record<number, string> = {
-  1: '草稿',
-  2: '已上架',
-  3: '已下架',
-  4: '违规下架',
-  5: '待审核',
-  6: '已驳回',
-}
-
+/**
+ * SPU 状态 → 标签颜色。
+ *
+ * ★ **这里只留颜色**：文案由后端给（`SpuCard.statusText` / `SpuDetail.statusText`）。
+ *   原来前端也维护了一份 `SPU_STATUS_TEXT`，于是同一件事有两个来源 ——
+ *   改了一边忘了另一边，页面上写的和接口里说的就不是一回事，而这种「差一个词」
+ *   没人会发现。颜色是纯展示，后端不管，所以它留下。
+ */
 export const SPU_STATUS_TYPE: Record<number, 'info' | 'success' | 'warning' | 'danger'> = {
   1: 'info',
   2: 'success',

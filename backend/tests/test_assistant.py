@@ -191,6 +191,35 @@ async def test_tool_result_is_wrapped_in_envelope(client: AsyncClient, session) 
     assert tool_messages[0]["content"].rstrip().endswith("</tool_result>")
 
 
+async def test_list_products_reports_and_filters_by_status(
+    client: AsyncClient, session
+) -> None:
+    """★ 商品列表要能**按状态筛**，并且**每行带状态**。
+
+    原来两样都没有：一页商品长得一模一样，模型只能答"工具没给状态"，
+    于是「哪些还是草稿」「这件还在卖吗」都答不了（用户报过这个）。
+    本场景的商品是刚发出来的**草稿**，正好反过来验：筛草稿有它、筛已上架没有。
+    """
+    ctx = await _prepare(client, session)
+
+    async def call(args_json: str) -> str:
+        message_id = await _ask(client, ctx["headers"], "看下我的商品")
+        llm = FakeLlm(replies=[tool_call("list_products", args_json), answer("好的")])
+        await _run(message_id, llm)
+        return next(m for m in llm.seen[1] if m.get("role") == "tool")["content"]
+
+    # ① 每行带状态文案（与「商品管理」页同一套词）
+    assert '"status_text": "草稿"' in await call("{}")
+
+    # ② 过滤真的生效：草稿查得到，已上架查不到
+    assert '"spu_id"' in await call('{"status": 1}')
+    assert '"spu_id"' not in await call('{"status": 2}')
+
+    # ③ 非法状态**明说**，而且整轮不失败（工具报错是回给模型一句话，不是炸掉提问）
+    bad = await call('{"status": 99}')
+    assert "status 只能是" in bad
+
+
 async def test_shop_overview_counts_match_the_pages(client: AsyncClient, session) -> None:
     """概览里的数字要对得上后台页面 —— 这里是"没有订单就是 0、有 1 个商品"的裸场景。"""
     ctx = await _prepare(client, session)
@@ -204,6 +233,34 @@ async def test_shop_overview_counts_match_the_pages(client: AsyncClient, session
     assert '"pending_ship_orders": 0' in payload
     assert '"pending_aftersales": 0' in payload
     assert '"pending_tickets": 0' in payload
+    # ★ 商品按状态的数量。这一项是补出来的：原来只有 ``list_products``（一页 20 条、
+    #   且**不带状态**），于是"我有多少商品上架了"只能答"工具没给总数"（用户报过这个）。
+    #   本场景正好是那个坑：发出来的 SPU 是**草稿**，所以 on_shelf 必须是 0 ——
+    #   而 list_products 有 1 条。数字与列表说的不是一回事。
+    assert '"on_shelf": 0' in payload, "新建的 SPU 是草稿，不该算在售"
+    assert '"draft": 1' in payload
+    assert '"pending_audit": 0' in payload
+
+
+async def test_shop_overview_product_counts_exclude_deleted(
+    client: AsyncClient, session
+) -> None:
+    """★ 商家**软删**过的商品不能被数进去。
+
+    这是"自己写一条 GROUP BY"最容易漏的一条（漏了就是数字比「商品管理」页多几个，
+    而且没人知道是哪边错了），所以它单独钉一遍：删掉那唯一一个商品后，六个状态全 0。
+    """
+    ctx = await _prepare(client, session)
+    resp = await client.delete(f"/api/merchant/spus/{ctx['spu_id']}", headers=ctx["headers"])
+    assert resp.status_code == 200, resp.text
+
+    message_id = await _ask(client, ctx["headers"], "我有多少商品上架了？")
+    llm = FakeLlm(replies=[tool_call("shop_overview", "{}"), answer("0 件")])
+    await _run(message_id, llm)
+
+    payload = next(m for m in llm.seen[1] if m.get("role") == "tool")["content"]
+    for key in ("on_shelf", "draft", "pending_audit", "off_shelf", "banned", "rejected"):
+        assert f'"{key}": 0' in payload, f"{key} 应该是 0（商品已软删）"
 
 
 # ==================================================================

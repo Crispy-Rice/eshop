@@ -179,4 +179,34 @@ router.beforeEach(async (to) => {
   return true
 })
 
+/**
+ * ★ 资源拉不到就**整页刷新一次**。
+ *
+ * 来由：每次发布都会换掉带 hash 的文件名，而**发布前就打开着的标签页**手里还是旧的
+ * index.html —— 它按需去拉路由 chunk 时那些名字已经 404 了，表现就是**点导航没反应**
+ * （控制台里是 "Failed to fetch dynamically imported module"）。用户报过这个。
+ *
+ * 三条纪律：
+ * 1. 只认「拉不到模块」这一类。别的导航错误（守卫里抛的、业务异常）不该被吞成一次刷新。
+ * 2. 一分钟内**只刷一次**（时间戳记在 sessionStorage）：资源真缺失时无限刷新比按钮
+ *    点不动更糟 —— 至少要让人能看见"它坏了"。
+ * 3. 带着用户原本要去的地址刷（`router.resolve(to).href` —— 那个 `href` 才是
+ *    **带 base 的完整地址**：后台挂在 `/admin/` 下，`to.href` 并不存在，
+ *    而 `fullPath` 会丢掉 base）。
+ */
+const CHUNK_RELOAD_KEY = 'eshop.chunkReloadAt'
+const CHUNK_RELOAD_COOLDOWN_MS = 60_000
+// Chrome / Edge 是前两句；Firefox 与部分浏览器是后两句
+const CHUNK_LOAD_ERROR =
+  /Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module/i
+
+router.onError((error, to) => {
+  const message = error instanceof Error ? error.message : String(error)
+  if (!CHUNK_LOAD_ERROR.test(message)) return
+  const last = Number(sessionStorage.getItem(CHUNK_RELOAD_KEY) ?? 0)
+  if (Date.now() - last < CHUNK_RELOAD_COOLDOWN_MS) return
+  sessionStorage.setItem(CHUNK_RELOAD_KEY, String(Date.now()))
+  window.location.assign(router.resolve(to).href)
+})
+
 export default router

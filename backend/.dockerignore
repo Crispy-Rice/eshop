@@ -8,8 +8,11 @@
 
 # 本地虚拟环境与缓存（镜像里的依赖来自 uv sync，不是这里）
 .venv/
-__pycache__/
-*.py[cod]
+# ★ 必须写 `**/`：`.dockerignore` 的 `__pycache__/` **只匹配顶层**那一个，
+#   于是 app/modules/*/__pycache__（本地跑测试留下的）会被烤进镜像 —— v0.1.4/v0.1.5
+#   都带着它们。不影响正确性（字节码来自已提交的源码），但那是该清掉的残留。
+**/__pycache__/
+**/*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

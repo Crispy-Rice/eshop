@@ -12,7 +12,6 @@ import {
   submitForAudit,
   updateSku,
   updateSpu,
-  SPU_STATUS_TEXT,
   SPU_STATUS_TYPE,
   SUBMITTABLE_STATUSES,
   type SkuDetail,
@@ -180,7 +179,7 @@ onMounted(load)
           <div class="left">
             <span>编辑商品</span>
             <el-tag :type="SPU_STATUS_TYPE[spu.status] ?? 'info'" size="small">
-              {{ SPU_STATUS_TEXT[spu.status] ?? spu.status }}
+              {{ spu.statusText }}
             </el-tag>
           </div>
           <div class="actions">

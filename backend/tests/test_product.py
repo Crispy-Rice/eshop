@@ -1047,6 +1047,9 @@ async def test_rejected_product_can_resubmit_but_not_skip_audit(client: AsyncCli
     assert again.status_code == 200, again.text
     detail = (await client.get(f"/api/merchant/spus/{spu_id}", headers=merchant_headers)).json()["data"]
     assert detail["status"] == 5
+    # ★ 文案也由接口给：商家后台直接渲染 statusText，不再自己维护一份映射表
+    #   （两份映射早晚会漂，而且"页面上写「已上架」、接口里是「在售」"没人会发现）
+    assert detail["statusText"] == "待审核"
 
 
 async def test_merchant_list_can_filter_by_rejected_status(client: AsyncClient, session) -> None:
@@ -1076,7 +1079,11 @@ async def test_merchant_list_can_filter_by_rejected_status(client: AsyncClient, 
 
     rejected = await client.get("/api/merchant/spus", params={"status": 6}, headers=merchant_headers)
     assert rejected.status_code == 200, rejected.text
-    assert spu_id in [i["id"] for i in rejected.json()["data"]["items"]]
+    rows = rejected.json()["data"]["items"]
+    assert spu_id in [i["id"] for i in rows]
+    # ★ 列表也带文案（前端直接渲染它）—— 不能只有详情有
+    row = next(i for i in rows if i["id"] == spu_id)
+    assert row["status"] == 6 and row["statusText"] == "已驳回"
 
     # 也不能同时挂在「草稿」下 —— 两档必须是分开的
     drafts = await client.get("/api/merchant/spus", params={"status": 1}, headers=merchant_headers)

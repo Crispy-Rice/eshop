@@ -6,7 +6,6 @@ import { fetchShops } from '@/api/auth'
 import { fetchAdminCategoryTree, type AdminCategory } from '@/api/category'
 import { isBizError } from '@/api/errors'
 import {
-  SPU_STATUS_TEXT,
   SPU_STATUS_TYPE,
   auditSpu,
   fetchAdminSpu,
@@ -260,7 +259,7 @@ onMounted(load)
         <el-table-column label="状态" width="110">
           <template #default="{ row }">
             <el-tag :type="SPU_STATUS_TYPE[row.status]" size="small" effect="plain" disable-transitions>
-              {{ SPU_STATUS_TEXT[row.status] ?? row.status }}
+              {{ row.statusText }}
             </el-tag>
           </template>
         </el-table-column>
@@ -320,7 +319,7 @@ onMounted(load)
           <el-descriptions :column="2" border size="small">
             <el-descriptions-item label="状态">
               <el-tag :type="SPU_STATUS_TYPE[detail.status]" size="small" disable-transitions>
-                {{ SPU_STATUS_TEXT[detail.status] ?? detail.status }}
+                {{ detail.statusText }}
               </el-tag>
             </el-descriptions-item>
             <el-descriptions-item label="店铺">

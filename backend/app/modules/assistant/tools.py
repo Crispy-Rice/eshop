@@ -52,6 +52,7 @@ from app.modules.assistant import rules
 from app.modules.freight import service as freight_service
 from app.modules.inventory import service as inventory_service
 from app.modules.product import service as product_service
+from app.modules.product.models import SPU_STATUS_TEXT
 from app.modules.support import service as support_service
 from app.modules.trade import service as trade_service
 
@@ -143,9 +144,14 @@ async def _get_shop_info(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
 async def _shop_overview(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     """店铺概览：问"我店铺现在什么情况"时唯一该调的工具。
 
-    ★ 四个数字各由**拥有该概念的模块**给出，这里只做编排 ——
+    ★ 每个数字都由**拥有该概念的模块**给出，这里只做编排 ——
       例如"待发货"是 trade 的业务概念，它自己知道那是哪个状态码，
       助手不去猜一个整数（那正是跨模块铁律要防的事）。
+
+    ★ ``products`` 是按**状态**分的商品数（``on_shelf`` 才是买家看得到的）。
+      这一项是补出来的：原来只有 ``list_products``（一页 20 条、不带状态），
+      于是"我有多少商品上架了"只能答"工具没给总数"（用户报过这个）。
+      计数走 product 自己那条过滤条件，和「商品管理」页的数字同源。
     """
     shop_id = ctx.caller.require_shop()
     return {
@@ -157,7 +163,11 @@ async def _shop_overview(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
         "out_of_stock_rows": await inventory_service.count_out_of_stock(
             ctx.session, shop_id=shop_id
         ),
-        "note": "out_of_stock_rows 数的是库存行（一个规格在一个仓），不是商品数",
+        "products": await product_service.count_spu_by_status_for_shop(ctx.session, shop_id),
+        "note": (
+            "out_of_stock_rows 数的是库存行（一个规格在一个仓），不是商品数；"
+            "products 里的 on_shelf 才等于买家在商城里能看到的商品数"
+        ),
     }
 
 
@@ -322,10 +332,20 @@ async def _check_freight_config(ctx: ToolContext, args: dict[str, Any]) -> dict[
 
 async def _list_products(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     shop_id = ctx.caller.require_shop()
+    status = args.get("status")
+    # ★ 状态不合法时**明说**，不要静默当成"没筛"：那会答出一份不含筛选的结果，
+    #   而模型不知道自己答的是另一件事。回一句可读的话，它可以改对再调一次
+    #   （工具报错当成结果回给模型，不让整轮失败 —— 见 service 里的那个 except）
+    if status is not None and status not in SPU_STATUS_TEXT:
+        raise BizError(
+            ErrorCode.VALIDATION_ERROR,
+            "status 只能是 1 草稿 / 2 已上架 / 3 已下架 / 4 违规下架 / 5 待审核 / 6 已驳回",
+        )
     out = await product_service.search_products(
         ctx.session,
         keyword=args.get("keyword") or None,
         shop_id=shop_id,
+        status=status,
         # 商家要能看见自己的草稿 / 已下架 / 被驳回的商品，不能只看上架的
         on_shelf_only=False,
         limit=_limit(args),
@@ -335,6 +355,12 @@ async def _list_products(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
             {
                 "spu_id": str(p.id),
                 "title": p.title,
+                # ★ 每行**带上状态**。原来没有它，"这件还在卖吗""哪些是草稿"都答不了 ——
+                #   列表里十条商品长得一模一样，模型只能干瞪眼。文案走 product 自己的
+                #   那一个函数（与商家在「商品管理」页看到的一致，也与接口里的
+                #   ``statusText`` 同一处来源）。
+                "status": p.status,
+                "status_text": product_service.status_text_of(p.status),
                 "price_min_cent": p.price_min,
                 "price_max_cent": p.price_max,
                 "total_sold": p.total_sold,
@@ -607,7 +633,10 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="shop_overview",
         description="本店的经营概览：待发货订单数、待处理售后数、待回复工单数、"
-        "可售为 0 的库存行数。用户问「今天有什么要处理的」「我店铺什么情况」时调它。",
+        "可售为 0 的库存行数，以及商品**按状态的数量**"
+        "（on_shelf 在售 / draft 草稿 / pending_audit 待审核 / off_shelf 已下架 / "
+        "banned 违规下架 / rejected 已驳回；只有 on_shelf 是买家能看到的那部分）。"
+        "用户问「今天有什么要处理的」「我店铺什么情况」「我有多少商品上架了」时调它。",
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         roles=frozenset({SCOPE_MERCHANT}),
         handler=_shop_overview,
@@ -696,11 +725,19 @@ TOOLS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="list_products",
-        description="本店的商品列表（含草稿、已下架、被驳回的）。可用 keyword 按标题搜。",
+        description="本店的商品列表（含草稿、已下架、被驳回的）。每行带 status 与 "
+        "status_text（草稿 / 已上架 / 已下架 / 违规下架 / 待审核 / 已驳回）。"
+        "可用 keyword 按标题搜、用 status 只看某一状态。"
+        "问「哪些商品还是草稿」「这件还在卖吗」用 status 过滤，别把整页拉回来自己数。",
         parameters={
             "type": "object",
             "properties": {
                 "keyword": {"type": "string", "description": "按商品标题搜索"},
+                "status": {
+                    "type": "integer",
+                    "description": "只看这个状态：1 草稿 2 已上架 3 已下架 "
+                    "4 违规下架 5 待审核 6 已驳回。不传 = 全部",
+                },
                 "limit": {
                     "type": "integer",
                     "description": f"返回条数，1-{MAX_TOOL_ROWS}，默认 10",

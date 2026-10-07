@@ -53,6 +53,19 @@ SPU_SUBMITTABLE = (SPU_DRAFT, SPU_REJECTED)
 # 还没通过平台审核的状态 —— 不允许直接上架，必须先走审核。
 SPU_NOT_APPROVED = (SPU_DRAFT, SPU_PENDING_AUDIT, SPU_REJECTED)
 
+# 状态 → 文案。**这是唯一一份**：接口把它作为 ``statusText`` 发给商家后台直接渲染，
+# 助手转述时也用它（``service.status_text_of``）。以前前端自己维护过一份，
+# 两边会漂 —— 而"页面上写「已上架」、助手说「在售」"没人会发现。
+# 加状态时只改这里（前端只留标签颜色，那是纯展示）。
+SPU_STATUS_TEXT: dict[int, str] = {
+    SPU_DRAFT: "草稿",
+    SPU_ON_SHELF: "已上架",
+    SPU_OFF_SHELF: "已下架",
+    SPU_BANNED: "违规下架",
+    SPU_PENDING_AUDIT: "待审核",
+    SPU_REJECTED: "已驳回",
+}
+
 # SKU 状态：只跟随 SPU，单独下架某个 SKU 用不到（下架 SPU 即可）
 SKU_OFF_SHELF = 2
 

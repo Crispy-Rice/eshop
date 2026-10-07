@@ -255,6 +255,34 @@ async def search_spus(
     return list(result)
 
 
+async def count_spus_by_status(session: AsyncSession, *, shop_id: int) -> dict[int, int]:
+    """本店商品按状态分组计数（助手的「店铺概览」用它回答"我有多少商品上架了"）。
+
+    ★ 过滤条件**复用 ``_spu_filters``**，不另写一份 WHERE —— 自己写最常漏的就是
+      ``deleted.is_(False)``：商家软删过的商品会被数进去，数字和「商品管理」页对不上，
+      而这种"差几个"最难发现。
+    ★ 一条 GROUP BY 出全部状态。概览要一次讲清"在售 / 草稿 / 待审核"，
+      按状态各调一次 COUNT 就是五次往返。
+    """
+    stmt = (
+        select(Spu.status, func.count())
+        .where(
+            *_spu_filters(
+                keywords=[],
+                category_ids=None,
+                price_from=None,
+                price_to=None,
+                shop_id=shop_id,
+                status=None,
+                on_shelf_only=False,
+            )
+        )
+        .group_by(Spu.status)
+    )
+    rows = await session.execute(stmt)
+    return {int(status): int(count) for status, count in rows.all()}
+
+
 async def count_spus(
     session: AsyncSession,
     *,

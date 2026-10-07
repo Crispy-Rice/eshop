@@ -11,7 +11,6 @@ import {
   offShelf,
   onShelf,
   submitForAudit,
-  SPU_STATUS_TEXT,
   SPU_STATUS_TYPE,
   type SpuCard,
 } from '@/api/product'
@@ -232,7 +231,7 @@ onMounted(() => {
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <el-tag :type="SPU_STATUS_TYPE[row.status] ?? 'info'" size="small" disable-transitions>
-              {{ SPU_STATUS_TEXT[row.status] ?? row.status }}
+              {{ row.statusText }}
             </el-tag>
           </template>
         </el-table-column>

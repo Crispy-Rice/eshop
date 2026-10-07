@@ -279,6 +279,9 @@ class SpuDetailOut(CamelModel):
     price_max: int
     total_sold: int
     status: int
+    # ★ 状态文案由后端给（`service.status_text_of`）—— 前端不再自己维护一份映射。
+    #   两份映射早晚会漂，而"页面上写「已上架」、接口里是「在售」"没人会发现。
+    status_text: str
     # 最近一次审核意见，**只对店主返回**（买家视角恒为 null）—— 见 service.get_spu_detail
     audit_remark: str | None = None
     spec_groups: list[SpecGroupOut]
@@ -309,6 +312,9 @@ class SpuCardOut(CamelModel):
     avg_score: float | None = None
     review_count: int = 0
     status: int = 2
+    # 状态文案（见 `SpuDetailOut.status_text`）。★ 买家侧恒为「已上架」——
+    # 公开搜索只返回在售商品，所以它既是**给商家/审核列表**用的，也不会泄露什么。
+    status_text: str
 
 
 class SkuBriefOut(CamelModel):
