@@ -103,6 +103,11 @@ Layer 3  Element Plus 桥接                --el-color-primary、--el-text-color
 - **货架是一个共享组件** `components/ProductGrid.vue`：搜索页与店铺页共用同一份网格与卡片。
   卡片那几十行里全是"货架感"的讲究，复制第二份就等着腐烂。
   页大小也由它算（列数 × 行数，列数只有它自己量得到），见 `composables/useShelf.ts`。
+- ★ **量列数时网格必须可见**。元素 `display:none` 时 `getComputedStyle(...).gridTemplateColumns`
+  返回的是**声明值** `repeat(auto-fill, minmax(200px, 1fr))` —— 按空格切正好 3 段，
+  会被算成"3 列"、得出一个看着很合理的页大小（3 × 3 = 9），一路静默错下去
+  （首屏只显示 9 个商品就是这么来的）。所以 `measure()` 只认算出 px 的轨道表，
+  且网格不能再挂 `v-show` 隐藏自己。
 - 商品卡用**自定义 `<a class="card">`**，不用 `el-card`——需要控制 `overflow:hidden` + 图片缩放 + `margin-top:auto`，`el-card` 的 body 结构会挡路。
 - ★ **卡片里不能放链接**。卡片整体已经是 `<a>`，再嵌一个（比如"店名 → 店铺页"）是无效 HTML，
   浏览器会把它拆开、行为不可预测。店铺入口因此只在**商品详情页**（那块店铺信息现在可点）。

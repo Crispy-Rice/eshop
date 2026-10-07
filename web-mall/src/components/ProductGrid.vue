@@ -98,12 +98,20 @@ function detailHref(spu: SpuCard): string {
 
 const shelfEl = ref<HTMLElement | null>(null)
 
-/** 网格当前几列。视口一变就变，所以每次现测，不能缓存 */
+/**
+ * 网格当前几列。视口一变就变，所以每次现测，不能缓存。
+ *
+ * ★ 只认**算出 px 的轨道表**。元素不可见（display:none）时 `getComputedStyle` 给的是
+ *   **声明值** `repeat(auto-fill, minmax(200px, 1fr))` —— 按空格切正好是 3 段，
+ *   会被当成"3 列"，算出一个**看着很合理**的页大小（3 × 3 行 = 9），一路静默错下去。
+ *   不是 px 就这一轮不量：宁可用兜底页大小，也不把错的发出去。
+ */
 function measure(): void {
   const el = shelfEl.value
   if (!el) return
-  const cols = getComputedStyle(el).gridTemplateColumns.split(' ').filter(Boolean).length
-  if (cols) emit('page-size', cols * props.shelfRows)
+  const tracks = getComputedStyle(el).gridTemplateColumns.split(' ').filter(Boolean)
+  if (!tracks.length || !tracks.every((t) => t.endsWith('px'))) return
+  emit('page-size', tracks.length * props.shelfRows)
 }
 
 onMounted(() => {
@@ -119,9 +127,12 @@ onBeforeUnmount(() => window.removeEventListener('resize', measure))
   <div v-loading="loading" class="shelf-wrap">
     <el-empty v-if="!loading && items.length === 0" :description="emptyText" />
 
-    <!-- v-show 而不是 v-else：网格要**一直在 DOM 里**才量得到列数。
-         首屏加载中它也是可见的（loading 只盖一层遮罩），所以这一刻量得准 -->
-    <div v-show="!(items.length === 0 && !loading)" ref="shelfEl" class="shelf">
+    <!-- ★ 网格**必须一直在 DOM 里、且一直是 `display:grid`** —— 列数只有布局算得出来。
+         这里早先挂着 `v-show="!(items.length === 0 && !loading)"`，而"空结果且不在加载中"
+         恰恰就是**首屏挂载那一刻**的状态：网格是 display:none，量到的是隐藏元素的声明值，
+         于是"3 列 × 3 行 = 9"，首屏只拉 9 个商品、还要点「加载更多」才补齐。
+         空网格高度是 0，与 el-empty 并存没有任何视觉影响，就让它一直显示。 -->
+    <div ref="shelfEl" class="shelf">
       <a
         v-for="item in items"
         :key="item.id"
