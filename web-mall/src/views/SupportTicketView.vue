@@ -11,6 +11,7 @@ import {
   requestHuman,
   sendTicketMessage,
   type TicketDetail,
+  type TicketMessage,
 } from '@/api/support'
 import { usePoll } from '@/composables/usePoll'
 import { useAuthStore } from '@/stores/auth'
@@ -26,10 +27,46 @@ const router = useRouter()
 const MAX_IMAGES = 3
 /** 我 = 买家（senderType 1）。右侧气泡。 */
 const SENDER_USER = 1
+/** 智能客服（后端的 `SENDER_AI`）。★ 只用来挑头像与配色 —— 名字一律用后端给的
+ *  `senderTypeText`，前端不自己维护第二份发送方文案表。 */
+const SENDER_AI = 5
+
+/**
+ * 头像里的字。
+ *
+ * ★ 买家走的是**自己的头像图**（见模板），这里是它没有头像时的兜底。
+ *   **不用昵称首字** —— 昵称是用户自己填的，拿它当头像会出现
+ *   "标签写着「买家」、头像却写着「商」"这种自相矛盾（演示账号的昵称就是「商家2号」）。
+ * 智能客服给一个显眼的「AI」；其余（商家 / 平台客服 / 系统）取角色名首字 ——
+ * 名字本来就在后端的 `senderTypeText` 里，不另写一份。
+ */
+function avatarText(m: TicketMessage): string {
+  if (m.senderType === SENDER_USER) return '我'
+  if (m.senderType === SENDER_AI) return 'AI'
+  return m.senderTypeText.slice(0, 1)
+}
+
+/** 头像底色的三种角色：我 / 智能客服 / 店里的其他人（商家、平台、系统） */
+function avatarClass(m: TicketMessage): string {
+  if (m.senderType === SENDER_USER) return 'me'
+  return m.senderType === SENDER_AI ? 'ai' : 'staff'
+}
+
+/** 我自己的头像图（没设过就空串，模板退回字母徽章） */
+const myAvatar = computed(() => auth.user?.avatar ?? '')
 
 const ticketNo = computed(() => String(route.params.ticketNo))
 const ticket = ref<TicketDetail | null>(null)
 const loading = ref(false)
+/**
+ * 发完消息后的那段等待里显示「等待客服回复 ···」。
+ *
+ * ★ 只在 `watchForReply` 那个窗口内置真（20 秒）。不做后端状态：
+ *   "我刚发完消息"这件事买家自己的浏览器就知道（与不做 `aiReplying` 同一个理由）。
+ * ★ 措辞用「等待客服回复」而不是「对方正在输入」：我们**不知道**是店小蜜还是
+ *   商家本人来接，写成"正在输入"就是在替谁撒谎。
+ */
+const waitingReply = ref(false)
 const loadingOlder = ref(false)
 const sending = ref(false)
 const uploading = ref(false)
@@ -136,11 +173,17 @@ async function onSend(): Promise<void> {
  */
 async function watchForReply(baseline: number): Promise<void> {
   const deadline = Date.now() + 20_000
-  while (!unmounted && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 1500))
-    if (unmounted) return
-    await load(true)
-    if ((ticket.value?.messages.length ?? 0) > baseline) return
+  // 这 20 秒里线程末尾挂一条「等待客服回复 ···」，让用户知道有人在处理
+  waitingReply.value = true
+  try {
+    while (!unmounted && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500))
+      if (unmounted) return
+      await load(true)
+      if ((ticket.value?.messages.length ?? 0) > baseline) return
+    }
+  } finally {
+    waitingReply.value = false
   }
 }
 
@@ -275,23 +318,38 @@ usePoll(() => load(true), 15_000, { immediate: false })
         class="row"
         :class="{ mine: m.senderType === SENDER_USER }"
       >
-        <div class="bubble">
-          <div class="meta">
-            <span>{{ m.senderTypeText }}</span>
-            <span class="time">{{ formatDateTime(m.createdAt) }}</span>
-          </div>
-          <p class="body">{{ m.body }}</p>
-          <div v-if="m.images.length" class="shots">
-            <img
-              v-for="img in m.images"
-              :key="img"
-              :src="mediaUrl(img)"
-              alt="会话图片"
-              @error="onImageError"
-            />
+        <!-- 买家用自己的头像图（有的话）；其余一律字母徽章。
+             不用昵称首字当头像 —— 那是用户自己填的，会出现"标签写「买家」、
+             头像写「商」"这种自相矛盾（演示账号的昵称就叫「商家2号」） -->
+        <span v-if="m.senderType === SENDER_USER && myAvatar" class="avatar me">
+          <img :src="myAvatar" alt="" @error="onImageError" />
+        </span>
+        <span v-else class="avatar" :class="avatarClass(m)">{{ avatarText(m) }}</span>
+        <div class="col">
+          <span class="who">{{ m.senderTypeText }}</span>
+          <div class="bubble">
+            <p class="body">{{ m.body }}</p>
+            <div v-if="m.images.length" class="shots">
+              <img
+                v-for="img in m.images"
+                :key="img"
+                :src="mediaUrl(img)"
+                alt="会话图片"
+                @error="onImageError"
+              />
+            </div>
+            <div class="time">{{ formatDateTime(m.createdAt) }}</div>
           </div>
         </div>
       </div>
+
+      <!--
+        等回复：三点跳动。★ **不给它配头像** —— 这会儿还不知道是店小蜜还是
+        商家本人接，配一个就等于替其中一方表态了。
+      -->
+      <p v-if="waitingReply" class="waiting">
+        等待客服回复<span class="dots"><i /><i /><i /></span>
+      </p>
     </section>
 
     <footer class="composer">
@@ -423,16 +481,73 @@ usePoll(() => load(true), 15_000, { immediate: false })
   padding: var(--space-5) 0;
 }
 
+/* 一条消息 = 头像 + 名字/气泡一列。买家那一侧整行翻过来（头像在右） */
 .row {
   display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
 }
 
 .row.mine {
-  justify-content: flex-end;
+  flex-direction: row-reverse;
+}
+
+.avatar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  line-height: 1;
+}
+
+/* 三种底色：我（灰）/ 智能客服（实心强调色，一眼认出是机器人）/ 店里的人 */
+.avatar.me {
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+}
+
+.avatar.ai {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+  font-weight: var(--weight-medium);
+}
+
+.avatar.staff {
+  background: var(--color-bg-subtle);
+  color: var(--color-text-secondary);
+}
+
+.avatar img {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  /* 留出头像的位置，气泡才不会顶满整行 */
+  max-width: calc(76% + 32px);
+}
+
+.row.mine .col {
+  align-items: flex-end;
+}
+
+.who {
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
 }
 
 .bubble {
-  max-width: 76%;
+  max-width: 100%;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
@@ -444,19 +559,61 @@ usePoll(() => load(true), 15_000, { immediate: false })
   border-color: transparent;
 }
 
-.meta {
+/* 时间挪到气泡**底部**（名字已经移到气泡上方、和头像一起） */
+.time {
+  margin-top: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--color-text-placeholder);
+}
+
+/*
+  等回复那一条。★ 不给它配头像（还不知道谁来接），所以它是一条**状态行**而不是消息气泡。
+*/
+.waiting {
   display: flex;
-  gap: var(--space-2);
+  align-items: center;
+  gap: 2px;
+  /* 缩进到左边那条消息的**气泡**左缘（头像 28px + 间距 8px）——
+     它不是一条消息，不该顶格读起来像谁说的话 */
+  padding-left: 36px;
   font-size: var(--text-xs);
   color: var(--color-text-tertiary);
 }
 
-.time {
-  color: var(--color-text-placeholder);
+.dots {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: var(--space-1);
+}
+
+.dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--color-text-tertiary);
+  animation: blink 1.2s infinite ease-in-out;
+}
+
+.dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes blink {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 1;
+  }
 }
 
 .body {
-  margin-top: var(--space-1);
   font-size: var(--text-sm);
   color: var(--color-text);
   line-height: var(--leading-relaxed);

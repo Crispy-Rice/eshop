@@ -224,14 +224,25 @@ function bubbleClass(status: string): string {
           class="ai-row"
           :class="{ mine: m.role === 'user' }"
         >
-          <div v-if="m.role === 'user'" class="ai-bubble mine">{{ m.content }}</div>
-          <div
-            v-else-if="m.status === 'pending' || m.status === 'running'"
-            class="ai-bubble pending"
-          >
-            <span class="ai-dot" /><span class="ai-dot" /><span class="ai-dot" />
+          <!-- 头像 + 名字：一眼看出哪句是谁说的。AI 用实心强调色，
+               与用户那个灰底区分开 —— 这正是"这是机器人"的第一层标识 -->
+          <span class="ai-avatar" :class="m.role === 'user' ? 'user' : 'bot'">
+            {{ m.role === 'user' ? '我' : 'AI' }}
+          </span>
+          <div class="ai-col">
+            <span class="ai-who">{{ m.role === 'user' ? '我' : '助手' }}</span>
+            <div v-if="m.role === 'user'" class="ai-bubble mine">{{ m.content }}</div>
+            <!-- ★ 还在飞的那一条：三点跳动 + 一句"正在查询…"。
+                 光有动画没有字，用户不知道是在查还是在卡住 -->
+            <div
+              v-else-if="m.status === 'pending' || m.status === 'running'"
+              class="ai-bubble pending"
+            >
+              <span class="ai-dot" /><span class="ai-dot" /><span class="ai-dot" />
+              <span class="ai-thinking">正在查询…</span>
+            </div>
+            <div v-else :class="bubbleClass(m.status)">{{ m.content }}</div>
           </div>
-          <div v-else :class="bubbleClass(m.status)">{{ m.content }}</div>
         </div>
       </div>
 
@@ -380,12 +391,60 @@ function bubbleClass(status: string): string {
   color: var(--color-text-tertiary);
 }
 
+/* 一条消息 = 头像 + 名字/气泡一列。用户那一侧整行翻过来（头像在右） */
 .ai-row {
   display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
 }
 
 .ai-row.mine {
-  justify-content: flex-end;
+  flex-direction: row-reverse;
+}
+
+.ai-avatar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  line-height: 1;
+}
+
+/* AI 用实心强调色：与用户那个灰底一眼区分开 */
+.ai-avatar.bot {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+  font-weight: var(--weight-medium);
+}
+
+.ai-avatar.user {
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+}
+
+.ai-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ai-row.mine .ai-col {
+  align-items: flex-end;
+}
+
+.ai-who {
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+}
+
+.ai-thinking {
+  margin-left: var(--space-1);
+  color: var(--color-text-secondary);
 }
 
 .ai-bubble {
@@ -417,6 +476,7 @@ function bubbleClass(status: string): string {
 }
 
 .ai-dot {
+  flex: 0 0 auto;
   width: 5px;
   height: 5px;
   border-radius: 50%;
