@@ -40,8 +40,10 @@ from app.modules.support.models import (
     EVENT_OPEN,
     EVENT_REOPEN,
     PLATFORM_SHOP_ID,
+    SENDER_AI,
     SENDER_MERCHANT,
     SENDER_PLATFORM,
+    SENDER_SYSTEM,
     SENDER_TEXT,
     SENDER_USER,
     SOURCE_AFTERSALE,
@@ -55,6 +57,7 @@ from app.modules.support.models import (
 )
 from app.modules.support.rules import staff_owes_reply
 from app.modules.support.schemas import (
+    AwaitingTicketOut,
     OpenTicketRequest,
     TicketContextOut,
     TicketCountOut,
@@ -62,6 +65,7 @@ from app.modules.support.schemas import (
     TicketListItemOut,
     TicketListOut,
     TicketMessageOut,
+    TicketStateOut,
 )
 from app.modules.trade.order_no import build_ticket_no
 
@@ -79,11 +83,21 @@ PLATFORM_SHOP_NAME = "平台客服"
 # ★ 发送方 → 状态流水的操作者。**两套枚举的数值不一样**（SenderType 里
 #   3=平台、4=系统；OperatorType 里 3=系统、4=平台），所以必须显式映射，
 #   不能靠数值相等 —— 否则审计流水里平台与系统会对调。
+#
+# ★ ``SENDER_SYSTEM`` 与 ``SENDER_AI`` 都记成 ``SYSTEM``（自动化，不是人）：
+#   状态流水要回答的是"谁重开的"，而这两个都没有 operator_id。
+#   哪天需要区分"系统重开"与"AI 重开"，再给 OperatorType 加一个值。
 _OPERATOR_OF_SENDER = {
     SENDER_USER: OperatorType.USER,
     SENDER_MERCHANT: OperatorType.MERCHANT,
     SENDER_PLATFORM: OperatorType.PLATFORM,
+    SENDER_SYSTEM: OperatorType.SYSTEM,
+    SENDER_AI: OperatorType.SYSTEM,
 }
+
+# 「人」的发送方：只有它们吃按发送者的发消息限流。
+# AI 与系统不占这个键（见 _reply 的说明）。
+_HUMAN_SENDERS = frozenset({SENDER_USER, SENDER_MERCHANT, SENDER_PLATFORM})
 
 
 def _text(mapping: dict[int, str], key: int | None, default: str = "") -> str:
@@ -208,7 +222,9 @@ def _to_list_item(
         last_sender_type=last_sender,
         last_sender_text=_text(SENDER_TEXT, last_sender),
         unread=unread,
-        staff_owes_reply=staff_owes_reply(int(ticket.status), last_sender),
+        staff_owes_reply=staff_owes_reply(
+            int(ticket.status), last_sender, ticket.need_human_at is not None
+        ),
         created_at=ticket.created_at,
     )
 
@@ -284,9 +300,13 @@ async def _detail(
             order_main_no=ticket.order_main_no,
             order_sub_no=ticket.order_sub_no,
             refund_no=ticket.refund_no,
+            spu_id=ticket.spu_id,
         ),
         last_message_at=ticket.last_message_at,
-        staff_owes_reply=staff_owes_reply(int(ticket.status), int(ticket.last_sender_type)),
+        staff_owes_reply=staff_owes_reply(
+            int(ticket.status), int(ticket.last_sender_type), ticket.need_human_at is not None
+        ),
+        need_human=ticket.need_human_at is not None,
         close_by_text=_text(CLOSE_BY_TEXT, close_by, "") if close_by is not None else None,
         close_reason=ticket.close_reason,
         close_time=ticket.close_time,
@@ -326,6 +346,7 @@ async def open_ticket(
         order_main_no=req.order_main_no,
         order_sub_no=req.order_sub_no,
         refund_no=req.refund_no,
+        spu_id=int(req.spu_id) if req.spu_id is not None else None,
         now=now,
     )
     ticket = await repo.get_active(session, user_id=user_id, shop_id=shop_id)
@@ -341,6 +362,23 @@ async def open_ticket(
             operator_type=OperatorType.USER,
             operator_id=user_id,
         )
+    else:
+        # ★ 复用已有会话时，**刷新上下文**（后一次点击为准）。
+        #   不刷新的话会答错：买家上一轮从商品 A 点进来、这一轮从商品 B 点进来，
+        #   会话里记的还是 A —— 店小蜜会拿 A 的价格去答 B 的问题。
+        #   只更新请求里**真的带了**的那几项（None 不动），所以从订单页点进来
+        #   不会把商品上下文抹掉。
+        await repo.refresh_context(
+            session,
+            ticket_no=ticket.ticket_no,
+            spu_id=int(req.spu_id) if req.spu_id is not None else None,
+            order_main_no=req.order_main_no,
+            order_sub_no=req.order_sub_no,
+            refund_no=req.refund_no,
+            now=now,
+        )
+        ticket = await repo.get_active(session, user_id=user_id, shop_id=shop_id)
+        assert ticket is not None
     return await _detail(session, ticket, as_staff=False)
 
 
@@ -383,6 +421,43 @@ async def reply_as_user(
         images=images,
         sender_type=SENDER_USER,
         sender_id=user_id,
+        user_id=user_id,
+    )
+
+
+async def request_human(
+    session: AsyncSession, redis: Redis, *, user_id: int, ticket_no: str
+) -> None:
+    """买家主动要人工客服。
+
+    ★ 它只做两件事：置 ``need_human_at``（让这条会话**留在/回到**商家的「待回复」
+      队列里 —— 否则 AI 说过话之后，买家再喊一句"我要人工"是掉进队列外面的），
+      外加一条给买家看的系统消息。**不新开会话、不改归属**。
+
+    ★ 与 ``assistant.service.handoff_to_human``（商家 → **平台**，会另开一张
+      **平台级**工单）是两件事：那条是"商家以平台使用者的身份提问"，
+      这条是"买家在自己店里要人工"。两者的票据、队列、参与方都不同。
+
+    幂等：已经转过的会话不再重复插消息（买家连点两下只有一条说明）。
+    """
+    now = datetime.now(UTC)
+    ticket = await repo.get_for_update(session, ticket_no)
+    if ticket is None or int(ticket.user_id) != user_id:
+        raise BizError(ErrorCode.NOT_FOUND, "会话不存在")
+    if ticket.need_human_at is not None:
+        return
+
+    await repo.set_need_human(session, ticket_no, now=now)
+    # 走 _reply 而不是自己插消息：它顺带处理"会话已关则重开"、行锁与
+    # last_message_at/last_sender_type 的维护（系统消息不动任何读游标、不推站内信）
+    await _reply(
+        session,
+        redis,
+        ticket_no=ticket_no,
+        body="已收到，正在为你转接人工客服，商家会尽快回复。",
+        images=(),
+        sender_type=SENDER_SYSTEM,
+        sender_id=None,
         user_id=user_id,
     )
 
@@ -460,6 +535,55 @@ async def reply_as_merchant(
     )
 
 
+# ---------------------------------------------------------------
+# 店铺的智能客服（AI 以店铺身份说话）
+# ---------------------------------------------------------------
+async def reply_as_ai(
+    session: AsyncSession,
+    redis: Redis,
+    *,
+    shop_id: int,
+    ticket_no: str,
+    body: str,
+) -> TicketMessageOut:
+    """店铺的智能客服在会话里说一句。
+
+    ★ 归属还是商家那一套（``shop_id`` 必须等于会话的店铺）—— AI 不是特权身份，
+      它就是这家店的一个发言人。调用方（assistant 模块）负责在那之前复核
+      "真人有没有抢答 / 开关是否还开着"。
+    ★ **不推站内信、不动商家读游标**（``_reply`` 里按发送方白名单分派），
+      于是 AI 说完话之后，商家的未读与「待回复」都还是准的。
+    """
+    return await _reply(
+        session,
+        redis,
+        ticket_no=ticket_no,
+        body=body,
+        images=(),
+        sender_type=SENDER_AI,
+        sender_id=None,
+        shop_id=shop_id,
+    )
+
+
+async def flag_need_human(session: AsyncSession, *, shop_id: int, ticket_no: str) -> None:
+    """把会话标成「需要人工」——**智能客服答不了时**调用。
+
+    ★ 与 ``request_human`` 的分工：那个是**买家**要人工（会留一条说明消息给买家看），
+      这个是**店铺的机器人**自己认输（它刚说过"我答不了"，不必再插一条）。
+      两者共用 ``need_human_at`` 这一个闩锁 —— 谁先说都算数，商家回复时一起解开。
+
+    ★ 归属照商家的规矩校验：AI 只能动自己店的会话。
+    """
+    ticket = await repo.get_for_update(session, ticket_no)
+    if ticket is None or int(ticket.shop_id) != shop_id:
+        raise BizError(ErrorCode.NOT_FOUND, "会话不存在")
+    # 已转过 / 已关闭：无事可做（关闭的会话连闩锁都不该再置）
+    if ticket.need_human_at is not None or int(ticket.status) == TICKET_CLOSED:
+        return
+    await repo.set_need_human(session, ticket_no, now=datetime.now(UTC))
+
+
 async def close_by_merchant(
     session: AsyncSession,
     *,
@@ -480,21 +604,29 @@ async def close_by_merchant(
 
 
 # ---------------------------------------------------------------
-# 平台（可介入任何会话，含平台级）
+# 平台（**只**处理平台级会话 —— 商家 / 买家提给平台的工单）
 # ---------------------------------------------------------------
-async def list_all(
+async def list_platform(
     session: AsyncSession,
     *,
-    shop_id: int | None,
     status: int | None,
     pending_only: bool,
     cursor: str | None,
     limit: int,
 ) -> TicketListOut:
+    """平台队列。**恒定过滤 ``shop_id = 平台哨兵``。**
+
+    ★ 这里**没有 ``shop_id`` 参数是故意的**。它原来接受 ``None``（= 不限店铺），
+      于是平台客服台会列出所有店铺的买家会话，平台还能以「平台客服」的身份插进去
+      —— 买家正在跟某家店聊，中间冒出一句平台客服的话，**谁在跟谁说话都分不清**。
+
+      平台在这套系统里的职责是"回答提给平台的工单"，店的会话归商家（商家要是处理不了，
+      会自己转人工给平台）。写成常量而不是参数，将来没人能靠传参把范围放开。
+    """
     capped = _clamp(limit)
     rows = await repo.list_tickets(
         session,
-        shop_id=shop_id,
+        shop_id=PLATFORM_SHOP_ID,
         status=status,
         owes_reply_only=pending_only,
         cursor=_decode_cursor(cursor) if cursor else None,
@@ -503,11 +635,12 @@ async def list_all(
     return await _to_list(session, rows, as_staff=True, limit=capped)
 
 
-async def get_any(
+async def get_for_platform(
     session: AsyncSession, *, ticket_no: str, before_id: int | None
 ) -> TicketDetailOut:
     ticket = await repo.get_by_no(session, ticket_no)
-    if ticket is None:
+    # 归属不对一律 NOT_FOUND（与商家侧同一条规矩：不给遍历探测留口子）
+    if ticket is None or int(ticket.shop_id) != PLATFORM_SHOP_ID:
         raise BizError(ErrorCode.NOT_FOUND, "会话不存在")
     return await _detail(session, ticket, as_staff=True, before_id=before_id)
 
@@ -521,6 +654,8 @@ async def reply_as_platform(
     body: str,
     images: Sequence[str],
 ) -> TicketMessageOut:
+    """★ 复用 ``_reply`` 的**店铺归属校验**：传 ``shop_id=平台哨兵``，
+    店里的会话会被那条等式挡成 404 —— 平台只能落在平台级会话里。"""
     return await _reply(
         session,
         redis,
@@ -529,6 +664,7 @@ async def reply_as_platform(
         images=images,
         sender_type=SENDER_PLATFORM,
         sender_id=operator_id,
+        shop_id=PLATFORM_SHOP_ID,
     )
 
 
@@ -542,6 +678,64 @@ async def close_by_platform(
         close_by=SENDER_PLATFORM,
         operator_type=OperatorType.PLATFORM,
         operator_id=operator_id,
+        shop_id=PLATFORM_SHOP_ID,
+    )
+
+
+# ---------------------------------------------------------------
+# 给别的模块的只读投影（跨模块的唯一入口）
+# ---------------------------------------------------------------
+async def list_awaiting_tickets(
+    session: AsyncSession, *, since: datetime, limit: int = 50
+) -> list[AwaitingTicketOut]:
+    """买家刚说完话、**还没有人接**的会话（店铺会话，按最近发言排序）。
+
+    ★ **泛型**：语义只有"买家发言了、还没有人回"，**不含任何 AI 概念** ——
+      support 不知道谁会用这个列表（见 docs/19 §2.3 与 docs/20 §14）。
+    ★ 比「商家欠回复」窄一项：**已转人工的不算**，那种已经交给人了。
+    ★ ``since`` 是新鲜度窗口，调用方给（越旧的会话越不该被翻出来自动回）。
+    """
+    rows = await repo.list_awaiting(session, since=since, limit=_clamp(limit))
+    return [
+        AwaitingTicketOut(
+            ticket_no=ticket.ticket_no,
+            shop_id=ticket.shop_id,
+            user_id=ticket.user_id,
+            last_message_id=last_id,
+            last_message_at=ticket.last_message_at,
+            source=int(ticket.source),
+            subject=ticket.subject,
+            order_main_no=ticket.order_main_no,
+            order_sub_no=ticket.order_sub_no,
+            refund_no=ticket.refund_no,
+        )
+        for ticket, last_id in rows
+    ]
+
+
+async def get_ticket_state(
+    session: AsyncSession, *, shop_id: int, ticket_no: str, lock: bool = False
+) -> TicketStateOut | None:
+    """一条会话的当前状态（给别的模块做**写前复核**）。
+
+    ★ ``lock=True`` 会拿行锁。调用方要的是"**重读 → 判断 → 写**"这一串不被打断：
+      不锁的话，商家可能在你读完、还没写完之间回了一条，你的写就盖掉了他的话。
+      （写路径 ``_reply`` 自己也会拿行锁，但"判断"必须在锁内做才有意义。）
+    ★ 归属不对 / 不存在 → ``None``：与全模块一致，不区分"没有"和"不是你的"。
+    """
+    ticket = (
+        await repo.get_for_update(session, ticket_no)
+        if lock
+        else await repo.get_by_no(session, ticket_no)
+    )
+    if ticket is None or int(ticket.shop_id) != shop_id:
+        return None
+    return TicketStateOut(
+        ticket_no=ticket.ticket_no,
+        shop_id=ticket.shop_id,
+        status=int(ticket.status),
+        last_sender_type=int(ticket.last_sender_type),
+        need_human=ticket.need_human_at is not None,
     )
 
 
@@ -556,11 +750,19 @@ async def _reply(
     body: str,
     images: Sequence[str],
     sender_type: int,
-    sender_id: int,
+    sender_id: int | None,
     shop_id: int | None = None,
     user_id: int | None = None,
 ) -> TicketMessageOut:
-    await _check_rate_limit(redis, sender_id)
+    """所有发送方共用的写路径。
+
+    ★ **限流只对"人"生效**（买家 / 商家 / 平台）。AI 与系统没有 ``sender_id``：
+      拿店铺 id 去套那个键会和商家自己的回复抢同一个计数器（20 条/分钟），
+      而 AI 的花费由 assistant 自己的额度闸（按店铺日 token）管。
+    """
+    if sender_type in _HUMAN_SENDERS:
+        assert sender_id is not None  # 人类发送方一定带 id
+        await _check_rate_limit(redis, sender_id)
 
     # 行锁：并发回复同一会话时，last_message_at / last_sender_type 才不会互相覆盖
     ticket = await repo.get_for_update(session, ticket_no)
@@ -599,8 +801,18 @@ async def _reply(
 
     if sender_type == SENDER_USER:
         await repo.set_user_read(session, ticket_no, now=now)
-    else:
+    elif sender_type in (SENDER_MERCHANT, SENDER_PLATFORM):
+        # ★ 白名单，不是 `else`。原来这里是 else，于是**任何**新发送方都会掉进来
+        #   干两件错事（SENDER_AI 正是这样被坑到的）：
+        #   ① `set_staff_read(now)` 把商家的读游标推到现在 —— 买家刚问的问题会被
+        #      机器人自己标成"商家已读"，`unread_of` 算出的商家未读直接归零；
+        #   ② 推一条「客服回复了你」的站内信 —— 说话的根本不是人（误导），
+        #      而且会计入买家的未读角标。
+        #   AI 的话买家在会话页本来就看得到，不需要额外推一条。
+        #   将来再加发送方，默认是"什么都不做"，而不是"当成客服"。
         await repo.set_staff_read(session, ticket_no, now=now)
+        # 人已经回过了，这一笔不再欠谁（AI 转人工留下的闩锁在这里解开）
+        await repo.clear_need_human(session, ticket_no, now=now)
         # 客服回复 → 同事务写站内信。biz_key 带上消息 id：同一条回复**永远**
         # 只产生一条站内信，连"手滑发两条一样的话"也是两条（那是两条消息）。
         await notify_service.push(

@@ -130,3 +130,11 @@ def build_ticket_no(snowflake_id: int, *, now: datetime | None = None) -> str:
     now = now or datetime.now()
     body = f"{now:%Y%m%d}{snowflake_id % 10_000_000_000:010d}"
     return f"T{body}{luhn_check_digit(body)}"
+
+
+def build_conversation_no(snowflake_id: int, *, now: datetime | None = None) -> str:
+    """AI 助手会话号。``A`` 前缀，与订单号同构（docs/20 §2）。"""
+    now = now or datetime.now()
+    body = f"{now:%Y%m%d}{snowflake_id % 10_000_000_000:010d}"
+    return f"A{body}{luhn_check_digit(body)}"
+

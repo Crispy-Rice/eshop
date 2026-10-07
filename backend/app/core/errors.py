@@ -134,6 +134,29 @@ class ErrorCode(StrEnum):
     # 正文长度/空值由 pydantic 兜成 VALIDATION_ERROR。见 docs/19 §4。
     SUPPORT_RATE_LIMITED = ("SUPPORT_RATE_LIMITED", 429, "发送太频繁，请稍后再试")
 
+    # ---------- AI 助手 ----------
+    # 五个码对应五种**用户要做的事不一样**的失败（docs/20 §6）：
+    # - 关掉了 / 上游挂了：等一会儿或转人工，重试多半也没用
+    # - 问太密 / 额度用完：等（分钟级 / 明天），且要说清是哪一种
+    # - 上游超时：现在重试**可能**有用，所以文案要邀请重试
+    # 合成一个"助手不可用"会让用户不知道该等还是该重试，也让排查失去线索。
+    ASSISTANT_DISABLED = ("ASSISTANT_DISABLED", 503, "助手暂时不可用，可以稍后再试或转人工")
+    ASSISTANT_RATE_LIMITED = ("ASSISTANT_RATE_LIMITED", 429, "提问太频繁了，请稍后再试")
+    ASSISTANT_QUOTA_EXCEEDED = ("ASSISTANT_QUOTA_EXCEEDED", 429, "今天的助手额度已用完，明天再来")
+    ASSISTANT_UPSTREAM_TIMEOUT = (
+        "ASSISTANT_UPSTREAM_TIMEOUT",
+        504,
+        "助手这次没能响应，可以重试或转人工",
+    )
+    ASSISTANT_UPSTREAM_ERROR = (
+        "ASSISTANT_UPSTREAM_ERROR",
+        502,
+        "助手暂时无法回答，请稍后再试或转人工",
+    )
+    # 同一会话上一条还没答完又提交。不并答是因为工具调用循环共用一条历史，
+    # 交错会让两轮互相看见对方半截的工具结果
+    ASSISTANT_BUSY = ("ASSISTANT_BUSY", 409, "助手正在回答上一个问题，请稍等")
+
     # ---------- 文件上传 ----------
     INVALID_IMAGE = ("INVALID_IMAGE", 422, "图片格式不支持或已损坏")
     IMAGE_TOO_LARGE = ("IMAGE_TOO_LARGE", 413, "图片体积超过限制")

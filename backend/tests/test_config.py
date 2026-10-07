@@ -38,6 +38,8 @@ def prod_settings(**overrides: object) -> Settings:
         "mock_pay_secret": PROD_SECRET,
         "phone_enc_key": FRESH_ENC_KEY,
         "payment_mock_enabled": False,
+        # AI 助手的第三方凭据。它不是 HMAC 密钥，所以自检对它只要求"换掉、非空"
+        "llm_api_key": PROD_SECRET,
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]
@@ -67,6 +69,35 @@ def test_development_ignores_phone_enc_key_default() -> None:
     """开发环境不做这层校验（否则本地起不来）。"""
     settings = Settings(app_env="development", phone_enc_key=KNOWN_PHONE_ENC_KEY)
     assert settings.is_production is False
+
+
+# ============================================================
+# AI 助手的模型密钥
+# ============================================================
+def test_missing_llm_key_is_rejected_in_production() -> None:
+    """★ 开了助手却没配模型密钥 → 启动就失败。
+
+    不拦的话每次提问都要白跑一趟再失败，而运维只能从日志里看出来。
+    """
+    with pytest.raises(ValidationError) as exc:
+        prod_settings(llm_api_key="dev-only-placeholder")
+    assert "LLM_API_KEY" in str(exc.value)
+
+
+def test_llm_key_is_not_checked_against_the_hmac_length_rule() -> None:
+    """★ 它只要求"非空且换掉"，**不套** HS256 那条"至少 32 字节"。
+
+    厂商 API key 不是 HMAC 密钥，套那条规则会让报错文案撒谎（真实密钥
+    常常短于 32 字节，会被误报成"太短"）。
+    """
+    short_key = "sk-short-but-real"
+    assert prod_settings(llm_api_key=short_key).llm_api_key == short_key
+
+
+def test_assistant_disabled_needs_no_llm_key() -> None:
+    """没开助手，就不该逼运维配一个用不上的密钥。"""
+    settings = prod_settings(assistant_enabled=False, llm_api_key="dev-only-placeholder")
+    assert settings.assistant_enabled is False
 
 
 # ============================================================

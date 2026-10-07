@@ -37,6 +37,7 @@
 | **user** | 账号、地址、积分账户、角色权限 | PG | 积分流水 |
 | **review** | 评价、追评、图片、审核 | PG | 购后限制、唯一性 |
 | **support** | 客服会话（买家 ↔ 商家 / 平台的异步工单） | PG + Redis | 一会话一仓、未读游标 |
+| **assistant** | 后台 AI 助手（商家 / 平台的只读问答）+ **店小蜜**（买家侧：AI 以店铺身份答，见 [20 §14](20-assistant.md)） | PG + 外部模型 API | ★ 工具**只读**、身份服务端注入、答案靠轮询；店小蜜连发送方都是新的（`SENDER_AI`） |
 | **settlement** | 商家账单、平台佣金 | PG | 对账准确性 |
 | **notify** | 站内信（第一期不接短信） | PG | 幂等、去重 |
 
@@ -58,8 +59,22 @@ aftersale ─┬─> trade
 support ─┬─> account（店铺名、买家标签）
          └─> notify（写站内信）
 
+assistant ─┬─> trade / aftersale / inventory / freight / product / support（**只读**，取工具数据）
+           └─> account（店铺归属与店铺名）
+
 notify ──> （无下游；由 worker 的 outbox 投递循环与 support 调用）
 ```
+
+★ **`assistant` 是唯一一个把跨模块编排放在 `service` 之外的地方**：它的入口不是 HTTP 而是
+工具调用循环，所以编排落在 `tools.py` 的各个 handler 里（每个 handler 是个微型编排器），
+`router.py` 只管助手自己的 HTTP。除此之外铁律不破 —— handler 只调对方 `service.py`。
+
+★ **改动下面这些规则时要同步 `assistant/knowledge/`**（那是给模型看的）：后台那几篇
+（`audience: staff` / `admin`）讲的是"怎么配"；**买家那篇**（`audience: buyer`）讲的是
+"买家会问到的规则"（发货时效、七天无理由、运费的归属、退款流程）。两边的**受众是隔离的**
+（见 [20 §14.7](20-assistant.md)）：
+运费（[06](06-freight.md)）、仓库与发货路由（[03 §12](03-inventory.md)）、订单与售后（[07](07-order-and-split.md) / [08](08-aftersale.md)）、
+商品审核、客服（[19](19-support.md)）。**拿旧规则答错的伤害大于不回答** —— 这是把知识库放仓库里而不是数据库里的唯一理由。
 
 ★ **`trade` / `payment` / `aftersale` 与 `notify` 之间没有边**：它们把通知意图写进
 `core.local_message`（outbox，见 §2.2 与 docs/19 §4），由 worker 就地分派。这是

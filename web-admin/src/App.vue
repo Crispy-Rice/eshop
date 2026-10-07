@@ -4,15 +4,18 @@ import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
 import { setUnauthorizedHandler } from '@/api/http'
+import AiAssistant from '@/components/AiAssistant.vue'
 import ProfileEditDialog from '@/components/ProfileEditDialog.vue'
 import { usePoll } from '@/composables/usePoll'
 import { MALL_APP_URL } from '@/utils/siblingApp'
 import { onImageError } from '@/utils/placeholder'
+import { useAssistantStore } from '@/stores/assistant'
 import { useAuthStore } from '@/stores/auth'
 import { useSupportStore } from '@/stores/support'
 
 const auth = useAuthStore()
 const support = useSupportStore()
+const assistant = useAssistantStore()
 const router = useRouter()
 const route = useRoute()
 const profileVisible = ref(false)
@@ -63,6 +66,7 @@ function onUserCommand(command: 'profile' | 'logout'): void {
 setUnauthorizedHandler(() => {
   auth.clearLocal()
   support.reset()
+  assistant.reset()
   ElMessage.warning('登录已过期，请重新登录')
   void router.push({ name: 'login', query: { redirect: route.fullPath } })
 })
@@ -88,6 +92,7 @@ watch(
 async function onLogout(): Promise<void> {
   await auth.logout()
   support.reset()
+  assistant.reset()
   ElMessage.success('已退出登录')
   void router.push({ name: 'login' })
 }
@@ -119,6 +124,9 @@ async function onLogout(): Promise<void> {
               {{ support.pending > 99 ? '99+' : support.pending }}
             </span>
           </RouterLink>
+          <!-- 智能客服（店小蜜）：替商家答买家的那个。跟着「客服」放，两者是同一件事的两端。
+               只有商家能看 —— 端点全是本店范围，运营点进去只会弹「请先开通店铺」 -->
+          <RouterLink v-if="hasShop" to="/shopbot" class="nav-link">智能客服</RouterLink>
           <!-- 评价两边都能看：商家看本店、运营看审核队列，页面内部自己分会话 -->
           <RouterLink v-if="hasShop || isAdmin" to="/reviews" class="nav-link">评价</RouterLink>
           <RouterLink v-if="isPlatformAdmin" to="/categories" class="nav-link">类目</RouterLink>
@@ -172,6 +180,8 @@ async function onLogout(): Promise<void> {
     </main>
 
     <ProfileEditDialog v-model="profileVisible" />
+    <!-- 悬浮入口在这里而不是某个页面里：路由是扁平的、没有 layout 嵌套 -->
+    <AiAssistant />
   </div>
 </template>
 

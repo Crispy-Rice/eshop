@@ -15,6 +15,14 @@ from app.modules.account.models import (  # noqa: F401
     UserAddress,
 )
 from app.modules.aftersale.models import RefundItem, RefundOrder  # noqa: F401
+from app.modules.assistant.models import (  # noqa: F401
+    BotTurn,
+    Conversation,
+    Message,
+    ShopFaq,
+    ShopSetting,
+    UsageDaily,
+)
 from app.modules.cart.models import CartItem  # noqa: F401
 from app.modules.core.models import LocalMessage, OpsAlert  # noqa: F401
 from app.modules.freight.models import (  # noqa: F401

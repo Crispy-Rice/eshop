@@ -15,6 +15,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.support.models import (
+    OWES_REPLY_WHERE,
+    PLATFORM_SHOP_ID,
     SENDER_SYSTEM,
     SENDER_USER,
     TICKET_ACTIVE_WHERE,
@@ -44,6 +46,7 @@ async def insert_ticket_ignore_conflict(
     order_main_no: str | None,
     order_sub_no: str | None,
     refund_no: str | None,
+    spu_id: int | None,
     now: datetime,
 ) -> bool:
     """开一条会话；**该用户对同一个对象已有进行中的会话时静默不写**。
@@ -69,6 +72,7 @@ async def insert_ticket_ignore_conflict(
             order_main_no=order_main_no,
             order_sub_no=order_sub_no,
             refund_no=refund_no,
+            spu_id=spu_id,
             status=TICKET_OPEN,
             last_message_at=now,
             # 系统 = 还没有人说过话（见 models 的注释）
@@ -135,13 +139,14 @@ async def list_tickets(
     ★ ``owes_reply_only``（后台队列的「待回复」）**必须在这里过滤，不能拿到
       Python 侧筛**：分页是先取 ``limit + 1`` 再判 ``has_more``，筛在分页之后
       会让"这一页 20 条里只有 3 条命中"而 ``has_more`` 仍为真 —— 页大小就废了。
-      它与 ``rules.staff_owes_reply`` 是同一条判定，改一处要改两处（有集成测试兜着）。
+      SQL 用的是 ``models.OWES_REPLY_WHERE`` 那一句，与 ``rules.staff_owes_reply``、
+      ``count_owes_reply`` 是同一条判定（有集成测试钉着这三处一致）。
     """
     stmt = _apply_filters(
         select(Ticket), user_id=user_id, shop_id=shop_id, status=status
     )
     if owes_reply_only:
-        stmt = stmt.where(Ticket.status == TICKET_OPEN, Ticket.last_sender_type == SENDER_USER)
+        stmt = stmt.where(text(OWES_REPLY_WHERE))
     if cursor is not None:
         last_at, last_id = cursor
         stmt = stmt.where(
@@ -150,6 +155,72 @@ async def list_tickets(
         )
     stmt = stmt.order_by(*_ORDER).limit(limit + 1)
     return list((await session.scalars(stmt)).all())
+
+
+async def list_awaiting(
+    session: AsyncSession, *, since: datetime, limit: int
+) -> list[tuple[Ticket, int]]:
+    """「买家刚说完话、还没有人接」的会话 + 它的**最后一条消息 id**。
+
+    ★ 比「商家欠回复」（``OWES_REPLY_WHERE``）窄一项：**已转人工的不算** ——
+      那种已经交给人了，不该再排给谁去自动答。
+    ★ 只扫**店铺会话**（``shop_id <> 0``）：平台级工单没有店铺侧的目录可查。
+    ★ ``last_message_id`` 必须一起给：调用方靠它做幂等（同一条买家消息只处理一次）。
+      它在 ``ticket`` 上没有列，所以这里按 ``max(id)`` 现算。
+    ★ ``since`` 是**新鲜度窗口**：很久以前的会话不该因为"今天开了某个开关"就被翻出来答。
+    """
+    last_id = (
+        select(func.max(TicketMessage.id))
+        .where(TicketMessage.ticket_no == Ticket.ticket_no)
+        .scalar_subquery()
+    )
+    stmt = (
+        select(Ticket, last_id.label("last_message_id"))
+        .where(
+            Ticket.status == TICKET_OPEN,
+            Ticket.last_sender_type == SENDER_USER,
+            Ticket.need_human_at.is_(None),
+            Ticket.shop_id != PLATFORM_SHOP_ID,
+            Ticket.last_message_at >= since,
+        )
+        .order_by(*_ORDER)
+        .limit(limit)
+    )
+    rows = await session.execute(stmt)
+    # 理论上不可能没有消息（"最后一条是买家"就意味着有消息），这里只是让类型收敛
+    return [(ticket, int(mid)) for ticket, mid in rows.all() if mid is not None]
+
+
+async def refresh_context(
+    session: AsyncSession,
+    ticket_no: str,
+    *,
+    spu_id: int | None,
+    order_main_no: str | None,
+    order_sub_no: str | None,
+    refund_no: str | None,
+    now: datetime,
+) -> None:
+    """复用已有会话时刷新上下文：**只更新请求里真的带了的那几项**。
+
+    ★ 不刷新会**答错**：买家上一轮从商品 A 点进来、这一轮从商品 B 点进来，
+      会话里记的还是 A —— 店小蜜会拿 A 的价格去答 B 的问题。
+    ★ 没带的那几项（``None``）**一律不动**：从订单页点进来不该把商品上下文抹掉。
+    """
+    values: dict[str, Any] = {"updated_at": now}
+    if spu_id is not None:
+        values["spu_id"] = spu_id
+    if order_main_no is not None:
+        values["order_main_no"] = order_main_no
+    if order_sub_no is not None:
+        values["order_sub_no"] = order_sub_no
+    if refund_no is not None:
+        values["refund_no"] = refund_no
+    if len(values) == 1:  # 什么都没带：不必白写一次
+        return
+    await session.execute(
+        update(Ticket).where(Ticket.ticket_no == ticket_no).values(**values)
+    )
 
 
 async def touch_after_message(
@@ -172,7 +243,11 @@ async def cas_close(
     reason: str | None,
     now: datetime,
 ) -> bool:
-    """关闭（CAS）。``rowcount == 0`` 说明状态已经不是 ``from_status`` 了。"""
+    """关闭（CAS）。``rowcount == 0`` 说明状态已经不是 ``from_status`` 了。
+
+    ★ 顺手清掉 ``need_human_at``：会话都关了，那一笔不该再让它在商家队列里
+      挂着（开放状态由下面 ``reopen`` 恢复，转人工要重新点）。
+    """
     result = await session.execute(
         update(Ticket)
         .where(Ticket.ticket_no == ticket_no, Ticket.status == from_status)
@@ -181,6 +256,7 @@ async def cas_close(
             close_by=close_by,
             close_reason=reason,
             close_time=now,
+            need_human_at=None,
             updated_at=now,
         )
     )
@@ -211,6 +287,24 @@ async def set_user_read(session: AsyncSession, ticket_no: str, *, now: datetime)
 async def set_staff_read(session: AsyncSession, ticket_no: str, *, now: datetime) -> None:
     await session.execute(
         update(Ticket).where(Ticket.ticket_no == ticket_no).values(staff_read_at=now)
+    )
+
+
+async def set_need_human(session: AsyncSession, ticket_no: str, *, now: datetime) -> None:
+    """置「已转人工」。调用方负责幂等（读一下当前值再决定要不要插说明消息）。"""
+    await session.execute(
+        update(Ticket)
+        .where(Ticket.ticket_no == ticket_no)
+        .values(need_human_at=now, updated_at=now)
+    )
+
+
+async def clear_need_human(session: AsyncSession, ticket_no: str, *, now: datetime) -> None:
+    """清「已转人工」—— 人已经回过了，这一笔不再欠谁。"""
+    await session.execute(
+        update(Ticket)
+        .where(Ticket.ticket_no == ticket_no)
+        .values(need_human_at=None, updated_at=now)
     )
 
 
@@ -289,11 +383,10 @@ async def count_owes_reply(session: AsyncSession, *, shop_id: int | None) -> int
 
     ★ 列表接口是**游标分页**、不带总数，所以角标不能靠"取一页数 items.length"来凑
       （超过一页就会少报，而那正是最需要提醒的时候）。这里单独 count。
-      判定与 ``list_tickets(owes_reply_only=True)`` 必须一致：进行中 + 最后一条是买家。
+      判定与 ``list_tickets(owes_reply_only=True)`` **共用 `OWES_REPLY_WHERE`** ——
+      两处各写一遍 SQL 是这类"角标和列表对不上"的老来源。
     """
-    stmt = select(func.count()).select_from(Ticket).where(
-        Ticket.status == TICKET_OPEN, Ticket.last_sender_type == SENDER_USER
-    )
+    stmt = select(func.count()).select_from(Ticket).where(text(OWES_REPLY_WHERE))
     if shop_id is not None:
         stmt = stmt.where(Ticket.shop_id == shop_id)
     return int(await session.scalar(stmt) or 0)

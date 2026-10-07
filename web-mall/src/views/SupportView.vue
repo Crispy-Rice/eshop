@@ -88,12 +88,14 @@ function contextFromQuery(): OpenTicketPayload | null {
   const orderMainNo = typeof q.orderMainNo === 'string' ? q.orderMainNo : undefined
   const orderSubNo = typeof q.orderSubNo === 'string' ? q.orderSubNo : undefined
   const refundNo = typeof q.refundNo === 'string' ? q.refundNo : undefined
+  // 商品页会带（会话据此记住买家在问哪件商品，店小蜜要拿它查价格/在售状态）
+  const spuId = typeof q.spuId === 'string' ? q.spuId : undefined
   const source = typeof q.source === 'string' ? Number(q.source) : undefined
   // 标题：商品页会带上商品名（那才知道买家在问什么）。订单/售后不带 ——
   // 后端已经能从 source + 单号生成「关于订单 M…」，再传一遍是冗余。
   const subject = typeof q.subject === 'string' && q.subject ? q.subject.slice(0, 120) : undefined
   if (!shopId && !orderMainNo && !orderSubNo && !refundNo) return null
-  return { shopId, orderMainNo, orderSubNo, refundNo, source, subject }
+  return { shopId, orderMainNo, orderSubNo, refundNo, spuId, source, subject }
 }
 
 onMounted(async () => {

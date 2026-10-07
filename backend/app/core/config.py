@@ -103,6 +103,52 @@ class Settings(BaseSettings):
     media_url_prefix: str = "/media/"
     media_max_image_mb: int = 5
 
+    # ---------- AI 助手（docs/20-assistant.md）----------
+    # 总开关。助手要调外部 API、要花钱，出问题时运维得能一键关掉而不是等发版。
+    assistant_enabled: bool = True
+    # 百炼的 **OpenAI 兼容模式**：协议是 chat/completions，所以只用 httpx + JSON，
+    # 不引入任何厂商 SDK（httpx 本来就是依赖）。
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    llm_api_key: str = DEV_PLACEHOLDER
+    llm_model: str = "qwen-plus"
+    # 思考模式（百炼里只有**混合思考**模型才有这个开关，见 docs/20 §0）。
+    # 默认**关**，三个理由：
+    #   1. 助手要的是"按工具查数再答"，不需要长链推理；
+    #   2. 开着它会多产 output token（按 output 计价）并多等几秒；
+    #   3. Qwen 官方明确说思考模式下**不能强制 required 工具**，而我们最后一轮
+    #      正要用 tool_choice="none" 收尾。
+    # ★ 若模型根本不接受这个字段，上游会返回 400 —— 那种情况看日志里的原始报文
+    #   （service 会把它记下来），然后把这一行删掉即可。
+    llm_enable_thinking: bool = False
+    llm_timeout_seconds: float = 30.0
+    # 一次提问里模型最多能连着调几轮工具。防它反复调工具刷成本（docs/20 §6）。
+    assistant_max_tool_rounds: int = 4
+    assistant_max_output_tokens: int = 800
+    # 分钟级限流（固定窗口 60 秒）。按用户 + 按店铺两道：一个店多人共用账号时，
+    # 用户级那道挡不住单店把额度吃光
+    assistant_user_rate_per_minute: int = 10
+    assistant_shop_rate_per_minute: int = 20
+    # 每日 token 预算。★ 账本在 PG（assistant.usage_daily）而不是 Redis ——
+    # 演示机的 Redis 是 maxmemory 192MB 带淘汰策略的，计数被淘汰就等于静默变成无限额
+    assistant_daily_token_budget_user: int = 50_000
+    assistant_daily_token_budget_shop: int = 300_000
+    # 上游连续失败 N 次即熔断，冷却期内直接拒绝（不再等 30 秒超时）
+    assistant_breaker_threshold: int = 5
+    assistant_breaker_cooldown_seconds: int = 60
+
+    # ---------- 店小蜜（买家侧的智能客服，docs/20 §14）----------
+    # ★ 与 ``assistant_enabled`` **分开**：这一个面向的是**公众**（买家）。
+    #   想把买家侧关掉、但保留后台助手（或反过来）时，不该被迫连坐。
+    #   每个店铺还有自己的开关（``assistant.shop_setting.ai_enabled``，默认关），
+    #   这一行是**平台级的兜底**。
+    shopbot_enabled: bool = True
+    # 只在"买家最后发言"的这么久之内才接手。很久以前的会话不该因为"今天开了开关"
+    # 就被翻出来答 —— 那种情况交给商家本人更合适
+    shopbot_sweep_window_minutes: int = 30
+    # 按 (店铺, 买家) 限流：一个买家刷爆的应该是"他在这家店"的额度，而不是把他
+    # 在别的店里的提问也一起掐掉。比后台助手那道紧，因为这里对面是公众
+    shopbot_buyer_rate_per_minute: int = 6
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
@@ -155,6 +201,15 @@ class Settings(BaseSettings):
         # 上面那圈"前缀 + 长度"检查对它无效（见 KNOWN_PHONE_ENC_KEY 的注释）。
         if self.phone_enc_key == KNOWN_PHONE_ENC_KEY:
             problems.append("PHONE_ENC_KEY 仍是仓库里的公开默认值，加密手机号形同虚设")
+
+        # ★ 也单独判 LLM_API_KEY：它是**第三方凭据**，不是 HMAC 密钥，
+        #   上面那句"短于 32 字节会降低安全性（RFC 7518）"对它不成立 ——
+        #   把它塞进那个元组等于让报错文案撒谎。这里只要求"换掉、非空"。
+        #   开了助手却没配 key，就是每次提问都白跑一趟再失败，不如启动就别起来。
+        if self.assistant_enabled and (
+            not self.llm_api_key or DEV_PLACEHOLDER in self.llm_api_key
+        ):
+            problems.append("LLM_API_KEY 仍在使用开发默认值，助手开了但没有可用的密钥")
 
         if self.payment_mock_enabled and not self.allow_mock_payment_in_prod:
             problems.append(

@@ -561,16 +561,17 @@ async def ship(body: ShipRequest, sub: Annotated[OrderSub, Depends(owned_sub_ord
 | GET | `/api/support/tickets` | 买家 | 我的会话（keyset 游标 `cursor` / `limit`） |
 | GET | `/api/support/tickets/{no}` | 买家 | 详情 + 最近一页消息（最多 50 条）。`?before=<消息id>` 往前翻 |
 | POST | `/api/support/tickets/{no}/messages` | 买家 | 发消息。会话已关闭时**重开同一条** |
+| POST | `/api/support/tickets/{no}/request-human` | 买家 | 要求转人工（置 `need_human_at` + 一条说明；**不新开会话**，幂等） |
 | POST | `/api/support/tickets/{no}/close` | 买家 | 结束会话（重复调用**不报错**） |
 | GET | `/api/merchant/support/tickets` | 商家 | 本店队列。`pendingOnly=true` 只看「待回复」 |
 | GET | `/api/merchant/support/pending-count` | 商家 | 待回复条数（后台导航角标） |
 | GET | `/api/merchant/support/tickets/{no}` | 商家 | 详情 |
 | POST | `/api/merchant/support/tickets/{no}/messages` | 商家 | 回复。**同事务**给买家写一条站内信 |
 | POST | `/api/merchant/support/tickets/{no}/close` | 商家 | 结束会话 |
-| GET | `/api/admin/support/tickets` | 平台 | 全部会话，可加 `shopId`（`0` = 平台级）/ `status` / `pendingOnly` |
-| GET | `/api/admin/support/pending-count` | 平台 | 待回复条数（含全部店铺与平台级） |
-| GET | `/api/admin/support/tickets/{no}` | 平台 | 详情 |
-| POST | `/api/admin/support/tickets/{no}/messages` | 平台 | 介入发言 |
+| GET | `/api/admin/support/tickets` | 平台 | **平台级会话**（`shop_id = 0`），可加 `status` / `pendingOnly`。店里的会话不在此列 |
+| GET | `/api/admin/support/pending-count` | 平台 | 待回复条数（**只数平台级**，与上面那张列表同口径） |
+| GET | `/api/admin/support/tickets/{no}` | 平台 | 详情。店里的会话 → **404** |
+| POST | `/api/admin/support/tickets/{no}/messages` | 平台 | 回复提问方。店里的会话 → 404 |
 | POST | `/api/admin/support/tickets/{no}/close` | 平台 | 结束会话 |
 | GET | `/api/notifications` | 买家 | 我的站内信（`unreadOnly` / `cursor` / `limit`） |
 | GET | `/api/notifications/unread-count` | 买家 | 未读数（商城导航角标） |

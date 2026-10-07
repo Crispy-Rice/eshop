@@ -21,6 +21,7 @@ from fastapi import APIRouter, FastAPI
 
 from app.modules.account.router import router as account_router
 from app.modules.aftersale.router import router as aftersale_router
+from app.modules.assistant.router import router as assistant_router
 from app.modules.cart.router import router as cart_router
 from app.modules.files.router import router as files_router
 from app.modules.freight.router import router as freight_router
@@ -47,6 +48,7 @@ MODULE_ROUTERS: list[APIRouter] = [
     review_router,
     support_router,
     notify_router,
+    assistant_router,
 ]
 
 

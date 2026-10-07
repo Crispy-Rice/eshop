@@ -67,14 +67,12 @@ export interface TicketList {
 function listParams(params: {
   pendingOnly?: boolean
   status?: number
-  shopId?: string
   cursor?: string
   limit?: number
 }): Record<string, string | number | boolean> {
   const out: Record<string, string | number | boolean> = {}
   if (params.pendingOnly) out.pendingOnly = true
   if (params.status !== undefined) out.status = params.status
-  if (params.shopId !== undefined) out.shopId = params.shopId
   if (params.cursor) out.cursor = params.cursor
   if (params.limit !== undefined) out.limit = params.limit
   return out
@@ -112,9 +110,13 @@ export function fetchMerchantPendingCount(): Promise<{ count: number }> {
   return get<{ count: number }>('/merchant/support/pending-count')
 }
 
-// ---------------- 平台 ----------------
+// ---------------- 平台（只做平台级会话）----------------
+//
+// ★ 平台**看不到店里买家的会话**（后端的 `service.list_platform` 把范围钉在平台级）：
+//   原来这里有个 `shopId` 过滤参数，但页面从来没传过 —— 等于"能看全部店铺"，
+//   而平台以「平台客服」身份插进买家与商家的对话里，买家连在跟谁说话都分不清。
+//   参数已删：接口不接受它，前端也不该留一个发不出去的参数。
 export function fetchAdminTickets(params: {
-  shopId?: string
   status?: number
   pendingOnly?: boolean
   cursor?: string
@@ -144,3 +146,36 @@ export function closeAsAdmin(ticketNo: string, reason?: string): Promise<void> {
 export function fetchAdminPendingCount(): Promise<{ count: number }> {
   return get<{ count: number }>('/admin/support/pending-count')
 }
+
+// ---------------- 我提交给平台的（买家侧接口，商家/运营都在用）----------------
+//
+// ★ 后台的人**也会是提问方**：助手答不了时可以「转人工」，那条会话落在平台队列里，
+//   而开单与读回复走的都是买家那组接口（`/api/support/*`）。没有这几个函数，
+//   用户开了单就看不到回复 —— 那是"只写不读"。
+
+export function fetchMyTickets(params: {
+  cursor?: string
+  limit?: number
+}): Promise<TicketList> {
+  const query: Record<string, string | number> = {}
+  if (params.cursor) query.cursor = params.cursor
+  if (params.limit !== undefined) query.limit = params.limit
+  return get<TicketList>('/support/tickets', { params: query })
+}
+
+export function fetchMyTicket(ticketNo: string): Promise<TicketDetail> {
+  return get<TicketDetail>(`/support/tickets/${ticketNo}`)
+}
+
+export function replyMyTicket(
+  ticketNo: string,
+  body: string,
+  images: string[] = [],
+): Promise<TicketMessage> {
+  return post<TicketMessage>(`/support/tickets/${ticketNo}/messages`, { body, images })
+}
+
+export function closeMyTicket(ticketNo: string, reason?: string): Promise<void> {
+  return post<void>(`/support/tickets/${ticketNo}/close`, { reason })
+}
+

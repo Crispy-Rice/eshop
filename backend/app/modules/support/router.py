@@ -6,7 +6,13 @@
 |---|---|
 | ``/api/support/*`` | ``CurrentUserDep``（买家，按 ``user_id`` 判归属） |
 | ``/api/merchant/support/*`` | ``CurrentShopIdDep``（按**店铺归属**，刻意不看 role） |
-| ``/api/admin/support/*`` | ``require_role("admin")``（平台可介入任何会话） |
+| ``/api/admin/support/*`` | ``require_role("admin")``（**只做平台级会话**：提给平台的工单） |
+
+★ **平台不是"超级商家"。** 它原来能列出所有店铺的买家会话并以「平台客服」身份插话，
+  结果是买家正在跟某家店聊，中间冒出一句平台客服的话 —— 而且平台客服台里
+  混着几十家店的买家咨询，真正该看的"提给平台的工单"反而被淹了。
+  店的会话归商家；商家自己处理不了，会转人工到平台。这条边界在
+  ``service.list_platform`` 里用常量钉死（不提供 ``shop_id`` 参数）。
 
 ★ **发消息不要求 ``Idempotency-Key``** —— 与 cart 的加购同类：聊天消息的语义就是
   "又发了一条"，没有资金动作需要护住，真重复了也只是多一条同样的话。该做的是
@@ -30,6 +36,7 @@ from app.core.deps import CurrentUserDep, DbSession, RedisDep, require_role
 from app.core.response import ApiResponse
 from app.modules.account.deps import CurrentShopIdDep
 from app.modules.support import service
+from app.modules.support.models import PLATFORM_SHOP_ID
 from app.modules.support.schemas import (
     CloseTicketRequest,
     OpenTicketRequest,
@@ -115,6 +122,28 @@ async def send_message(
             images=body.images,
         )
     )
+
+
+@router.post(
+    "/api/support/tickets/{ticket_no}/request-human",
+    response_model=ApiResponse[None],
+    summary="买家要求人工客服",
+)
+async def request_human(
+    session: DbSession,
+    redis: RedisDep,
+    user: CurrentUserDep,
+    ticket_no: str,
+) -> ApiResponse[None]:
+    """在这条会话上置「已转人工」+ 留一条说明消息。**不新开会话。**
+
+    ★ 与 ``/api/assistant/handoff``（商家 → **平台**，会另开一张平台级工单）
+      是两件事，别混：这条是"买家在自己店里要人工"。
+
+    幂等：已经转过的会话重复点不会有第二条说明。
+    """
+    await service.request_human(session, redis, user_id=user.id, ticket_no=ticket_no)
+    return ApiResponse.ok(None)
 
 
 @router.post(
@@ -242,26 +271,24 @@ async def close_shop_ticket(
 
 
 # ============================================================
-# 平台（可介入任何会话，含平台级）
+# 平台（只处理平台级会话，见 service.list_platform）
 # ============================================================
 @router.get(
     "/api/admin/support/tickets",
     response_model=ApiResponse[TicketListOut],
-    summary="全部会话（平台）",
+    summary="平台级会话队列（提给平台的工单）",
 )
-async def list_all_tickets(
+async def list_platform_tickets(
     session: DbSession,
     user: AdminDep,
-    shop_id: int | None = Query(default=None, alias="shopId", description="按店铺筛；0 = 平台级"),
     status: int | None = Query(default=None, ge=10, le=30),
     pending_only: bool = Query(default=False, alias="pendingOnly", description="只看待回复"),
     cursor: str | None = Query(default=None, max_length=200),
     limit: int = Query(default=service.DEFAULT_LIMIT, ge=1, le=service.MAX_LIMIT),
 ) -> ApiResponse[TicketListOut]:
     return ApiResponse.ok(
-        await service.list_all(
+        await service.list_platform(
             session,
-            shop_id=shop_id,
             status=status,
             pending_only=pending_only,
             cursor=cursor,
@@ -273,12 +300,15 @@ async def list_all_tickets(
 @router.get(
     "/api/admin/support/pending-count",
     response_model=ApiResponse[TicketCountOut],
-    summary="待回复数（平台导航角标，含全部店铺与平台级）",
+    summary="待回复数（平台导航角标，只数平台级会话）",
 )
-async def admin_pending_count(
+async def platform_pending_count(
     session: DbSession, user: AdminDep
 ) -> ApiResponse[TicketCountOut]:
-    return ApiResponse.ok(await service.pending_count(session, shop_id=None))
+    """★ 口径与上面那张列表严格一致（都是平台级），否则角标会提示一堆点不进去的会话。"""
+    return ApiResponse.ok(
+        await service.pending_count(session, shop_id=PLATFORM_SHOP_ID)
+    )
 
 
 @router.get(
@@ -286,21 +316,22 @@ async def admin_pending_count(
     response_model=ApiResponse[TicketDetailOut],
     summary="会话详情（平台）",
 )
-async def get_any_ticket(
+async def get_platform_ticket(
     session: DbSession,
     user: AdminDep,
     ticket_no: str,
     before: int | None = Query(default=None),
 ) -> ApiResponse[TicketDetailOut]:
+    """★ 店铺的买家会话 → **404**（不是 403）：平台对它没有身份，装作"存在但无权"等于承认存在。"""
     return ApiResponse.ok(
-        await service.get_any(session, ticket_no=ticket_no, before_id=before)
+        await service.get_for_platform(session, ticket_no=ticket_no, before_id=before)
     )
 
 
 @router.post(
     "/api/admin/support/tickets/{ticket_no}/messages",
     response_model=ApiResponse[TicketMessageOut],
-    summary="平台介入发言",
+    summary="平台回复提问方",
 )
 async def reply_as_platform(
     session: DbSession,
@@ -324,9 +355,9 @@ async def reply_as_platform(
 @router.post(
     "/api/admin/support/tickets/{ticket_no}/close",
     response_model=ApiResponse[None],
-    summary="平台关闭会话",
+    summary="平台结束会话",
 )
-async def close_any_ticket(
+async def close_platform_ticket(
     session: DbSession,
     user: AdminDep,
     ticket_no: str,

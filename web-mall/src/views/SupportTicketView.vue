@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -8,6 +8,7 @@ import { isBizError } from '@/api/errors'
 import {
   closeTicket,
   fetchTicket,
+  requestHuman,
   sendTicketMessage,
   type TicketDetail,
 } from '@/api/support'
@@ -33,9 +34,16 @@ const loadingOlder = ref(false)
 const sending = ref(false)
 const uploading = ref(false)
 const closing = ref(false)
+const requesting = ref(false)
 const draft = ref('')
 const picked = ref<{ path: string; url: string }[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
+
+/** 组件卸载后短轮询要停 —— 否则它会在后台空转 20 秒，还往已卸载的组件里写值 */
+let unmounted = false
+onBeforeUnmount(() => {
+  unmounted = true
+})
 
 /** 入库存的是**相对路径**，渲染要拼 /media/（与后台售后页同一套约定）。 */
 function mediaUrl(path: string): string {
@@ -98,6 +106,7 @@ async function onPick(event: Event): Promise<void> {
 async function onSend(): Promise<void> {
   const body = draft.value.trim()
   if ((!body && picked.value.length === 0) || sending.value) return
+  const before = ticket.value?.messages.length ?? 0
   sending.value = true
   try {
     // 正文是必填的（后端 min_length=1），只发图时给一个占位文字
@@ -113,6 +122,48 @@ async function onSend(): Promise<void> {
     ElMessage.error(isBizError(e) ? e.message : '发送失败')
   } finally {
     sending.value = false
+  }
+  void watchForReply(before)
+}
+
+/**
+ * 发完消息后密集看几眼（最多 20 秒），看到新消息就停。
+ *
+ * ★ 页面本身的轮询是 15 秒一档，而智能客服通常几秒内就答完 —— 不密集看的话，
+ *   用户会觉得"问完没人理"。
+ * ★ **不复用 usePoll**：它是固定周期的，start/stop 在闭包私有、任务内部无法自停，
+ *   而这里要的正是"拿到就停"（与 web-admin 的 useAnswerPoll 同一个理由）。
+ */
+async function watchForReply(baseline: number): Promise<void> {
+  const deadline = Date.now() + 20_000
+  while (!unmounted && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1500))
+    if (unmounted) return
+    await load(true)
+    if ((ticket.value?.messages.length ?? 0) > baseline) return
+  }
+}
+
+async function onRequestHuman(): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      '转人工后会通知商家本人来回复你。智能客服答得了的问题不必转人工。',
+      '转人工客服',
+      { confirmButtonText: '转人工' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  requesting.value = true
+  try {
+    await requestHuman(ticketNo.value)
+    await load(true)
+    await notify.refresh()
+    ElMessage.success('已通知商家，请稍候')
+  } catch (e) {
+    ElMessage.error(isBizError(e) ? e.message : '操作失败')
+  } finally {
+    requesting.value = false
   }
 }
 
@@ -177,6 +228,16 @@ usePoll(() => load(true), 15_000, { immediate: false })
         </p>
       </div>
       <div class="head-right">
+        <el-button
+          v-if="ticket && ticket.status === 10"
+          size="small"
+          :type="ticket.needHuman ? 'default' : 'primary'"
+          :disabled="ticket.needHuman"
+          :loading="requesting"
+          @click="onRequestHuman"
+        >
+          {{ ticket.needHuman ? '已转人工' : '转人工' }}
+        </el-button>
         <el-button
           v-if="ticket && ticket.status === 10"
           size="small"

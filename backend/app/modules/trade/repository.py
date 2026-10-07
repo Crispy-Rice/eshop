@@ -150,13 +150,25 @@ async def list_mains_for_user(
     user_id: int,
     *,
     status: int | None = None,
+    shop_id: int | None = None,
     cursor: tuple[datetime, int] | None = None,
     limit: int = 20,
 ) -> list[OrderMain]:
-    """我的订单。**键集游标分页**，不用 OFFSET（越翻越慢）。"""
+    """我的订单。**键集游标分页**，不用 OFFSET（越翻越慢）。
+
+    ★ ``shop_id`` 给定时只留"这单里有这家店的商品"的母单（店小蜜要答
+      "我在你们家买过什么"）。用**子查询**下标而不是 join：join 会让分页的形状
+      变复杂（虽然 (母单, 店铺) 天然唯一，但没必要让读的人去验证这一点）。
+    """
     stmt: Select = select(OrderMain).where(OrderMain.user_id == user_id)
     if status is not None:
         stmt = stmt.where(OrderMain.status == status)
+    if shop_id is not None:
+        stmt = stmt.where(
+            OrderMain.order_main_no.in_(
+                select(OrderSub.order_main_no).where(OrderSub.shop_id == shop_id)
+            )
+        )
     if cursor is not None:
         last_time, last_id = cursor
         stmt = stmt.where(
@@ -177,6 +189,21 @@ async def list_timeout_mains(session: AsyncSession, *, limit: int = 500) -> list
             .limit(limit)
         )
     )
+
+
+async def count_shop_subs(
+    session: AsyncSession, shop_id: int, *, status: int | None = None
+) -> int:
+    """本店子单数，给 AI 助手的"店铺概览"用。
+
+    ★ 为什么不复用 ``trade.service.list_shop_orders`` 数一遍：那是键集游标分页，
+      要总数得把整条链翻完；这里是**一次索引扫描**，正好走
+      ``idx_order_sub_shop (shop_id, status, create_time DESC)``。
+    """
+    stmt = select(func.count()).select_from(OrderSub).where(OrderSub.shop_id == shop_id)
+    if status is not None:
+        stmt = stmt.where(OrderSub.status == status)
+    return int(await session.scalar(stmt) or 0)
 
 
 async def count_user_mains_in_statuses(

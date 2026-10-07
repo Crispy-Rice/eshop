@@ -37,6 +37,22 @@ async def close_pool() -> None:
         _pool = None
 
 
+async def enqueue_now(job_name: str, *args: object) -> bool:
+    """立刻投递任务。返回是否投递成功。
+
+    ★ 与 :func:`enqueue_at` 不同，这个的失败**必须让调用方看见** ——
+      AI 助手提交后要是没投出去，那条消息会永远停在「处理中」。
+      ``_job_id`` 由 ARQ 按函数名 + 参数推导，所以同一条消息重复投递会被去重。
+    """
+    try:
+        pool = await get_pool()
+        await pool.enqueue_job(job_name, *args)
+    except Exception:
+        logger.warning("投递任务失败", exc_info=True)
+        return False
+    return True
+
+
 async def enqueue_at(job_name: str, *args: object, run_at: datetime) -> bool:
     """在指定时刻投递任务。返回是否投递成功。
 

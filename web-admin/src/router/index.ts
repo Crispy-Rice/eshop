@@ -63,6 +63,15 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
+    // 智能客服（店小蜜）：开关 + 问答维护 + 今日计数。
+    // ★ 端点全是**本店**范围（后端 caller.require_shop()），所以只有商家能进 ——
+    //   让不让 AI 以本店的名义答买家是商户自己的事，运营进来会撞 403。
+    path: '/shopbot',
+    name: 'shopbot',
+    component: () => import('@/views/ShopBotView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/reviews',
     name: 'reviews',
     component: () => import('@/views/ReviewView.vue'),

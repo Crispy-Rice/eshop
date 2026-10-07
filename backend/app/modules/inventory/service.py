@@ -1027,6 +1027,16 @@ async def ensure_stock_rows(session: AsyncSession, shop_id: int, warehouse_id: i
     return len(missing)
 
 
+async def count_out_of_stock(session: AsyncSession, *, shop_id: int) -> int:
+    """可售为 0 的库存行数。给 AI 助手的"店铺概览"用（docs/20 §3）。
+
+    ★ 与 ``list_stock_out`` 用**同一份**已删 SKU 名单 —— 两个口径不一致的话，
+      助手说"有 3 处没货"而库存页上找不到那几行，用户只会觉得助手在胡说。
+    """
+    deleted_sku_ids = await product_service.list_deleted_sku_ids(session, shop_id)
+    return await repo.count_out_of_stock(session, shop_id, exclude_sku_ids=deleted_sku_ids)
+
+
 async def list_stock_out(
     session: AsyncSession,
     shop_id: int,

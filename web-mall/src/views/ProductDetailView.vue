@@ -56,6 +56,9 @@ function contactShop(): void {
       shopId: shop.value.id,
       source: TICKET_SOURCE.PRODUCT,
       subject: `关于「${spu.value?.title ?? '这件商品'}」`,
+      // ★ 带上 spuId：会话据此**记住买家在问哪件商品**（后端的 `ticket.spu_id`），
+      //   店小蜜才能查它的价格与在售状态。只带标题的话模型只能靠猜。
+      spuId: spu.value?.id,
     },
   })
 }

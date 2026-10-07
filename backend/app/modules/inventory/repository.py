@@ -189,6 +189,31 @@ async def list_stock(
     return list(await session.scalars(stmt))
 
 
+async def count_out_of_stock(
+    session: AsyncSession,
+    shop_id: int,
+    *,
+    exclude_sku_ids: Sequence[int] = (),
+) -> int:
+    """**可售为 0 的库存行数**，给 AI 助手的"店铺概览"用。
+
+    ★ 口径写清楚：数的是**库存行**（一个 SKU 在一个仓的一条记录），不是商品数。
+      同一个 SKU 摆在两个仓、两个仓都没货会算 2。助手要的是"有几处卖不动了"
+      这个量级感，不是财务口径 —— 需要精确口径时它应该去查具体的行。
+
+    ``exclude_sku_ids`` 与 ``list_stock`` 同源（已软删商品的 SKU）：
+    不排掉的话商家会看到"有 3 处没货"，点进库存页却找不到那几行。
+    """
+    stmt = (
+        select(func.count())
+        .select_from(SkuStock)
+        .where(SkuStock.shop_id == shop_id, SkuStock.available == 0)
+    )
+    if exclude_sku_ids:
+        stmt = stmt.where(SkuStock.sku_id.not_in(exclude_sku_ids))
+    return int(await session.scalar(stmt) or 0)
+
+
 async def get_stock(session: AsyncSession, sku_id: int, warehouse_id: int) -> SkuStock | None:
     return await session.scalar(
         select(SkuStock).where(

@@ -122,6 +122,17 @@ class RefreshToken(Base):
     created_at: Mapped[datetime] = mapped_column(TS, nullable=False, server_default=func.now())
 
 
+SHOP_STATUS_ACTIVE = 1
+"""``Shop.status`` 里"正常营业"的取值（见 ``SHOP_STATUS_TEXT``）。"""
+
+SHOP_STATUS_TEXT: dict[int, str] = {
+    1: "正常",
+    2: "已关闭",
+    3: "审核中",
+}
+"""``Shop.status`` 的文案。与那一列的建表注释同源，放在这里免得各端各写一份。"""
+
+
 class Shop(Base):
     """店铺。一个用户可以拥有多个店铺（一期先支持一个）。"""
 

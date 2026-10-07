@@ -65,6 +65,9 @@ SOURCE_ORDER = 2
 SOURCE_AFTERSALE = 3
 SOURCE_APPEAL = 4
 SOURCE_OTHER = 5
+# AI 助手答不了 → 转人工。与前面几个的区别是"从哪来的"：那些是买家从商品页/
+# 订单页点进来的，这个是**后台助手把问题转交过来**，首条消息里带着对话摘要
+SOURCE_AI_ASSISTANT = 6
 
 SOURCE_TEXT: dict[int, str] = {
     SOURCE_PRODUCT: "商品咨询",
@@ -72,23 +75,49 @@ SOURCE_TEXT: dict[int, str] = {
     SOURCE_AFTERSALE: "售后咨询",
     SOURCE_APPEAL: "账号申诉",
     SOURCE_OTHER: "其他",
+    SOURCE_AI_ASSISTANT: "助手转人工",
 }
+
+# 来源的**上界**。``OpenTicketRequest.source`` 的 ``le`` 用它，不再写死数字 ——
+# 加了来源却忘了改上界，表现是调用方收到一个看不出原因的 422
+# （``product`` 那边的 status 上界踩过同一个坑，见 product/router.py 的注释）。
+SOURCE_MAX = SOURCE_AI_ASSISTANT
 
 # ---------------- 消息发送方 ----------------
 SENDER_USER = 1
 SENDER_MERCHANT = 2
 SENDER_PLATFORM = 3
 SENDER_SYSTEM = 4
+# 店铺侧的智能客服（店小蜜）。它**不是人**，所以在读游标与站内信上必须与
+# 真人区分开（见 service._reply 里那段白名单）。
+SENDER_AI = 5
 
 SENDER_TEXT: dict[int, str] = {
     SENDER_USER: "买家",
     SENDER_MERCHANT: "商家",
     SENDER_PLATFORM: "平台客服",
     SENDER_SYSTEM: "系统",
+    # ★ 面向公众的生成式 AI 必须**标识**自己。这个字符串就是标识本身，
+    #   前端直接渲染后端给的这个文案（商城端没有 1-4 的映射表），改这里就够
+    SENDER_AI: "智能客服",
 }
 
 # 关闭/重开的发起方
 CLOSE_BY_TEXT: dict[int, str] = SENDER_TEXT
+
+# 「后台（商家/平台）欠一个回复」的条件 —— 商家队列的「待回复」与角标共用。
+#
+# ★ 与 TICKET_ACTIVE_WHERE 同一套路：写成常量，让两处 SQL（列表筛选、角标 count）
+#   与 rules.staff_owes_reply 说的是**同一句话**，不会各自漂移。
+#
+# ★ 为什么要 `need_human_at` 这一项：原来「欠回复」只看"最后一条是买家"。
+#   但 AI 一开口这条就不成立了 —— AI 答完球在买家手里（对，不该进队列）；
+#   而 **AI 答不了时也掉出队列**（错，那恰恰是必须人工的一条）。
+#   所以"已转人工"要单独记一笔：它表达的是**最后一条消息推不出来的事实**。
+OWES_REPLY_WHERE = (
+    f"status = {TICKET_OPEN}"
+    f" AND (last_sender_type = {SENDER_USER} OR need_human_at IS NOT NULL)"
+)
 
 # 平台级会话的哨兵店铺 id（见模块 docstring）
 PLATFORM_SHOP_ID = 0
@@ -137,6 +166,12 @@ class Ticket(Base):
     order_main_no: Mapped[str | None] = mapped_column(String(32))
     order_sub_no: Mapped[str | None] = mapped_column(String(32))
     refund_no: Mapped[str | None] = mapped_column(String(32))
+    # ★ 商品上下文。**只放 id，不放标题** —— 标题是快照会过期，而 id 永远指向
+    #   当前那份数据（商品改名/改价后，会话里说的应该是**现在**的样子）。
+    #   店小蜜的 ``ticket_product`` 工具读它（服务端注入，不由模型指定）。
+    spu_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="会话的商品上下文（商品页点进来时带上）"
+    )
 
     status: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, server_default=text(str(TICKET_OPEN))
@@ -156,6 +191,12 @@ class Ticket(Base):
 
     user_read_at: Mapped[datetime | None] = mapped_column(TS, comment="买家读到哪了")
     staff_read_at: Mapped[datetime | None] = mapped_column(TS, comment="商家/平台读到哪了")
+
+    need_human_at: Mapped[datetime | None] = mapped_column(
+        TS,
+        comment="已转人工的时刻。买家点「转人工」或 AI 判定答不了时置位，"
+        "客服回复或关单时清空 —— 「欠回复」判定要用（见 OWES_REPLY_WHERE）",
+    )
 
     close_by: Mapped[int | None] = mapped_column(SmallInteger, comment="见 CLOSE_BY_TEXT")
     close_reason: Mapped[str | None] = mapped_column(String(255))

@@ -1099,17 +1099,21 @@ async def list_my_orders(
     user_id: int,
     *,
     status: int | None = None,
+    shop_id: int | None = None,
     cursor: str | None = None,
     limit: int = 10,
 ) -> OrderListOut:
     """我的订单列表。**键集游标分页**（docs/07 §10）。
 
     多取一条判断 ``has_more`` —— 比再发一次 ``COUNT(*)`` 便宜得多。
+
+    ``shop_id`` 给定时只列"这单里有这家店商品"的母单（"我在你们家买过什么"）。
     """
     rows = await repo.list_mains_for_user(
         session,
         user_id,
         status=status,
+        shop_id=shop_id,
         cursor=_decode_cursor(cursor) if cursor else None,
         limit=limit + 1,
     )
@@ -1129,6 +1133,27 @@ async def list_my_orders(
         ),
         has_more=has_more,
     )
+
+
+async def count_shop_orders(
+    session: AsyncSession, shop_id: int, *, status: int | None = None
+) -> int:
+    """本店的子单数（可按状态过滤）。给 AI 助手的"店铺概览"用。
+
+    ★ 助手要的是**数字**，不是列表 —— 拿 ``list_shop_orders`` 翻页累加既慢又
+      会在"刚好翻到一半数据变了"时给出错数。COUNT 走索引，一次出结果。
+    """
+    return await repo.count_shop_subs(session, shop_id, status=status)
+
+
+async def count_shop_pending_ship(session: AsyncSession, shop_id: int) -> int:
+    """待发货的子单数。给 AI 助手的"店铺概览"用。
+
+    ★ 做成**具名函数**而不是让调用方传 ``status=ORDER_WAIT_DELIVER``：助手模块
+      不该 import trade 的 models（跨模块铁律），而"待发货"本来就是个业务概念，
+      由 trade 自己命名、自己定它等于哪个状态码。
+    """
+    return await repo.count_shop_subs(session, shop_id, status=ORDER_WAIT_DELIVER)
 
 
 async def list_shop_orders(

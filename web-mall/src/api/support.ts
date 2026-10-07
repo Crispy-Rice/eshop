@@ -51,6 +51,8 @@ export interface TicketDetail extends Omit<TicketListItem, 'unread'> {
   closeByText: string | null
   closeReason: string | null
   closeTime: string | null
+  /** 已转人工：按钮据此置灰（商家已经知道你要人工了） */
+  needHuman: boolean
   messages: TicketMessage[]
   hasMoreMessages: boolean
   nextMessageCursor: string | null
@@ -70,6 +72,8 @@ export interface OpenTicketPayload {
   orderMainNo?: string
   orderSubNo?: string
   refundNo?: string
+  /** 商品上下文（商品页点「联系客服」时带上）—— 店小蜜据此查价格与在售状态 */
+  spuId?: string
 }
 
 /**
@@ -105,4 +109,13 @@ export function sendTicketMessage(
 /** 结束会话。已关闭时重复调用**不报错**（后端幂等）。之后再发消息会自动重开。 */
 export function closeTicket(ticketNo: string, reason?: string): Promise<void> {
   return post<void>(`/support/tickets/${ticketNo}/close`, { reason })
+}
+
+/**
+ * 要求转人工客服。**不新开会话**，只是在会话上标记"需要人工"并留一条说明。
+ *
+ * ★ 幂等：已经转过的会话重复点不会有第二条说明（后端直接返回）。
+ */
+export function requestHuman(ticketNo: string): Promise<void> {
+  return post<void>(`/support/tickets/${ticketNo}/request-human`)
 }

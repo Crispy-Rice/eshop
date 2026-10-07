@@ -171,3 +171,37 @@ def stream_dead(topic: str) -> str:
 def support_send_rate(user_id: int) -> str:
     """客服发消息的限流计数（docs/19 §4）。固定窗口，60 秒。"""
     return f"support:ratelimit:{user_id}"
+
+
+def assistant_rate_user(user_id: int) -> str:
+    """AI 助手提问的限流计数（docs/20 §6）。固定窗口，60 秒。"""
+    return f"assistant:ratelimit:user:{user_id}"
+
+
+def assistant_rate_shop(shop_id: int) -> str:
+    """按店铺的提问限流。一个店多人共用账号时，用户级那道挡不住单店吃光额度。"""
+    return f"assistant:ratelimit:shop:{shop_id}"
+
+
+def assistant_rate_shop_buyer(shop_id: int, user_id: int) -> str:
+    """店小蜜（买家侧）的限流：**按 (店铺, 买家)**。
+
+    ★ 不按买家全站：一个买家刷爆的应该是"他在这家店"的额度，而不该把他
+      在别的店里的正常提问一起掐掉 —— 那是两家店各自的成本。
+    """
+    return f"assistant:ratelimit:shopbot:{shop_id}:{user_id}"
+
+
+def assistant_breaker() -> str:
+    """助手上游（模型 API）的熔断开关，连续失败时打开、按冷却时间自动过期。
+
+    ★ 刻意**不复用** ``switch()``：那个前缀的语义是"真源在 ``ops.switch`` 表、
+      Redis 只是副本"，运维能人工去改；而这里的开关是**从失败中推导出来的**，
+      没有人工真源，所以不能挂到同一套语义下。
+    """
+    return "assistant:breaker:llm"
+
+
+def assistant_breaker_failures() -> str:
+    """熔断用的连续失败计数（与开关分开：计数要跨多次失败累积，开关是那个结果）。"""
+    return "assistant:breaker:llm:failures"

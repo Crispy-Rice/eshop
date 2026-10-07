@@ -45,6 +45,15 @@ from app.main import app  # noqa: E402
 # 每个用例前清空的表（TRUNCATE ... CASCADE 会自动处理外键顺序）
 _TRUNCATE = (
     "ops.alert",
+    # AI 助手 / 店小蜜。★ 这几张**必须清**：``bot_turn`` 的幂等闩锁是
+    #   ``source_message_id``（跨用例唯一），留着旧行会让"这一轮该不该重投"
+    #   变成用例执行顺序的函数；``usage_daily`` 不清则额度和统计会串。
+    "assistant.bot_turn",
+    "assistant.message",
+    "assistant.conversation",
+    "assistant.usage_daily",
+    "assistant.shop_faq",
+    "assistant.shop_setting",
     # 客服会话与站内信（support 的表引用自己的 ticket_no，CASCADE 会处理顺序）
     "support.ticket_state_flow",
     "support.ticket_message",

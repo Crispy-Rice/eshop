@@ -24,6 +24,13 @@ from app.modules.aftersale.tasks import (
     reconcile_refunds,
     retry_refunds,
 )
+from app.modules.assistant.tasks import (
+    reap_stuck_messages,
+    reap_stuck_turns,
+    run_assistant_turn,
+    run_bot_turn,
+    sweep_ticket_turns,
+)
 from app.modules.inventory.tasks import (
     ensure_flow_partition,
     rebuild_stock_daily,
@@ -100,6 +107,14 @@ FUNCTIONS: list[Any] = [
     # outbox 投递：把 core.local_message 里积压的事件就地分派出去
     # （cron 每 5 秒叫一次，这里也登记一份，便于手工 enqueue 一次）
     deliver_outbox,
+    # AI 助手：一次提问一个任务（由 API 侧提交后投递）
+    run_assistant_turn,
+    # 卡住的消息兜底收尾，cron 每分钟叫一次
+    reap_stuck_messages,
+    # 店小蜜：扫描 → 一次回答一个任务（由扫描投递）、兜底收尾
+    sweep_ticket_turns,
+    run_bot_turn,
+    reap_stuck_turns,
 ]
 
 # 定时任务。
@@ -145,6 +160,18 @@ CRON_JOBS: list[Any] = [
     # ★ minute=None 而不是省略 —— ARQ 的 cron 把省略的 minute 当成 0（只在
     #   每小时的 0 分跑），不是"每分钟"。省略它就变成一小时一次了。
     cron(deliver_outbox, minute=None, second=set(range(0, 60, 5)), unique=True),
+    # ---------- AI 助手 ----------
+    # 卡住的消息兜底收尾：worker 崩了 / 队列丢了时，那些消息会永远停在「处理中」，
+    # 前端一直转圈。一分钟一次足够 —— 它修的是"不会自愈的坏状态"，不是实时性。
+    cron(reap_stuck_messages, minute=None, second=27, unique=True),
+    # ---------- 店小蜜（买家侧的智能客服）----------
+    # 扫描"买家刚说完话、还没人接"的会话并投递。**每 3 秒一轮**：
+    # 这是买家感知到的延迟的一部分（另一部分是模型本身），而查询命中的是
+    # (status, last_sender_type) 上的条件、代价极低。
+    # ★ minute=None 不能省 —— ARQ 把省略的 minute 当成 0（一小时一次）。
+    cron(sweep_ticket_turns, minute=None, second=set(range(0, 60, 3)), unique=True),
+    # 卡住的轮次：PENDING 的重投、RUNNING 的判失败。每分钟一次足够
+    cron(reap_stuck_turns, minute=None, second=41, unique=True),
 ]
 
 

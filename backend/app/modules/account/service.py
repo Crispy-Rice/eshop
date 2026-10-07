@@ -36,6 +36,8 @@ from app.core.security import (
 from app.core.snowflake import next_id
 from app.modules.account import repository as repo
 from app.modules.account.models import (
+    SHOP_STATUS_ACTIVE,
+    SHOP_STATUS_TEXT,
     RefreshToken,
     Shop,
     ShopMember,
@@ -489,6 +491,25 @@ async def get_shop_id(session: AsyncSession, user_id: int) -> int | None:
     """
     shop = await repo.get_shop_by_owner(session, user_id)
     return shop.id if shop else None
+
+
+def shop_status_text(status: int) -> str:
+    """``Shop.status`` 的中文文案。
+
+    ★ 单开一个函数而不是让调用方 import 我们的 ``models``：
+      ``ShopOut`` 只带整数 ``status``，而"这个数字是什么意思"是 account 的事。
+      跨模块的合法表面是 ``service``（docs/01 §2）。
+    """
+    return SHOP_STATUS_TEXT.get(status, str(status))
+
+
+def shop_is_active(status: int) -> bool:
+    """店铺是否处于正常营业状态。
+
+    ★ 给"提问之后、真正取数之前"的复核用（AI 助手在 worker 里会再查一次）：
+      提交那一刻店铺是好的，不等于几秒后还是。关店期间不该读到数据。
+    """
+    return status == SHOP_STATUS_ACTIVE
 
 
 async def get_my_shop(session: AsyncSession, user_id: int) -> ShopOut:

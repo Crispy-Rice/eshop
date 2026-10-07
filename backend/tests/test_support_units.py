@@ -12,7 +12,13 @@ import pytest
 
 from app.modules.core import outbox
 from app.modules.notify.handlers import DISPATCH
-from app.modules.support.models import SENDER_MERCHANT, SENDER_PLATFORM, SENDER_USER
+from app.modules.support.models import (
+    SENDER_AI,
+    SENDER_MERCHANT,
+    SENDER_PLATFORM,
+    SENDER_SYSTEM,
+    SENDER_USER,
+)
 from app.modules.support.rules import is_buyer_sender, staff_owes_reply
 from app.modules.trade.order_no import build_ticket_no, is_valid_luhn, parse_main_no
 
@@ -51,21 +57,36 @@ def test_is_buyer_sender(sender: int) -> None:
 # ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("last_sender", [SENDER_USER, SENDER_MERCHANT, SENDER_PLATFORM])
+@pytest.mark.parametrize("last_sender", [SENDER_USER, SENDER_MERCHANT, SENDER_PLATFORM, SENDER_AI])
 def test_staff_owes_reply_only_when_open_and_buyer_spoke_last(last_sender: int) -> None:
     expected = last_sender == SENDER_USER
-    assert staff_owes_reply(10, last_sender) is expected
+    assert staff_owes_reply(10, last_sender, False) is expected
     # 关闭的会话不欠任何人，哪怕最后一句是买家说的
-    assert staff_owes_reply(30, last_sender) is False
+    assert staff_owes_reply(30, last_sender, False) is False
+    assert staff_owes_reply(30, last_sender, True) is False
+
+
+@pytest.mark.parametrize(
+    "last_sender", [SENDER_USER, SENDER_MERCHANT, SENDER_PLATFORM, SENDER_SYSTEM, SENDER_AI]
+)
+def test_need_human_keeps_the_ticket_in_the_queue(last_sender: int) -> None:
+    """★ 已转人工的会话，**不管最后一句是谁说的**都还欠一个回复。
+
+    这就是 ``need_human_at`` 存在的理由：智能客服答不了时也要把票留在队列里，
+    而"最后一条是买家"这个充要条件在 AI 说过话之后就不成立了。
+    """
+    assert staff_owes_reply(10, last_sender, True) is True
 
 
 def test_staff_owes_reply_matches_sql_filter() -> None:
-    """``rules.staff_owes_reply`` 与 ``repository.list_tickets(owes_reply_only=)``
-    是同一条判定的两份写法（一份在 Python、一份在 SQL）。这条用例把"两处都只认
-    （进行中 + 买家最后发言）"钉住 —— 集成测试再验证 SQL 那侧的返回值。"""
-    assert staff_owes_reply(10, SENDER_USER) is True
-    assert staff_owes_reply(10, SENDER_MERCHANT) is False
-    assert staff_owes_reply(10, SENDER_PLATFORM) is False
+    """``rules.staff_owes_reply`` 与 SQL 那份（``models.OWES_REPLY_WHERE``，
+    列表筛选与角标 count 共用）是同一条判定的两种写法。这条用例把两边一起钉住；
+    集成测试再验证 SQL 那侧的返回值确实一致。"""
+    assert staff_owes_reply(10, SENDER_USER, False) is True
+    assert staff_owes_reply(10, SENDER_MERCHANT, False) is False
+    assert staff_owes_reply(10, SENDER_PLATFORM, False) is False
+    # 智能客服说过话 = 球在买家手里，不进队列
+    assert staff_owes_reply(10, SENDER_AI, False) is False
 
 
 # ---------------------------------------------------------------

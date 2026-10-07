@@ -859,6 +859,31 @@ async def list_admin_spus(
     )
 
 
+async def count_pending_audit(session: AsyncSession) -> int:
+    """待审核的商品数（跨店铺）。给平台 AI 助手的概览用。
+
+    ★ 复用 ``search_products(with_total=True)`` 而不是自己写 COUNT：待审核的
+      筛选条件（含"要不要看下架的"这些开关）已经在那套条件里，
+      重写一遍就多一处会和列表对不上的地方。
+    """
+    out = await search_products(
+        session,
+        status=SPU_PENDING_AUDIT,
+        on_shelf_only=False,
+        with_total=True,
+        limit=1,
+    )
+    return int(out.total or 0)
+
+
+async def list_pending_audit(session: AsyncSession, *, limit: int = 20) -> SpuListOut:
+    """待审核商品列表（跨店铺）。给平台 AI 助手用。
+
+    ``SPU_PENDING_AUDIT`` 这个状态码留在这里，助手不必知道它是几。
+    """
+    return await list_admin_spus(session, status=SPU_PENDING_AUDIT, limit=limit)
+
+
 async def get_spu_detail(
     session: AsyncSession,
     spu_id: int,

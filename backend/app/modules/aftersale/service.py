@@ -938,6 +938,15 @@ async def list_my_refunds(
     )
 
 
+async def count_pending_for_shop(session: AsyncSession, shop_id: int) -> int:
+    """待商家处理的售后数。给 AI 助手的"店铺概览"用（docs/20 §3）。
+
+    ★ 只是把 ``repository`` 里已有的那个包一层，**不另写 SQL** ——
+      商家后台的角标用的也是它，口径只有一处。
+    """
+    return await repo.count_pending_for_shop(session, shop_id)
+
+
 async def list_shop_refunds(
     session: AsyncSession,
     shop_id: int,

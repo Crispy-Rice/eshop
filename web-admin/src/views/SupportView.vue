@@ -9,12 +9,16 @@ import {
   TICKET_OPEN,
   closeAsAdmin,
   closeAsMerchant,
+  closeMyTicket,
   fetchAdminTicket,
   fetchAdminTickets,
   fetchMerchantTicket,
   fetchMerchantTickets,
+  fetchMyTicket,
+  fetchMyTickets,
   replyAsAdmin,
   replyAsMerchant,
+  replyMyTicket,
   type TicketDetail,
   type TicketListItem,
 } from '@/api/support'
@@ -31,20 +35,50 @@ const MAX_IMAGES = 3
 const SENDER_USER = 1
 
 /**
- * 有店铺 = 商家视角（只看本店）；否则平台视角（全部店铺 + 平台级）。
+ * 有店铺 = 商家视角（只看本店）；否则平台视角（只看平台级）。
  * 与 `App.vue` 的菜单判据、以及后端两组端点的守卫一致。
+ *
+ * ★ 平台视角**不是**"超级商家"：它只处理提给平台的工单（助手转人工等），
+ *   店里买家的会话归商家（见后端 `service.list_platform`）。
  */
 const isShopSide = computed(() => Boolean(auth.user?.shopId))
+
+/** 对面提问的人叫什么。商家视角一定是买家；平台视角可能是商家，也可能是买家。 */
+const askerLabel = computed(() => (isShopSide.value ? '买家' : '提问方'))
 
 const TABS = [
   { key: 'pending', label: '待回复' },
   { key: 'open', label: '进行中' },
   { key: 'closed', label: '已结束' },
   { key: 'all', label: '全部' },
+  { key: 'mine', label: '我提交的' },
 ] as const
 type TabKey = (typeof TABS)[number]['key']
 
 const tab = ref<TabKey>('pending')
+
+/**
+ * 「我提交的」：**我是提问方**的那些会话（比如助手转人工给平台开的单）。
+ *
+ * ★ 没有这个页签，转人工就是**只写不读** —— 商家开了单，平台的回复他看不到：
+ *   站内信是发到商城端的，后台没有站内信页。这一页要排在 `isShopSide` **前面**
+ *   判断，否则运营点进来会看到"全部店铺的工单"（那是客服视角，不是他的提问）。
+ */
+const isMine = computed(() => tab.value === 'mine')
+
+/**
+ * 回复框的占位提示。**三种视角对面坐的人不一样**：
+ * 「我提交的」对面是平台客服，商家对面是买家，平台对面是提问的人。
+ * 原来一律写「回复买家…」—— 在平台视角里，提问的往往是**商家**。
+ */
+const replyPlaceholder = computed(() =>
+  isMine.value
+    ? '回复平台客服…'
+    : isShopSide.value
+      ? '回复买家…'
+      : '以平台客服身份回复…',
+)
+
 const items = ref<TicketListItem[]>([])
 const cursor = ref<string | null>(null)
 const hasMore = ref(false)
@@ -78,18 +112,20 @@ async function load(reset = true): Promise<void> {
     limit: 20,
   }
   try {
-    const page = isShopSide.value
-      ? await fetchMerchantTickets({ ...params, pendingOnly: tab.value === 'pending' })
-      : await fetchAdminTickets({
-          ...params,
-          pendingOnly: tab.value === 'pending',
-          status:
-            tab.value === 'open'
-              ? TICKET_OPEN
-              : tab.value === 'closed'
-                ? TICKET_CLOSED
-                : undefined,
-        })
+    const page = isMine.value
+      ? await fetchMyTickets(params)
+      : isShopSide.value
+        ? await fetchMerchantTickets({ ...params, pendingOnly: tab.value === 'pending' })
+        : await fetchAdminTickets({
+            ...params,
+            pendingOnly: tab.value === 'pending',
+            status:
+              tab.value === 'open'
+                ? TICKET_OPEN
+                : tab.value === 'closed'
+                  ? TICKET_CLOSED
+                  : undefined,
+          })
     items.value = reset ? page.items : [...items.value, ...page.items]
     cursor.value = page.nextCursor
     hasMore.value = page.hasMore
@@ -121,11 +157,14 @@ async function loadDetail(silent = false): Promise<void> {
   if (!no) return
   if (!silent) detailLoading.value = true
   try {
-    detail.value = isShopSide.value
-      ? await fetchMerchantTicket(no)
-      : await fetchAdminTicket(no)
-    // 打开详情即已读（后端推进客服侧游标），顺手把角标刷到最新
-    await support.refresh()
+    detail.value = isMine.value
+      ? await fetchMyTicket(no)
+      : isShopSide.value
+        ? await fetchMerchantTicket(no)
+        : await fetchAdminTicket(no)
+    // 打开详情即已读（后端推进**客服侧**游标），顺手把角标刷到最新。
+    // 「我提交的」那一页读的是买家侧游标，跟待回复角标无关，不必刷
+    if (!isMine.value) await support.refresh()
   } catch (e) {
     if (!silent) ElMessage.error(isBizError(e) ? e.message : '加载会话失败')
   } finally {
@@ -160,7 +199,9 @@ async function onSend(): Promise<void> {
   sending.value = true
   try {
     const images = picked.value.map((f) => f.path)
-    if (isShopSide.value) {
+    if (isMine.value) {
+      await replyMyTicket(no, body || '[图片]', images)
+    } else if (isShopSide.value) {
       await replyAsMerchant(no, body || '[图片]', images)
     } else {
       await replyAsAdmin(no, body || '[图片]', images)
@@ -188,7 +229,9 @@ async function onClose(): Promise<void> {
     return
   }
   try {
-    if (isShopSide.value) {
+    if (isMine.value) {
+      await closeMyTicket(no)
+    } else if (isShopSide.value) {
       await closeAsMerchant(no)
     } else {
       await closeAsAdmin(no)
@@ -224,9 +267,11 @@ usePoll(
         <h2 class="title">客服</h2>
         <p class="lead">
           {{
-            isShopSide
-              ? '买家的咨询会进到这里。回复后买家会收到站内信提醒。'
-              : '全部店铺的咨询会话，可以介入任意一条。'
+            isMine
+              ? '你提交给平台的会话（比如助手转人工）。平台回复会出现在这里。'
+              : isShopSide
+                ? '买家的咨询会进到这里。回复后买家会收到站内信提醒。'
+                : '商家 / 买家提给平台的会话。买家与商家的会话归商家处理，不在这里。'
           }}
         </p>
       </div>
@@ -249,15 +294,11 @@ usePoll(
     </div>
 
     <el-table v-loading="loading" :data="items" size="small" @row-click="openDetail">
-      <el-table-column label="买家" min-width="170">
+      <el-table-column v-if="!isMine" :label="askerLabel" min-width="170">
         <template #default="{ row }">
           <span>{{ row.buyerNickname || '—' }}</span>
           <span class="muted"> · {{ row.buyerPhone || '—' }}</span>
         </template>
-      </el-table-column>
-
-      <el-table-column v-if="!isShopSide" label="店铺" min-width="130">
-        <template #default="{ row }">{{ row.shopName }}</template>
       </el-table-column>
 
       <el-table-column label="主题" min-width="200">
@@ -267,7 +308,9 @@ usePoll(
         </template>
       </el-table-column>
 
-      <el-table-column label="状态" width="110">
+      <!-- ★ 160 而不是 110：两个标签（进行中 + 待回复）并排要 ~136px，
+           110 会让它们**换行**，把行高从 40px 撑到 65px -->
+      <el-table-column label="状态" width="160">
         <template #default="{ row }">
           <el-tag size="small" :type="row.status === TICKET_OPEN ? 'warning' : 'info'">
             {{ row.status === TICKET_OPEN ? '进行中' : '已结束' }}
@@ -304,7 +347,7 @@ usePoll(
               <p class="subject">{{ detail.subject }}</p>
               <p class="muted small">
                 {{ detail.shopName }} · {{ detail.sourceText }} ·
-                {{ detail.buyerNickname || '买家' }}（{{ detail.buyerPhone || '未留手机号' }}）
+                {{ detail.buyerNickname || askerLabel }}（{{ detail.buyerPhone || '未留手机号' }}）
               </p>
             </div>
             <el-button
@@ -361,7 +404,7 @@ usePoll(
               :rows="3"
               maxlength="2000"
               resize="none"
-              placeholder="回复买家…"
+              :placeholder="replyPlaceholder"
             />
             <div class="actions">
               <input ref="fileInput" type="file" accept="image/*" hidden @change="onPick" />
