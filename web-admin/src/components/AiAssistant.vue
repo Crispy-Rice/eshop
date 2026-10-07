@@ -242,6 +242,7 @@ function bubbleClass(status: string): string {
           :rows="2"
           resize="none"
           maxlength="2000"
+          show-word-limit
           placeholder="回车换行；点「发送」提交"
           @keydown.enter.exact.prevent="onSend"
         />

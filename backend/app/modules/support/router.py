@@ -175,14 +175,18 @@ async def close_ticket(
 async def list_shop_tickets(
     session: DbSession,
     shop_id: CurrentShopIdDep,
+    status: int | None = Query(default=None, ge=10, le=30, description="按状态过滤"),
     pending_only: bool = Query(default=False, alias="pendingOnly", description="只看待回复"),
     cursor: str | None = Query(default=None, max_length=200),
     limit: int = Query(default=service.DEFAULT_LIMIT, ge=1, le=service.MAX_LIMIT),
 ) -> ApiResponse[TicketListOut]:
+    """★ ``status`` 与平台那条同构（10 进行中 / 30 已结束）—— 后台的页签靠它，
+    少了它「已结束」就会查出全部（见 ``service.list_for_shop`` 的说明）。"""
     return ApiResponse.ok(
         await service.list_for_shop(
             session,
             shop_id=shop_id,
+            status=status,
             pending_only=pending_only,
             cursor=cursor,
             limit=limit,

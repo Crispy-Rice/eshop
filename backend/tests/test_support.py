@@ -24,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core.db import get_session_factory
 from app.core.redis import get_redis
 from app.modules.support import service as support_service
+from app.modules.support.models import TICKET_CLOSED, TICKET_OPEN
 from tests.conftest import (
     api_code,
     auth_header,
@@ -275,6 +276,41 @@ async def test_merchant_without_shop_is_rejected(client: AsyncClient, session) -
     ctx = await _setup(client, session)
     resp = await client.get("/api/merchant/support/tickets", headers=ctx["buyer"])
     assert resp.status_code == 403
+
+
+async def test_merchant_list_filters_by_status(client: AsyncClient, session) -> None:
+    """★ 商家列表必须认 ``status`` —— 后台的「进行中 / 已结束 / 全部」三个页签靠它。
+
+    原来这条端点**只有** ``pendingOnly``（那只是「待回复」一个页签），于是点
+    「已结束」查出来的还是全部，看着就像页签坏了。这条用例钉住它真的在筛。
+    """
+    ctx = await _setup(client, session)
+    ticket = await _open(client, ctx, shopId=ctx["shop_id"])
+    no = ticket["ticketNo"]
+    await _send(client, ctx["buyer"], no)
+
+    async def listed(**params: int) -> set[str]:
+        resp = await client.get(
+            "/api/merchant/support/tickets", params=params, headers=ctx["merchant"]
+        )
+        assert resp.status_code == 200, resp.text
+        return {i["ticketNo"] for i in resp.json()["data"]["items"]}
+
+    assert no in await listed(status=TICKET_OPEN)
+    assert no not in await listed(status=TICKET_CLOSED), "进行中的会话不该出现在「已结束」"
+
+    resp = await client.post(
+        f"/api/merchant/support/tickets/{no}/close", json={}, headers=ctx["merchant"]
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert no not in await listed(status=TICKET_OPEN)
+    assert no in await listed(status=TICKET_CLOSED)
+    # 不传 status = 全部：关掉之后仍然查得到
+    assert no in await listed()
+
+    # status 与待回复是 AND，两个一起传只会更窄：关掉的单子调不出「待回复」
+    assert no not in await listed(status=TICKET_CLOSED, pendingOnly=1)
 
 
 # ============================================================

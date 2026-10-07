@@ -312,6 +312,7 @@ usePoll(() => load(true), 15_000, { immediate: false })
           type="textarea"
           :rows="2"
           maxlength="2000"
+          show-word-limit
           resize="none"
           placeholder="描述你的问题…"
           @keydown.enter.exact.prevent="onSend"

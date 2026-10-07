@@ -107,25 +107,26 @@ async function load(reset = true): Promise<void> {
   } else {
     loadingMore.value = true
   }
+  /**
+   * 「进行中 / 已结束 / 全部」→ `status`。
+   * ★ **商家那一侧也必须传**：后端 `/merchant/support/tickets` 原来只有 `pendingOnly`
+   *   （那只是「待回复」一个页签），于是点「已结束」查出来的还是全部 —— 页签看着像坏的。
+   */
+  const status =
+    tab.value === 'open' ? TICKET_OPEN : tab.value === 'closed' ? TICKET_CLOSED : undefined
   const params = {
+    status,
+    pendingOnly: tab.value === 'pending',
     cursor: reset ? undefined : (cursor.value ?? undefined),
     limit: 20,
   }
   try {
     const page = isMine.value
-      ? await fetchMyTickets(params)
+      ? // 「我提交的」走买家侧接口，它只认游标与页大小（那三个页签在这里没有意义）
+        await fetchMyTickets({ cursor: params.cursor, limit: params.limit })
       : isShopSide.value
-        ? await fetchMerchantTickets({ ...params, pendingOnly: tab.value === 'pending' })
-        : await fetchAdminTickets({
-            ...params,
-            pendingOnly: tab.value === 'pending',
-            status:
-              tab.value === 'open'
-                ? TICKET_OPEN
-                : tab.value === 'closed'
-                  ? TICKET_CLOSED
-                  : undefined,
-          })
+        ? await fetchMerchantTickets(params)
+        : await fetchAdminTickets(params)
     items.value = reset ? page.items : [...items.value, ...page.items]
     cursor.value = page.nextCursor
     hasMore.value = page.hasMore

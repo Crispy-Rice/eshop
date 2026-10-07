@@ -483,14 +483,24 @@ async def list_for_shop(
     session: AsyncSession,
     *,
     shop_id: int,
+    status: int | None,
     pending_only: bool,
     cursor: str | None,
     limit: int,
 ) -> TicketListOut:
+    """本店队列。
+
+    ★ ``status`` 不是可选项：后台的「进行中 / 已结束 / 全部」三个页签全靠它。
+      原来这里只认 ``pending_only``（那只是「待回复」**一个**页签），于是
+      「已结束」查出来的还是全部 —— 点下去看着就像页签坏了。
+      它与 ``pending_only`` 是 AND 关系：后者本身还带一个「进行中」
+      （见 ``models.OWES_REPLY_WHERE``），两个一起传只会更窄，不会打架。
+    """
     capped = _clamp(limit)
     rows = await repo.list_tickets(
         session,
         shop_id=shop_id,
+        status=status,
         owes_reply_only=pending_only,
         cursor=_decode_cursor(cursor) if cursor else None,
         limit=capped,

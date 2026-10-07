@@ -79,7 +79,13 @@ function listParams(params: {
 }
 
 // ---------------- 商家 ----------------
+/**
+ * ★ 商家这条**也必须收 `status`**：后台的「进行中 / 已结束 / 全部」三个页签靠它。
+ *   后端原来只有 `pendingOnly`（那只是「待回复」一个页签），于是点「已结束」
+ *   查出来的还是全部 —— 看着像页签坏了。
+ */
 export function fetchMerchantTickets(params: {
+  status?: number
   pendingOnly?: boolean
   cursor?: string
   limit?: number

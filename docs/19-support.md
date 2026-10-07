@@ -214,7 +214,7 @@ handler 内部的**部分写入**也能自愈，不必自己开保存点。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/merchant/support/tickets` | 本店队列，`pendingOnly=true` 只看待回复 |
+| GET | `/api/merchant/support/tickets` | 本店队列。`status` 按状态筛（10 / 30），`pendingOnly=true` 只看待回复（两者是 AND） |
 | GET | `/api/merchant/support/pending-count` | 待回复条数（导航角标） |
 | GET | `/api/merchant/support/tickets/{no}` | 详情 |
 | POST | `/api/merchant/support/tickets/{no}/messages` | 回复（**同事务**给买家写站内信） |
@@ -222,7 +222,9 @@ handler 内部的**部分写入**也能自愈，不必自己开保存点。
 
 ### 平台 `/api/admin/support/*`（`require_role("admin")`）
 
-同上，外加 `status` 过滤。★ **范围恒定是平台级会话（`shop_id = 0`）**，没有 `shopId`
+同上（`status` / `pendingOnly` 都有 —— 后台三个「进行中 / 已结束 / 全部」页签就是
+`status`；商家那条原来漏了它，于是点「已结束」查出来的还是全部）。★ **范围恒定是平台级
+会话（`shop_id = 0`）**，没有 `shopId`
 参数可传（见 §2.2）；店里的买家会话对平台**一律 404**，角标也只数平台级 ——
 否则角标会提示一堆点不进去的会话。
 

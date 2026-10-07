@@ -57,6 +57,22 @@ def test_prompt_has_injection_guard() -> None:
     assert "数据" in prompt
 
 
+def test_prompt_forbids_inventing_ui_behavior() -> None:
+    """★ 后台助手与店小蜜都要有"界面操作不许臆测"这一条。
+
+    来由：商家问「点转人工之后，客服的回复我在哪儿看」，模型答成"会显示在你当前与
+    AI 对话的这个窗口里" —— 真实路径是「客服」页 → 「我提交的」。它不是在幻觉**数据**，
+    而是在**编造界面行为**，而用户会照着做。所以两个提示词都要明写这条。
+    """
+    admin_prompt = rules.build_system_prompt(caller=MERCHANT, shop_name=None, knowledge="")
+    assert "界面操作" in admin_prompt
+
+    shopbot_prompt = rules.build_shopbot_prompt(
+        shop_name="演示店", faq="", knowledge="", ticket=TICKET
+    )
+    assert "界面操作" in shopbot_prompt
+
+
 # ==================================================================
 # 工具参数 —— 越权的第一道闸
 # ==================================================================
@@ -247,6 +263,11 @@ def test_knowledge_loads_for_merchant_and_admin() -> None:
     assert "审核" in admin_text
     # 运营也能读到共用的那几篇（他会被问"运费怎么算"）
     assert "运费" in admin_text
+    # ★ 「转人工」的说明必须在**商家**看得到的那一份里。这条是修 bug 修出来的：
+    #   原来只有 audience:admin 的文件讲了转人工，商家拿不到 —— 于是 AI 编出了
+    #   "回复会显示在助手窗口里"（真实路径是「客服」页 → 「我提交的」）。
+    assert "转人工" in merchant_text
+    assert "我提交的" in merchant_text
 
 
 def test_knowledge_is_cached_and_stable() -> None:
